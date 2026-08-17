@@ -204,3 +204,18 @@ func TestWriteSnapshotResultWritesTerminationMessage(t *testing.T) {
 		t.Fatalf("unexpected second result: %#v", result.Containers[1])
 	}
 }
+
+func TestCommitContainerArgsDisablesSecondPause(t *testing.T) {
+	args := commitContainerArgs("container-id", "registry.example/snapshot:test")
+
+	if !contains(args, "--pause=false") {
+		t.Fatalf("commit args must disable nerdctl's implicit second pause: %v", args)
+	}
+	got := args[len(args)-2:]
+	want := []string{"container-id", "registry.example/snapshot:test"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("commit args suffix = %v, want %v", got, want)
+		}
+	}
+}

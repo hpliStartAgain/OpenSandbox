@@ -447,13 +447,26 @@ func resumeAllPausedContainers() {
 // commitContainer uses nerdctl to commit a container to an image
 func commitContainer(containerID, targetImage string) error {
 	fmt.Printf("Committing container %s to image %s...\n", containerID, targetImage)
-	args := append(nerdctlBaseArgs(), "commit", containerID, targetImage)
+	args := commitContainerArgs(containerID, targetImage)
 	cmd := exec.Command("nerdctl", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to commit container %s to %s: %v, output: %s", containerID, targetImage, err, string(output))
 	}
 	return nil
+}
+
+func commitContainerArgs(containerID, targetImage string) []string {
+	// The caller has already paused the container and tracks it for guaranteed
+	// cleanup. nerdctl commit defaults --pause=true; asking it to pause an
+	// already-paused CRI container can block until the controller Job deadline.
+	return append(
+		nerdctlBaseArgs(),
+		"commit",
+		"--pause=false",
+		containerID,
+		targetImage,
+	)
 }
 
 // pushImage uses nerdctl to push the image to the registry.
