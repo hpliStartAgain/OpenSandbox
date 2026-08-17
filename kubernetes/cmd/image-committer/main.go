@@ -474,6 +474,10 @@ func commitContainerArgs(containerID, targetImage string) []string {
 // nerdctl login first, then nerdctl push with --insecure-registry.
 func pushImage(targetImage string) error {
 	fmt.Printf("Pushing image %s...\n", targetImage)
+	expectedManifestDigest, digestErr := getImageManifestDigest(targetImage)
+	if digestErr != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: could not determine the local manifest digest before push: %v\n", digestErr)
+	}
 
 	// Parse registry host from target image
 	imageParts := strings.Split(targetImage, "/")
@@ -503,13 +507,73 @@ func pushImage(targetImage string) error {
 	}
 	pushOpts = append(pushOpts, targetImage)
 
-	cmd := exec.Command("nerdctl", pushOpts...)
-	output, err := cmd.CombinedOutput()
+	output, err := commandCombinedOutput("nerdctl", pushOpts...)
 	if err != nil {
+		if digestErr == nil && isManifestDigestMismatch(string(output)) {
+			if verifyErr := verifyPushedImage(targetImage, expectedManifestDigest); verifyErr == nil {
+				fmt.Fprintf(
+					os.Stderr,
+					"WARNING: registry returned a mismatched digest in the push response, but pulling %s resolved the expected manifest %s; accepting the verified upload\n",
+					targetImage,
+					expectedManifestDigest,
+				)
+				return nil
+			} else {
+				fmt.Fprintf(os.Stderr, "WARNING: registry digest mismatch verification failed: %v\n", verifyErr)
+			}
+		}
 		return fmt.Errorf("failed to push image %s: %v, output: %s", targetImage, err, string(output))
 	}
 
 	return nil
+}
+
+func isManifestDigestMismatch(output string) bool {
+	return strings.Contains(output, "failed commit on ref \"manifest-sha256:") &&
+		strings.Contains(output, "got digest sha256:") &&
+		strings.Contains(output, "expected sha256:")
+}
+
+// verifyPushedImage handles registries or reverse proxies that persist the
+// uploaded manifest correctly but return an incorrect Docker-Content-Digest in
+// the successful PUT response. nerdctl treats that protocol violation as a
+// push failure. We only accept it after pulling the same tag and proving that
+// the resolved manifest digest is exactly the digest committed locally.
+func verifyPushedImage(targetImage, expectedManifestDigest string) error {
+	pullArgs := append(nerdctlBaseArgs(), "pull", targetImage)
+	output, err := commandCombinedOutput("nerdctl", pullArgs...)
+	if err != nil {
+		return fmt.Errorf("failed to pull image after registry digest mismatch: %w, output: %s", err, strings.TrimSpace(string(output)))
+	}
+
+	actualManifestDigest, err := getImageManifestDigest(targetImage)
+	if err != nil {
+		return fmt.Errorf("failed to inspect pulled image after registry digest mismatch: %w", err)
+	}
+	if actualManifestDigest != expectedManifestDigest {
+		return fmt.Errorf(
+			"pulled manifest digest %s does not match locally committed digest %s",
+			actualManifestDigest,
+			expectedManifestDigest,
+		)
+	}
+	return nil
+}
+
+func getImageManifestDigest(imageRef string) (string, error) {
+	args := append(nerdctlBaseArgs(), "images", "--format", "{{.Digest}}", imageRef)
+	output, err := commandCombinedOutput("nerdctl", args...)
+	if err != nil {
+		return "", fmt.Errorf("nerdctl images failed for image %s: %w, output: %s", imageRef, err, strings.TrimSpace(string(output)))
+	}
+	digest := strings.TrimSpace(string(output))
+	if digest == "" {
+		return "", fmt.Errorf("nerdctl images returned empty manifest digest for image %s", imageRef)
+	}
+	if strings.ContainsAny(digest, " \t\r\n") {
+		return "", fmt.Errorf("nerdctl images returned multiple or malformed manifest digests for image %s: %q", imageRef, digest)
+	}
+	return digest, nil
 }
 
 // nerdctlLogin extracts credentials from a Docker config.json and runs nerdctl login.

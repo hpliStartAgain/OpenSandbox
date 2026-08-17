@@ -219,3 +219,116 @@ func TestCommitContainerArgsDisablesSecondPause(t *testing.T) {
 		}
 	}
 }
+
+func TestGetImageManifestDigestReturnsDigest(t *testing.T) {
+	original := commandCombinedOutput
+	t.Cleanup(func() { commandCombinedOutput = original })
+	commandCombinedOutput = func(name string, args ...string) ([]byte, error) {
+		if name != "nerdctl" || !contains(args, "images") {
+			t.Fatalf("unexpected command %q %v", name, args)
+		}
+		return []byte("sha256:manifest123\n"), nil
+	}
+
+	digest, err := getImageManifestDigest("registry.example.com/test:snap")
+	if err != nil {
+		t.Fatalf("expected manifest digest lookup to succeed, got %v", err)
+	}
+	if digest != "sha256:manifest123" {
+		t.Fatalf("unexpected manifest digest %q", digest)
+	}
+}
+
+func TestVerifyPushedImageAcceptsExactRemoteManifest(t *testing.T) {
+	original := commandCombinedOutput
+	t.Cleanup(func() { commandCombinedOutput = original })
+
+	calls := 0
+	commandCombinedOutput = func(name string, args ...string) ([]byte, error) {
+		calls++
+		if name != "nerdctl" {
+			t.Fatalf("unexpected command %q", name)
+		}
+		switch calls {
+		case 1:
+			if !contains(args, "pull") {
+				t.Fatalf("first verification command must pull the remote tag: %v", args)
+			}
+			return []byte("pulled"), nil
+		case 2:
+			if !contains(args, "images") {
+				t.Fatalf("second verification command must inspect the manifest digest: %v", args)
+			}
+			return []byte("sha256:expected\n"), nil
+		default:
+			t.Fatalf("unexpected verification command #%d", calls)
+			return nil, nil
+		}
+	}
+
+	if err := verifyPushedImage("registry.example.com/test:snap", "sha256:expected"); err != nil {
+		t.Fatalf("expected exact remote manifest to be accepted, got %v", err)
+	}
+}
+
+func TestVerifyPushedImageRejectsDifferentRemoteManifest(t *testing.T) {
+	original := commandCombinedOutput
+	t.Cleanup(func() { commandCombinedOutput = original })
+
+	calls := 0
+	commandCombinedOutput = func(_ string, _ ...string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return []byte("pulled"), nil
+		}
+		return []byte("sha256:different\n"), nil
+	}
+
+	err := verifyPushedImage("registry.example.com/test:snap", "sha256:expected")
+	if err == nil {
+		t.Fatal("expected mismatched remote manifest to be rejected")
+	}
+}
+
+func TestManifestDigestMismatchDetectionIsNarrow(t *testing.T) {
+	known := `failed commit on ref "manifest-sha256:aaa": got digest sha256:bbb, expected sha256:aaa`
+	if !isManifestDigestMismatch(known) {
+		t.Fatal("expected known registry response digest mismatch to be detected")
+	}
+	if isManifestDigestMismatch("connection refused") {
+		t.Fatal("ordinary push errors must not be treated as digest mismatch")
+	}
+}
+
+func TestPushImageAcceptsOnlyVerifiedRegistryDigestMismatch(t *testing.T) {
+	original := commandCombinedOutput
+	t.Cleanup(func() { commandCombinedOutput = original })
+
+	calls := 0
+	commandCombinedOutput = func(name string, args ...string) ([]byte, error) {
+		calls++
+		if name != "nerdctl" {
+			t.Fatalf("unexpected command %q", name)
+		}
+		switch calls {
+		case 1:
+			return []byte("sha256:expected\n"), nil
+		case 2:
+			return []byte(`failed commit on ref "manifest-sha256:expected": got digest sha256:wrong, expected sha256:expected`), errors.New("exit status 1")
+		case 3:
+			if !contains(args, "pull") {
+				t.Fatalf("third command must verify the remote tag with pull: %v", args)
+			}
+			return []byte("pulled"), nil
+		case 4:
+			return []byte("sha256:expected\n"), nil
+		default:
+			t.Fatalf("unexpected command #%d", calls)
+			return nil, nil
+		}
+	}
+
+	if err := pushImage("registry.example.com/test:snap"); err != nil {
+		t.Fatalf("expected verified upload to be accepted, got %v", err)
+	}
+}
