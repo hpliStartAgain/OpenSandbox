@@ -529,7 +529,10 @@ func pushImage(targetImage string) error {
 }
 
 func isManifestDigestMismatch(output string) bool {
-	return strings.Contains(output, "failed commit on ref \"manifest-sha256:") &&
+	// logrus escapes the quotes around the manifest reference in its rendered
+	// message, so match the semantic markers instead of one exact quote layout.
+	return strings.Contains(output, "failed commit on ref") &&
+		strings.Contains(output, "manifest-sha256:") &&
 		strings.Contains(output, "got digest sha256:") &&
 		strings.Contains(output, "expected sha256:")
 }

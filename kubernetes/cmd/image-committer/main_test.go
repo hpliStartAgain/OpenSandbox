@@ -291,9 +291,12 @@ func TestVerifyPushedImageRejectsDifferentRemoteManifest(t *testing.T) {
 }
 
 func TestManifestDigestMismatchDetectionIsNarrow(t *testing.T) {
-	known := `failed commit on ref "manifest-sha256:aaa": got digest sha256:bbb, expected sha256:aaa`
+	known := `time="2026-08-17T11:48:49Z" level=fatal msg="failed commit on ref \"manifest-sha256:aaa\": got digest sha256:bbb, expected sha256:aaa"`
 	if !isManifestDigestMismatch(known) {
 		t.Fatal("expected known registry response digest mismatch to be detected")
+	}
+	if isManifestDigestMismatch(`failed commit on ref "layer-sha256:aaa": got digest sha256:bbb, expected sha256:aaa`) {
+		t.Fatal("layer integrity failures must not be treated as the known manifest response-header mismatch")
 	}
 	if isManifestDigestMismatch("connection refused") {
 		t.Fatal("ordinary push errors must not be treated as digest mismatch")
