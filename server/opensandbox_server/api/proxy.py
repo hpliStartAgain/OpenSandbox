@@ -88,6 +88,17 @@ WEBSOCKET_HANDSHAKE_HEADERS = {
 
 router = APIRouter(tags=["Sandboxes"])
 
+# ``responses={"default": ...}`` suppresses FastAPI's generated 422 entry.
+# Merge after generation so the existing 200/422 contract remains additive.
+PROXY_HTTP_OPENAPI_EXTRA = {
+    "responses": {
+        "default": {
+            "description": "Response relayed from the sandbox backend.",
+            "content": {"*/*": {}},
+        }
+    }
+}
+
 
 def _build_proxy_target_url(
     endpoint: Endpoint,
@@ -565,6 +576,7 @@ async def _proxy_websocket_request(
 @router.api_route(
     "/sandboxes/{sandbox_id}/proxy/{port}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    openapi_extra=PROXY_HTTP_OPENAPI_EXTRA,
 )
 async def proxy_sandbox_endpoint_root(
     request: Request,
@@ -578,6 +590,7 @@ async def proxy_sandbox_endpoint_root(
 @router.api_route(
     "/sandboxes/{sandbox_id}/proxy/{port}/{full_path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    openapi_extra=PROXY_HTTP_OPENAPI_EXTRA,
 )
 async def proxy_sandbox_endpoint_request(
     request: Request,

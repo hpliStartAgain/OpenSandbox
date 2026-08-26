@@ -110,6 +110,77 @@ def _set_http_client(client: TestClient, fake_client: _FakeAsyncClient) -> None:
     cast(Any, client.app).state.http_client = fake_client
 
 
+PROXY_HTTP_PATHS = (
+    "/sandboxes/{sandbox_id}/proxy/{port}",
+    "/sandboxes/{sandbox_id}/proxy/{port}/{full_path}",
+    "/v1/sandboxes/{sandbox_id}/proxy/{port}",
+    "/v1/sandboxes/{sandbox_id}/proxy/{port}/{full_path}",
+)
+PROXY_HTTP_METHODS = ("get", "post", "put", "delete", "patch")
+
+
+def test_proxy_openapi_declares_transparent_backend_responses(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+
+    operations = [
+        schema["paths"][path][method]
+        for path in PROXY_HTTP_PATHS
+        for method in PROXY_HTTP_METHODS
+    ]
+
+    assert len(operations) == 20
+    for operation in operations:
+        assert set(operation["responses"]) == {"200", "422", "default"}
+        assert operation["responses"]["default"] == {
+            "description": "Response relayed from the sandbox backend.",
+            "content": {"*/*": {}},
+        }
+
+
+@pytest.mark.parametrize("status_code", [200, 302, 405, 503])
+@pytest.mark.parametrize(
+    "request_path",
+    [
+        "/sandboxes/sbx-123/proxy/44772",
+        "/v1/sandboxes/sbx-123/proxy/44772/status",
+    ],
+)
+def test_proxy_preserves_backend_status_codes(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+    status_code: int,
+    request_path: str,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+            assert sandbox_id == "sbx-123"
+            assert port == 44772
+            assert resolve_internal is True
+            return Endpoint(endpoint="backend.example:40109")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+
+    fake_client = _FakeAsyncClient()
+    fake_client.response = _FakeStreamingResponse(
+        status_code=status_code,
+        headers={"content-type": "text/plain"},
+        chunks=[b"backend-response"],
+    )
+    _set_http_client(client, fake_client)
+
+    response = client.get(
+        request_path,
+        headers=auth_headers,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == status_code
+    assert response.content == b"backend-response"
+    assert response.headers["content-type"].startswith("text/plain")
+
+
 class _FakeBackendWebSocket:
     def __init__(self, message: str = "backend-ready", subprotocol: str | None = "claw.v1"):
         self.message = message
