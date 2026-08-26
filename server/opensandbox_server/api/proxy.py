@@ -31,6 +31,7 @@ from fastapi.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 from starlette.websockets import WebSocketDisconnect
 from websockets.asyncio.client import ClientConnection
+from websockets.frames import EXTERNAL_CLOSE_CODES
 from websockets.typing import Origin
 
 from opensandbox_server.api import lifecycle
@@ -87,6 +88,17 @@ WEBSOCKET_HANDSHAKE_HEADERS = {
 }
 
 router = APIRouter(tags=["Sandboxes"])
+
+# ``responses={"default": ...}`` suppresses FastAPI's generated 422 entry.
+# Merge after generation so the existing 200/422 contract remains additive.
+PROXY_HTTP_OPENAPI_EXTRA = {
+    "responses": {
+        "default": {
+            "description": "Response relayed from the sandbox backend.",
+            "content": {"*/*": {}},
+        }
+    }
+}
 
 
 def _build_proxy_target_url(
@@ -411,6 +423,15 @@ async def _fail_client_websocket(websocket: WebSocket, code: int, reason: str = 
         pass
 
 
+def _client_websocket_close_code(code: int | None) -> int:
+    """Map non-transmittable close codes to a legal client close code."""
+    if code is None:
+        return status.WS_1000_NORMAL_CLOSURE
+    if code in EXTERNAL_CLOSE_CODES or 3000 <= code < 5000:
+        return code
+    return status.WS_1011_INTERNAL_ERROR
+
+
 async def _relay_client_messages(
     websocket: WebSocket,
     backend: ClientConnection,
@@ -451,7 +472,7 @@ async def _relay_backend_messages(
     except websockets.ConnectionClosed as exc:
         try:
             await websocket.close(
-                code=exc.code or status.WS_1000_NORMAL_CLOSURE,
+                code=_client_websocket_close_code(exc.code),
                 reason=exc.reason or "",
             )
         except RuntimeError:
@@ -597,6 +618,7 @@ for _method in _PROXY_HTTP_METHODS:
         "/sandboxes/{sandbox_id}/proxy/{port}",
         proxy_sandbox_endpoint_root,
         methods=[_method],
+        openapi_extra=PROXY_HTTP_OPENAPI_EXTRA,
     )
 
 router.add_api_route(
@@ -611,6 +633,7 @@ for _method in _PROXY_HTTP_METHODS:
         "/sandboxes/{sandbox_id}/proxy/{port}/{full_path:path}",
         proxy_sandbox_endpoint_request,
         methods=[_method],
+        openapi_extra=PROXY_HTTP_OPENAPI_EXTRA,
     )
 
 

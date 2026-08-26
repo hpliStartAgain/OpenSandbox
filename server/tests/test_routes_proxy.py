@@ -23,6 +23,8 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import ClientDisconnect
 from starlette.types import Message
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+from websockets.frames import Close, CloseCode
 from websockets.typing import Origin
 
 import opensandbox_server.api.proxy as proxy_api
@@ -111,6 +113,15 @@ def _set_http_client(client: TestClient, fake_client: _FakeAsyncClient) -> None:
     cast(Any, client.app).state.http_client = fake_client
 
 
+PROXY_HTTP_PATHS = (
+    "/sandboxes/{sandbox_id}/proxy/{port}",
+    "/sandboxes/{sandbox_id}/proxy/{port}/{full_path}",
+    "/v1/sandboxes/{sandbox_id}/proxy/{port}",
+    "/v1/sandboxes/{sandbox_id}/proxy/{port}/{full_path}",
+)
+PROXY_HTTP_METHODS = ("get", "post", "put", "delete", "patch")
+
+
 class _FakeBackendWebSocket:
     def __init__(self, message: str = "backend-ready", subprotocol: str | None = "claw.v1"):
         self.message = message
@@ -152,6 +163,101 @@ class _FakeWebSocketConnector:
         return _ContextManager()
 
 
+class _ClosingBackendWebSocket:
+    def __init__(
+        self,
+        close_exception: ConnectionClosedError | ConnectionClosedOK,
+    ) -> None:
+        self._messages: list[str | bytes] = ["backend-text", b"\x00\x01"]
+        self._close_exception = close_exception
+
+    async def recv(self) -> str | bytes:
+        if self._messages:
+            return self._messages.pop(0)
+        raise self._close_exception
+
+
+class _RecordingClientWebSocket:
+    def __init__(self) -> None:
+        self.text_messages: list[str] = []
+        self.binary_messages: list[bytes] = []
+        self.close_calls: list[tuple[int, str]] = []
+
+    async def send_text(self, payload: str) -> None:
+        self.text_messages.append(payload)
+
+    async def send_bytes(self, payload: bytes) -> None:
+        self.binary_messages.append(payload)
+
+    async def close(self, code: int, reason: str = "") -> None:
+        Close(code, reason).serialize()
+        self.close_calls.append((code, reason))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend_close", "expected_code", "expected_reason"),
+    [
+        (ConnectionClosedError(None, None), 1011, ""),
+        (
+            ConnectionClosedError(Close(CloseCode.NO_STATUS_RCVD, ""), None),
+            1011,
+            "",
+        ),
+        (ConnectionClosedOK(Close(1000, "normal"), None), 1000, "normal"),
+        (ConnectionClosedError(Close(4001, "application close"), None), 4001, "application close"),
+    ],
+)
+async def test_relay_backend_messages_maps_non_transmittable_close_code(
+    backend_close: ConnectionClosedError | ConnectionClosedOK,
+    expected_code: int,
+    expected_reason: str,
+) -> None:
+    websocket = _RecordingClientWebSocket()
+    backend = _ClosingBackendWebSocket(backend_close)
+    cancelled: list[bool] = []
+    cancel_scope = SimpleNamespace(cancel=lambda: cancelled.append(True))
+
+    await asyncio.wait_for(
+        proxy_api._relay_backend_messages(
+            cast(Any, websocket),
+            cast(Any, backend),
+            cast(Any, cancel_scope),
+        ),
+        timeout=0.5,
+    )
+
+    assert websocket.text_messages == ["backend-text"]
+    assert websocket.binary_messages == [b"\x00\x01"]
+    assert websocket.close_calls == [(expected_code, expected_reason)]
+    assert cancelled == [True]
+
+
+@pytest.mark.parametrize(
+    ("backend_code", "expected_code"),
+    [
+        (None, 1000),
+        (999, 1011),
+        (1000, 1000),
+        (1004, 1011),
+        (1005, 1011),
+        (1006, 1011),
+        (1011, 1011),
+        (1015, 1011),
+        (2999, 1011),
+        (3000, 3000),
+        (4001, 4001),
+        (4999, 4999),
+        (5000, 1011),
+    ],
+)
+def test_client_websocket_close_code_maps_only_transmittable_codes(
+    backend_code: int | None,
+    expected_code: int,
+) -> None:
+    assert proxy_api._client_websocket_close_code(backend_code) == expected_code
+
+
 def test_proxy_openapi_operation_ids_are_unique(client: TestClient) -> None:
     app = cast(Any, client.app)
     app.openapi_schema = None
@@ -159,17 +265,10 @@ def test_proxy_openapi_operation_ids_are_unique(client: TestClient) -> None:
         warnings.simplefilter("always")
         schema = app.openapi()
 
-    proxy_paths = {
-        "/sandboxes/{sandbox_id}/proxy/{port}",
-        "/sandboxes/{sandbox_id}/proxy/{port}/{full_path}",
-        "/v1/sandboxes/{sandbox_id}/proxy/{port}",
-        "/v1/sandboxes/{sandbox_id}/proxy/{port}/{full_path}",
-    }
-    proxy_methods = {"get", "post", "put", "delete", "patch"}
     operation_ids = [
         schema["paths"][path][method]["operationId"]
-        for path in proxy_paths
-        for method in proxy_methods
+        for path in PROXY_HTTP_PATHS
+        for method in PROXY_HTTP_METHODS
     ]
     duplicate_warnings = [
         str(item.message)
@@ -181,6 +280,24 @@ def test_proxy_openapi_operation_ids_are_unique(client: TestClient) -> None:
     assert len(operation_ids) == 20
     assert len(set(operation_ids)) == len(operation_ids)
     assert duplicate_warnings == []
+
+
+def test_proxy_openapi_declares_transparent_backend_responses(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+
+    operations = [
+        schema["paths"][path][method]
+        for path in PROXY_HTTP_PATHS
+        for method in PROXY_HTTP_METHODS
+    ]
+
+    assert len(operations) == 20
+    for operation in operations:
+        assert set(operation["responses"]) == {"200", "422", "default"}
+        assert operation["responses"]["default"] == {
+            "description": "Response relayed from the sandbox backend.",
+            "content": {"*/*": {}},
+        }
 
 
 @pytest.mark.parametrize(
