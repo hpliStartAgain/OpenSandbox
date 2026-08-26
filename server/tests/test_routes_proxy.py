@@ -24,7 +24,7 @@ from fastapi.testclient import TestClient
 from starlette.requests import ClientDisconnect
 from starlette.types import Message
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
-from websockets.frames import Close
+from websockets.frames import Close, CloseCode
 from websockets.typing import Origin
 
 import opensandbox_server.api.proxy as proxy_api
@@ -190,11 +190,16 @@ class _RecordingClientWebSocket:
     ("backend_close", "expected_code", "expected_reason"),
     [
         (ConnectionClosedError(None, None), 1011, ""),
+        (
+            ConnectionClosedError(Close(CloseCode.NO_STATUS_RCVD, ""), None),
+            1011,
+            "",
+        ),
         (ConnectionClosedOK(Close(1000, "normal"), None), 1000, "normal"),
         (ConnectionClosedError(Close(4001, "application close"), None), 4001, "application close"),
     ],
 )
-async def test_relay_backend_messages_maps_only_abnormal_close_code(
+async def test_relay_backend_messages_maps_non_transmittable_close_code(
     backend_close: ConnectionClosedError | ConnectionClosedOK,
     expected_code: int,
     expected_reason: str,
@@ -217,6 +222,31 @@ async def test_relay_backend_messages_maps_only_abnormal_close_code(
     assert websocket.binary_messages == [b"\x00\x01"]
     assert websocket.close_calls == [(expected_code, expected_reason)]
     assert cancelled == [True]
+
+
+@pytest.mark.parametrize(
+    ("backend_code", "expected_code"),
+    [
+        (None, 1000),
+        (999, 1011),
+        (1000, 1000),
+        (1004, 1011),
+        (1005, 1011),
+        (1006, 1011),
+        (1011, 1011),
+        (1015, 1011),
+        (2999, 1011),
+        (3000, 3000),
+        (4001, 4001),
+        (4999, 4999),
+        (5000, 1011),
+    ],
+)
+def test_client_websocket_close_code_maps_only_transmittable_codes(
+    backend_code: int | None,
+    expected_code: int,
+) -> None:
+    assert proxy_api._client_websocket_close_code(backend_code) == expected_code
 
 
 def test_proxy_openapi_operation_ids_are_unique(client: TestClient) -> None:

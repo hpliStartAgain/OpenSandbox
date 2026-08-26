@@ -31,6 +31,7 @@ from fastapi.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 from starlette.websockets import WebSocketDisconnect
 from websockets.asyncio.client import ClientConnection
+from websockets.frames import EXTERNAL_CLOSE_CODES
 from websockets.typing import Origin
 
 from opensandbox_server.api import lifecycle
@@ -412,10 +413,12 @@ async def _fail_client_websocket(websocket: WebSocket, code: int, reason: str = 
 
 
 def _client_websocket_close_code(code: int | None) -> int:
-    """Map the reserved abnormal-closure code to a legal client close code."""
-    if code == status.WS_1006_ABNORMAL_CLOSURE:
-        return status.WS_1011_INTERNAL_ERROR
-    return code or status.WS_1000_NORMAL_CLOSURE
+    """Map non-transmittable close codes to a legal client close code."""
+    if code is None:
+        return status.WS_1000_NORMAL_CLOSURE
+    if code in EXTERNAL_CLOSE_CODES or 3000 <= code < 5000:
+        return code
+    return status.WS_1011_INTERNAL_ERROR
 
 
 async def _relay_client_messages(
