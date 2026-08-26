@@ -411,6 +411,13 @@ async def _fail_client_websocket(websocket: WebSocket, code: int, reason: str = 
         pass
 
 
+def _client_websocket_close_code(code: int | None) -> int:
+    """Map the reserved abnormal-closure code to a legal client close code."""
+    if code == status.WS_1006_ABNORMAL_CLOSURE:
+        return status.WS_1011_INTERNAL_ERROR
+    return code or status.WS_1000_NORMAL_CLOSURE
+
+
 async def _relay_client_messages(
     websocket: WebSocket,
     backend: ClientConnection,
@@ -451,7 +458,7 @@ async def _relay_backend_messages(
     except websockets.ConnectionClosed as exc:
         try:
             await websocket.close(
-                code=exc.code or status.WS_1000_NORMAL_CLOSURE,
+                code=_client_websocket_close_code(exc.code),
                 reason=exc.reason or "",
             )
         except RuntimeError:
