@@ -20,11 +20,13 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	resourcehelper "k8s.io/component-helpers/resource"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils"
+	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/fieldindex"
 )
 
 const (
@@ -180,7 +182,10 @@ func collectCapacitySnapshot(ctx context.Context, reader client.Reader, allocati
 
 func collectPoolCapacity(ctx context.Context, reader client.Reader, allocations poolAllocationReader, pool *sandboxv1alpha1.Pool) (poolCapacity, error) {
 	pods := &corev1.PodList{}
-	if err := reader.List(ctx, pods, client.InNamespace(pool.Namespace), client.MatchingLabels{LabelPoolName: pool.Name}); err != nil {
+	if err := reader.List(ctx, pods, &client.ListOptions{
+		Namespace:     pool.Namespace,
+		FieldSelector: fields.SelectorFromSet(fields.Set{fieldindex.IndexNameForOwnerRefUID: string(pool.UID)}),
+	}); err != nil {
 		return poolCapacity{}, err
 	}
 	allocatedPods, err := allocations.GetPoolAllocation(ctx, pool)
