@@ -26,7 +26,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 )
@@ -45,7 +44,7 @@ func TestCapacityMetricsExposePoolAndBatchSandboxState(t *testing.T) {
 	require.NoError(t, sandboxv1alpha1.AddToScheme(scheme))
 
 	pool := &sandboxv1alpha1.Pool{
-		ObjectMeta: metav1.ObjectMeta{Name: "warm", Namespace: "tenant-a"},
+		ObjectMeta: metav1.ObjectMeta{Name: "warm", Namespace: "tenant-a", UID: "warm-a"},
 		Status: sandboxv1alpha1.PoolStatus{
 			Total: 2, Allocated: 1, Available: 1, Updated: 2,
 		},
@@ -61,6 +60,7 @@ func TestCapacityMetricsExposePoolAndBatchSandboxState(t *testing.T) {
 		corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("128Mi"),
 	}
 	available := poolPod("available", "warm", true, "250m", "256Mi")
+	setPoolOwner(pool, allocated, available)
 	pooledSandbox := &sandboxv1alpha1.BatchSandbox{
 		ObjectMeta: metav1.ObjectMeta{Name: "pooled", Namespace: "tenant-a"},
 		Spec:       sandboxv1alpha1.BatchSandboxSpec{Replicas: int32Ptr(1), PoolRef: "warm"},
@@ -75,9 +75,7 @@ func TestCapacityMetricsExposePoolAndBatchSandboxState(t *testing.T) {
 			Phase: sandboxv1alpha1.BatchSandboxPhasePending, Replicas: 1, Allocated: 1,
 		},
 	}
-	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
-		pool, allocated, available, pooledSandbox, directSandbox,
-	).Build()
+	client := capacityMetricsClient(scheme, pool, allocated, available, pooledSandbox, directSandbox)
 	allocations := capacityAllocationReaderStub{allocations: map[string]map[string]string{
 		"tenant-a/warm": {"allocated": "pooled"},
 	}}
@@ -126,7 +124,7 @@ func TestCapacityMetricsUseSchedulerEquivalentPodRequests(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, sandboxv1alpha1.AddToScheme(scheme))
 
-	pool := &sandboxv1alpha1.Pool{ObjectMeta: metav1.ObjectMeta{Name: "warm", Namespace: "tenant-a"}}
+	pool := &sandboxv1alpha1.Pool{ObjectMeta: metav1.ObjectMeta{Name: "warm", Namespace: "tenant-a", UID: "warm-a"}}
 	allocated := poolPod("allocated", "warm", true, "500m", "512Mi")
 	allocated.Spec.InitContainers = []corev1.Container{{
 		Name: "init",
@@ -138,7 +136,8 @@ func TestCapacityMetricsUseSchedulerEquivalentPodRequests(t *testing.T) {
 		corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("128Mi"),
 	}
 	available := poolPod("available", "warm", true, "250m", "256Mi")
-	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool, allocated, available).Build()
+	setPoolOwner(pool, allocated, available)
+	client := capacityMetricsClient(scheme, pool, allocated, available)
 	allocations := capacityAllocationReaderStub{allocations: map[string]map[string]string{
 		"tenant-a/warm": {"allocated": "pooled"},
 	}}
