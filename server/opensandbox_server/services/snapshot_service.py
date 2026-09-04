@@ -243,7 +243,11 @@ class PersistedSnapshotService(SnapshotService):
             if record is None:
                 return
 
-        claimed = self._claim_operation(record)
+        try:
+            claimed = self._claim_operation(record)
+        except Exception:
+            self._ensure_recovery_thread()
+            raise
         if claimed is None:
             return
         self._delete_snapshot_worker(claimed, propagate=True)

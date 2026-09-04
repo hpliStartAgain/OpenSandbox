@@ -1034,6 +1034,53 @@ def test_sqlite_failed_delete_schedules_recovery_after_lease_expiry(tmp_path) ->
         service.close()
 
 
+def test_sqlite_failed_delete_claim_schedules_recovery(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    record = _snapshot_record(
+        "snap-delete-claim-retry",
+        SnapshotState.READY,
+        image="opensandbox-snapshots:snap-delete-claim-retry",
+    )
+    repo.create(record)
+    runtime = StubSnapshotRuntime()
+    original_claim = repo.claim_operation
+    claim_attempts = 0
+
+    def fail_first_claim(*args, **kwargs):
+        nonlocal claim_attempts
+        claim_attempts += 1
+        if claim_attempts == 1:
+            raise RuntimeError("transient claim failure")
+        return original_claim(*args, **kwargs)
+
+    repo.claim_operation = fail_first_claim
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        recovery_interval_seconds=0.01,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="transient claim failure"):
+            service.delete_snapshot(record.id)
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if repo.get(record.id) is None:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("SQLite deletion was not recovered after its initial claim failed")
+
+        assert claim_attempts == 2
+        assert runtime.delete_calls == [
+            (record.id, "opensandbox-snapshots:snap-delete-claim-retry"),
+        ]
+    finally:
+        service.close()
+
+
 def test_sqlite_rejected_metadata_delete_is_recovered(tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     record = _snapshot_record(
