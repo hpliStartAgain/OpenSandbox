@@ -433,12 +433,17 @@ class PersistedSnapshotService(SnapshotService):
             if not result.items:
                 return
 
-            deleted_any = False
+            result_set_changed = False
             for record in result.items:
                 try:
                     recovered = self._recover_unfinished_snapshot(record)
-                    if record.status.state == SnapshotState.DELETING and recovered:
-                        deleted_any = True
+                    if recovered:
+                        current = self._snapshot_repository.get(record.id)
+                        if current is None or current.status.state not in (
+                            SnapshotState.CREATING,
+                            SnapshotState.DELETING,
+                        ):
+                            result_set_changed = True
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "Failed to recover unfinished snapshot %s: %s",
@@ -447,7 +452,7 @@ class PersistedSnapshotService(SnapshotService):
                         exc_info=True,
                     )
 
-            if deleted_any:
+            if result_set_changed:
                 page = 1
                 continue
             if page * SNAPSHOT_RECOVERY_PAGE_SIZE >= result.total_items:

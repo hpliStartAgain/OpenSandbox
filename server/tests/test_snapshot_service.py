@@ -1306,6 +1306,31 @@ def test_sqlite_startup_recovers_deleting_backlog_across_page_boundary(tmp_path)
     assert all(repo.get(record.id) is None for record in records)
 
 
+def test_sqlite_startup_recovers_creating_backlog_across_page_boundary(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    records = [
+        _snapshot_record(f"snap-create-page-{index}", SnapshotState.CREATING)
+        for index in range(205)
+    ]
+    for record in records:
+        repo.create(record)
+    runtime = ReadyCreateRuntime()
+
+    PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=ImmediateExecutor(),
+    )
+
+    assert len(runtime.recover_calls) == len(records)
+    assert all(
+        (stored := repo.get(record.id)) is not None
+        and stored.status.state == SnapshotState.READY
+        for record in records
+    )
+
+
 def test_sqlite_startup_continues_creating_backlog_after_slots_free(tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     records = [
