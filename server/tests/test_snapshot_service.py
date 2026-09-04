@@ -883,3 +883,38 @@ def test_sqlite_startup_recovers_more_than_distributed_worker_limit(tmp_path) ->
         record.id for record in records
     )
     assert all(repo.get(record.id) is None for record in records)
+
+
+def test_sqlite_startup_continues_creating_backlog_after_slots_free(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    records = [
+        _snapshot_record(f"snap-create-{index}", SnapshotState.CREATING)
+        for index in range(3)
+    ]
+    for record in records:
+        repo.create(record)
+    runtime = BlockingRecoveryRuntime()
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        recovery_interval_seconds=0.02,
+    )
+
+    try:
+        assert runtime.two_started.wait(timeout=2)
+        assert runtime.three_started.is_set() is False
+        runtime.release.set()
+        assert runtime.three_started.wait(timeout=2)
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            stored = [repo.get(record.id) for record in records]
+            if all(item is not None and item.status.state == SnapshotState.READY for item in stored):
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("SQLite startup recovery did not drain the Creating backlog")
+    finally:
+        runtime.release.set()
+        service.close()
