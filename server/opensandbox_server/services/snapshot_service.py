@@ -427,9 +427,12 @@ class PersistedSnapshotService(SnapshotService):
             if not result.items:
                 return
 
+            deleted_any = False
             for record in result.items:
                 try:
-                    self._recover_unfinished_snapshot(record)
+                    recovered = self._recover_unfinished_snapshot(record)
+                    if record.status.state == SnapshotState.DELETING and recovered:
+                        deleted_any = True
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "Failed to recover unfinished snapshot %s: %s",
@@ -438,6 +441,9 @@ class PersistedSnapshotService(SnapshotService):
                         exc_info=True,
                     )
 
+            if deleted_any:
+                page = 1
+                continue
             if page * SNAPSHOT_RECOVERY_PAGE_SIZE >= result.total_items:
                 return
             page += 1
@@ -450,8 +456,7 @@ class PersistedSnapshotService(SnapshotService):
             claimed = self._claim_operation(record)
             if claimed is None:
                 return False
-            self._delete_snapshot_worker(claimed, propagate=False)
-            return True
+            return self._delete_snapshot_worker(claimed, propagate=False)
 
         return False
 
@@ -572,7 +577,7 @@ class PersistedSnapshotService(SnapshotService):
             raise
         future.add_done_callback(self._log_worker_failure)
 
-    def _delete_snapshot_worker(self, record: SnapshotRecord, *, propagate: bool) -> None:
+    def _delete_snapshot_worker(self, record: SnapshotRecord, *, propagate: bool) -> bool:
         heartbeat = self._start_lease_heartbeat(record)
         try:
             self._snapshot_runtime.delete_snapshot(
@@ -592,6 +597,7 @@ class PersistedSnapshotService(SnapshotService):
                     record.id,
                     record.operation_generation,
                 )
+            return deleted
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Failed to delete snapshot %s while holding generation %s: %s",
@@ -600,9 +606,10 @@ class PersistedSnapshotService(SnapshotService):
                 exc,
                 exc_info=True,
             )
+            self._ensure_recovery_thread()
             if propagate:
                 raise
-            return
+            return False
         finally:
             self._stop_lease_heartbeat(heartbeat)
 

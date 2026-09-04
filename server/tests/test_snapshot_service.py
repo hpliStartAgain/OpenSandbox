@@ -145,6 +145,19 @@ class BlockingRecoveryRuntime(StubSnapshotRuntime):
         )
 
 
+class FailOnceDeleteRuntime(StubSnapshotRuntime):
+    def delete_snapshot(
+        self,
+        snapshot_id: str,
+        image: str | None = None,
+        *,
+        namespace: str | None = None,
+    ) -> None:
+        self.delete_calls.append((snapshot_id, image))
+        if len(self.delete_calls) == 1:
+            raise RuntimeError("transient delete failure")
+
+
 class DistributedSQLiteSnapshotRepository(SQLiteSnapshotRepository):
     @property
     def supports_distributed_leases(self) -> bool:
@@ -689,6 +702,44 @@ def test_snapshot_service_recovers_delete_after_runtime_cleanup_succeeds(tmp_pat
     assert repo.get("snap-delete-crash") is None
 
 
+def test_sqlite_failed_delete_schedules_recovery_after_lease_expiry(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    record = _snapshot_record(
+        "snap-delete-retry",
+        SnapshotState.READY,
+        image="opensandbox-snapshots:snap-delete-retry",
+    )
+    repo.create(record)
+    runtime = FailOnceDeleteRuntime()
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        operation_lease_seconds=0.1,
+        lease_renew_interval_seconds=0.02,
+        recovery_interval_seconds=0.01,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="transient delete failure"):
+            service.delete_snapshot(record.id)
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if repo.get(record.id) is None:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("SQLite deletion was not retried after its lease expired")
+
+        assert runtime.delete_calls == [
+            (record.id, "opensandbox-snapshots:snap-delete-retry"),
+            (record.id, "opensandbox-snapshots:snap-delete-retry"),
+        ]
+    finally:
+        service.close()
+
+
 def test_snapshot_service_stale_worker_does_not_cleanup_runtime_artifact(tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     runtime = StubSnapshotRuntime()
@@ -882,6 +933,31 @@ def test_sqlite_startup_recovers_more_than_distributed_worker_limit(tmp_path) ->
     assert sorted(call[0] for call in runtime.delete_calls) == sorted(
         record.id for record in records
     )
+    assert all(repo.get(record.id) is None for record in records)
+
+
+def test_sqlite_startup_recovers_deleting_backlog_across_page_boundary(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    records = [
+        _snapshot_record(
+            f"snap-delete-page-{index}",
+            SnapshotState.DELETING,
+            image=f"opensandbox-snapshots:snap-delete-page-{index}",
+        )
+        for index in range(205)
+    ]
+    for record in records:
+        repo.create(record)
+    runtime = StubSnapshotRuntime()
+
+    PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=ImmediateExecutor(),
+    )
+
+    assert len(runtime.delete_calls) == len(records)
     assert all(repo.get(record.id) is None for record in records)
 
 
