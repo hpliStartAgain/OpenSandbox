@@ -105,7 +105,11 @@ latency for Kubernetes snapshots; it does not provide an exactly-once guarantee
 across PostgreSQL, Kubernetes, and the image registry.
 :::
 
-For Kubernetes Secret and Helm values wiring, see [Kubernetes Deployment](/kubernetes/deployment#use-postgresql-for-server-persistence).
+The Helm chart still defaults to one Server replica. An explicitly configured
+two-replica topology is supported for public snapshots only under the
+PostgreSQL-plus-Kubernetes conditions above. For Secret, configuration, and
+Helm values wiring, see
+[Kubernetes Deployment](/kubernetes/deployment#use-postgresql-for-server-persistence).
 
 ### OpenTelemetry metrics
 
