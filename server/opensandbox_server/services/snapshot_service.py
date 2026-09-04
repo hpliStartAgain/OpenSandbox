@@ -98,6 +98,8 @@ class PersistedSnapshotService(SnapshotService):
     Snapshot service backed by the configured repository.
     """
 
+    _preserve_deleting_on_cleanup_failure = False
+
     def __init__(
         self,
         snapshot_repository: SnapshotRepository,
@@ -346,7 +348,13 @@ class PersistedSnapshotService(SnapshotService):
             return
 
         if current_record.status.state == SnapshotState.DELETING:
-            self._cleanup_runtime_artifact(current_record.id, runtime_status.image, current_record.namespace)
+            cleaned = self._cleanup_runtime_artifact(
+                current_record.id,
+                runtime_status.image,
+                current_record.namespace,
+            )
+            if self._preserve_deleting_on_cleanup_failure and not cleaned:
+                return
             self._snapshot_repository.delete(current_record.id)
             return
 
@@ -502,12 +510,13 @@ class PersistedSnapshotService(SnapshotService):
         snapshot_id: str,
         image: str | None,
         namespace: str | None = "default",
-    ) -> None:
+    ) -> bool:
         if not image:
-            return
+            return False
 
         try:
             self._snapshot_runtime.delete_snapshot(snapshot_id, image=image, namespace=namespace)
+            return True
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Failed to cleanup snapshot artifact for %s: %s",
@@ -515,6 +524,7 @@ class PersistedSnapshotService(SnapshotService):
                 exc,
                 exc_info=True,
             )
+            return False
 
     @staticmethod
     def _ensure_source_sandbox_running(sandbox) -> None:
@@ -561,6 +571,8 @@ class PersistedSnapshotService(SnapshotService):
 
 class PostgreSQLKubernetesSnapshotService(PersistedSnapshotService):
     """Periodic unfinished-operation recovery for PostgreSQL + Kubernetes only."""
+
+    _preserve_deleting_on_cleanup_failure = True
 
     def __init__(
         self,

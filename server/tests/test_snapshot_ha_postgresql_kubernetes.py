@@ -42,13 +42,13 @@ from opensandbox_server.services.snapshot_models import (
     SnapshotState,
     SnapshotStatusRecord,
 )
+from opensandbox_server.services.snapshot_runtime import SnapshotRuntimeStatus
 from opensandbox_server.services.snapshot_runtime_factory import create_snapshot_runtime
 from opensandbox_server.services.snapshot_repository import (
     SnapshotListQuery,
     SnapshotListResult,
 )
 from opensandbox_server.services.snapshot_service import (
-    PersistedSnapshotService,
     PostgreSQLKubernetesSnapshotService,
 )
 
@@ -239,24 +239,26 @@ def test_two_active_services_share_one_cr_and_one_terminal_cas(
     postgresql_dsn: str,
 ) -> None:
     repositories = [_repository(postgresql_dsn), _repository(postgresql_dsn)]
-    services: list[PersistedSnapshotService] = []
+    services: list[PostgreSQLKubernetesSnapshotService] = []
     try:
         _truncate(postgresql_dsn)
-        repositories[0].create(_creating_record())
         k8s_client = _SharedK8sClient(force_create_conflict=True)
         cas_winners: list[str] = []
 
         for repository in repositories:
             runtime = create_snapshot_runtime(_config(postgresql_dsn), k8s_client=k8s_client)
-            services.append(
-                PersistedSnapshotService(
-                    _CountingRepository(repository, cas_winners),
-                    _SandboxService(),
-                    snapshot_runtime=runtime,
-                    snapshot_executor=_ImmediateExecutor(),
-                    recover_unfinished_snapshots=False,
-                )
+            service = PostgreSQLKubernetesSnapshotService(
+                _CountingRepository(repository, cas_winners),
+                _SandboxService(),
+                snapshot_runtime=runtime,
+                snapshot_executor=_ImmediateExecutor(),
+                recovery_interval_seconds=60,
             )
+            service._recovery_stop.set()
+            service._recovery_thread.join()
+            services.append(service)
+
+        repositories[0].create(_creating_record())
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(service.recover_unfinished_snapshots) for service in services]
@@ -281,6 +283,17 @@ def test_two_active_services_share_one_cr_and_one_terminal_cas(
             updated_at=datetime.now(timezone.utc),
         )
         assert repositories[0].update_if_state(deleting, SnapshotState.READY)
+        services[0]._complete_snapshot(
+            deleting,
+            SnapshotRuntimeStatus(
+                state=SnapshotState.CREATING,
+                reason="snapshot_runtime_timeout",
+                message="A stale worker has no artifact to clean up.",
+            ),
+        )
+        still_deleting = repositories[0].get(SNAPSHOT_ID)
+        assert still_deleting is not None
+        assert still_deleting.status.state == SnapshotState.DELETING
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(service.recover_unfinished_snapshots) for service in services]

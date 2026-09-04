@@ -515,6 +515,83 @@ def test_snapshot_service_worker_cleans_up_snapshot_deleted_during_creation(tmp_
     assert repo.get(created.id) is None
 
 
+def test_postgresql_kubernetes_worker_preserves_deleting_row_without_artifact(
+    tmp_path,
+) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = StubSnapshotRuntime()
+    service = PostgreSQLKubernetesSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        recovery_interval_seconds=60,
+    )
+    service._recovery_stop.set()
+    service._recovery_thread.join()
+    try:
+        record = _snapshot_record("snap-delete-recovery", SnapshotState.DELETING)
+        repo.create(record)
+
+        service._complete_snapshot(
+            record,
+            SnapshotRuntimeStatus(
+                state=SnapshotState.CREATING,
+                reason="snapshot_runtime_timeout",
+                message="Snapshot creation is still recoverable.",
+            ),
+        )
+
+        stored = repo.get(record.id)
+        assert stored is not None
+        assert stored.status.state == SnapshotState.DELETING
+        assert runtime.delete_calls == []
+    finally:
+        service.close()
+
+
+def test_postgresql_kubernetes_worker_preserves_deleting_row_on_cleanup_failure(
+    tmp_path,
+) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = StubSnapshotRuntime()
+
+    def fail_delete(*args, **kwargs) -> None:
+        raise RuntimeError("temporary Kubernetes delete failure")
+
+    runtime.delete_snapshot = fail_delete
+    service = PostgreSQLKubernetesSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        recovery_interval_seconds=60,
+    )
+    service._recovery_stop.set()
+    service._recovery_thread.join()
+    try:
+        record = _snapshot_record(
+            "snap-delete-retry",
+            SnapshotState.DELETING,
+            image="registry/sandbox:snapshot",
+        )
+        repo.create(record)
+
+        service._complete_snapshot(
+            record,
+            SnapshotRuntimeStatus(
+                state=SnapshotState.READY,
+                image="registry/sandbox:snapshot",
+                reason="snapshot_runtime_ready",
+                message="Snapshot image is ready.",
+            ),
+        )
+
+        stored = repo.get(record.id)
+        assert stored is not None
+        assert stored.status.state == SnapshotState.DELETING
+    finally:
+        service.close()
+
+
 def test_snapshot_service_worker_does_not_overwrite_transitioned_snapshot(tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     runtime = StubSnapshotRuntime()
