@@ -25,6 +25,7 @@ Tracking issue: [#1713](https://github.com/opensandbox-group/OpenSandbox/issues/
   - [Relationship to Existing Work](#relationship-to-existing-work)
   - [Public Configuration](#public-configuration)
   - [Capability Negotiation](#capability-negotiation)
+  - [Static Pass-Through Overlap](#static-pass-through-overlap)
   - [TLS Decision Contract](#tls-decision-contract)
   - [Authoritative Decision Snapshot](#authoritative-decision-snapshot)
   - [Revision Transaction Protocol](#revision-transaction-protocol)
@@ -127,7 +128,7 @@ in the fleet profile.
 | R7 | Removing the final binding for a host fences new requests from the retired revision before acknowledgement; previously admitted requests may drain for a bounded interval while new connections use pass-through | Must Have |
 | R8 | The request-admission linearization point and prior-revision completion semantics are explicit for HTTP/1.1 and HTTP/2 | Must Have |
 | R9 | Sidecar and fleet profiles expose the same user-visible behavior | Must Have |
-| R10 | Static `ignore_hosts` keeps precedence, and bindings that overlap it remain invalid | Must Have |
+| R10 | Static pass-through keeps precedence, and overlap with binding selectors is rejected using a sound shared host-selector algebra | Must Have |
 | R11 | Metrics and logs contain no credentials and avoid unbounded hostname labels | Must Have |
 | R12 | Phase 1 covers canonical HTTPS port 443; other TLS ports require explicit follow-up support | Must Have |
 | R13 | HTTP port 80 behavior remains unchanged in the first implementation | Must Have |
@@ -136,6 +137,7 @@ in the fleet profile.
 | R16 | TLS host selectors include only bindings eligible for HTTPS on canonical port 443 | Must Have |
 | R17 | Every Credential Vault PATCH in credential-bound mode requires `expectedRevision` | Must Have |
 | R18 | The non-default mode uses a capability-gated create route that does not exist on older servers, so unsupported backends cannot silently create an `all`-mode sandbox | Must Have |
+| R19 | Credential-bound mode rejects legacy arbitrary-regex `ignore_hosts`; operators must use analyzable exact/wildcard pass-through selectors | Must Have |
 
 ## Proposal
 
@@ -186,9 +188,11 @@ method, path, and any future binding selectors before injecting a credential.
 - Certificate-pinned clients work without the OpenSandbox CA only for hosts
   that remain unbound. Bound hosts continue to require CA trust and may remain
   incompatible with pinning.
-- Existing static `ignore_hosts` entries remain operator policy and win over
-  dynamic selection. OSEP-0012 validation already rejects binding hosts that
-  overlap static pass-through configuration.
+- Static operator pass-through remains higher precedence than dynamic
+  selection, but credential-bound mode accepts only the analyzable exact and
+  leftmost-wildcard selector list defined below. Existing arbitrary-regex
+  `ignore_hosts` remains supported in `all` mode and must be migrated before
+  enabling `credential-bound`.
 - Network allow/deny behavior does not change. A pass-through decision does not
   imply that egress policy allows the destination.
 - Selection is defined on the TLS connection's visible SNI, not on every HTTP
@@ -213,6 +217,7 @@ method, path, and any future binding selectors before injecting a credential.
 | HTTP/2 origin coalescing carries a bound authority over an unbound SNI connection | The request remains opaque and receives no credential | Define the feature as SNI-connection scoped, reject cross-authority requests on decrypted connections, and document that credentialed clients must connect with the bound host as SNI |
 | Live connection tracking exhausts memory | Revision fencing becomes unreliable | Enforce global and per-subject live-connection caps; deny new tracked TLS connections on exhaustion |
 | A new client sends `interceptionMode` to an older server that ignores unknown nested fields | The request silently runs in `all` mode and decrypts unrelated TLS | Never send the new mode to the legacy create route; use a capability-gated route that older servers cannot match |
+| A wildcard binding overlaps only one exact hostname matched by static pass-through | Probe-based validation misses the overlap, so credential traffic passes through without injection | Reject legacy regex configuration in the new mode and compare exact/wildcard selector languages directly |
 
 ## Design Details
 
@@ -364,6 +369,54 @@ reject unknown nested fields. This catches typos and future fields when a
 caller reaches a capable server, but it is defense in depth rather than the
 old-server negotiation mechanism.
 
+### Static Pass-Through Overlap
+
+The current mitmproxy `ignore_hosts` option is an arbitrary Python regular-
+expression list. The existing Go validation cannot soundly prove that such a
+regex is disjoint from a Credential Vault wildcard by testing the literal
+selector and one synthetic `probe.` hostname. For example,
+`^api\.example\.com$` overlaps `*.example.com` even though neither probe is a
+complete proof of the two languages' intersection.
+
+Credential-bound mode therefore introduces an operator-owned selector list:
+
+```bash
+OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS='["status.example.com","*.logs.example.com"]'
+```
+
+The list uses exactly the same normalized host grammar as Credential Vault
+bindings:
+
+- exact IDNA-normalized FQDN, such as `status.example.com`; or
+- leftmost-label wildcard, such as `*.logs.example.com`, matching one or more
+  subdomain labels but not the apex.
+
+When `interceptionMode=credential-bound`, startup fails closed if the baked-in
+mitmproxy `ignore_hosts` list is non-empty. The error identifies the migration
+requirement but does not echo sensitive configuration. Operators move intended
+entries to `OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS`. The sidecar
+compiles those selectors to anchored mitmproxy regexes only after validation;
+callers cannot provide raw regex. The legacy regex option remains unchanged for
+`all` mode.
+
+Vault create and PATCH compare every HTTPS/443 binding host selector against
+every static pass-through selector using semantic intersection:
+
+| Binding selector | Static selector | Overlap rule |
+|---|---|---|
+| exact | exact | normalized hosts are equal |
+| exact | wildcard | the exact host is a non-apex member of the wildcard |
+| wildcard | exact | the exact host is a non-apex member of the wildcard |
+| wildcard | wildcard | their suffix languages are nested or equal; one normalized base is equal to or a subdomain of the other |
+
+Any overlap rejects the complete candidate revision before prepare/commit. The
+same shared selector parser, normalizer, matcher, and intersection function are
+used by Go validation and the addon decision snapshot; probe-based overlap
+checks are not part of credential-bound correctness. The static selector list
+is immutable for the egress process lifetime. A future hot-reload design must
+join the same per-subject mutation barrier and revalidate every active binding
+before activation.
+
 ### TLS Decision Contract
 
 `all` mode keeps the current decision path and does not require a Credential
@@ -382,7 +435,8 @@ order:
 3. If SNI is absent, pass through without credentials and record
    `reason=no_sni`. Credential-bound runtimes already reject
    `ssl_insecure=true`, so there is no insecure no-SNI MITM exception.
-4. If static `ignore_hosts` matches normalized SNI, pass through and record
+4. If the validated static pass-through selector list matches normalized SNI,
+   pass through and record
    `reason=static_ignore`.
 5. Load the installed active acknowledged decision snapshot for that identity.
    If it is unavailable or bootstrapping, deny the connection.
@@ -606,7 +660,7 @@ old generation cannot affect the replacement subject.
 |---|---|
 | Authoritative active-empty snapshot | Select pass-through after live-connection registry admission |
 | SNI does not match a bound host | Select pass-through after live-connection registry admission |
-| Static `ignore_hosts` match | Pass through; binding overlap remains invalid |
+| Validated static pass-through selector match | Pass through; semantic overlap with a binding is rejected before activation |
 | ECH hides the actual SNI | Pass through as opaque TLS; no credential injection |
 | No SNI | Preserve current secure no-SNI pass-through behavior; no credential injection |
 | Live connection registry cap reached | Deny; do not create an untracked visible-SNI pass-through or decrypted connection |
@@ -761,7 +815,12 @@ it does not change traffic.
 - ECH is detected before outer-SNI matching and selects opaque pass-through.
 - Bound SNI selects decryption, then still requires a full HTTP binding match.
 - HTTP-only bindings do not add hosts to `tlsBindingHostSelectors`.
-- Static `ignore_hosts` wins, and overlapping binding revisions are rejected.
+- Exact/exact, exact/wildcard, wildcard/exact, and wildcard/wildcard overlap
+  checks reject every intersecting binding revision.
+- Static exact `api.example.com` rejects binding wildcard `*.example.com`; the
+  inverse combination and nested wildcard suffixes are covered as regressions.
+- Credential-bound startup rejects any non-empty legacy regex `ignore_hosts`
+  list and accepts the equivalent analyzable pass-through selector list.
 - Missing/bootstrapping state is distinct from an acknowledged empty revision,
   timeout, 5xx, malformed JSON, dispatch miss, and generation mismatch; only
   the acknowledged empty revision selects dynamic pass-through.
@@ -854,7 +913,9 @@ proposal.
 
 Operators can already rebuild or mount a static mitmproxy configuration. It
 does not follow sandbox-local runtime mutations, cannot vary per fleet subject,
-and risks drift between the static list and the active vault.
+and risks drift between the static list and the active vault. Arbitrary regex
+also has no sound intersection check against the binding wildcard language, so
+credential-bound mode requires migration to the analyzable selector list.
 
 ### Bypass mitmproxy in iptables or nftables
 
@@ -917,6 +978,10 @@ paths.
 6. Document that every `PATCH /credential-vault` request in this mode must
    include the existing `expectedRevision`; callers can obtain it from `GET
    /credential-vault`.
-7. Keep current static `ignore_hosts`, CA setup, and `all` behavior unchanged.
+7. Keep current regex `ignore_hosts`, CA setup, and `all` behavior unchanged for
+   existing deployments. Before enabling `credential-bound`, migrate intended
+   static bypass entries to the exact/wildcard
+   `OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS` list; the new mode rejects a
+   non-empty legacy regex list.
 8. Do not change the default in this OSEP. A future default change requires
    usage data, addon compatibility evidence, and a separate migration plan.
