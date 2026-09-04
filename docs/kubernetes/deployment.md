@@ -89,6 +89,7 @@ the complete `configToml` value:
 ```yaml
 server:
   replicaCount: 2
+  replicaSafetyMode: postgresql-kubernetes
   env:
     - name: OPENSANDBOX_STORE_POSTGRESQL_DSN
       valueFrom:
@@ -109,9 +110,11 @@ configToml: |
 ::: info
 Multiple active Server replicas are supported for Kubernetes public snapshots
 when every replica uses the same PostgreSQL database. The chart rejects
-`server.replicaCount > 1` unless `configToml` selects both PostgreSQL and the
-Kubernetes runtime. It does not add session affinity because any healthy replica
-can read or restore a terminal snapshot.
+`server.replicaCount > 1` unless `server.replicaSafetyMode` explicitly declares
+`postgresql-kubernetes`. Set this declaration only when `configToml` selects
+both PostgreSQL and the Kubernetes runtime; Helm cannot safely parse arbitrary
+TOML to verify the declaration. The chart does not add session affinity because
+any healthy replica can read or restore a terminal snapshot.
 :::
 
 PostgreSQL operation leases select one worker for each `Creating` or `Deleting`
@@ -166,7 +169,8 @@ curl --fail http://127.0.0.1:8080/health
 |-------|---------|-------|
 | `server.image.repository` | Server image registry and repository | Override for a private mirror or custom build. |
 | `server.image.tag` | Server image version | The release install command pins it to `APP_VERSION`. |
-| `server.replicaCount` | Number of server Pods | Defaults to `1`. Values greater than `1` require `[store] type = "postgresql"` and `[runtime] type = "kubernetes"` in `configToml`. |
+| `server.replicaCount` | Number of server Pods | Defaults to `1`. Values greater than `1` require `server.replicaSafetyMode = "postgresql-kubernetes"` and matching PostgreSQL/Kubernetes settings in `configToml`. |
+| `server.replicaSafetyMode` | Explicit multi-replica snapshot topology declaration | Defaults to empty. Set to `postgresql-kubernetes` only when `configToml` selects PostgreSQL and the Kubernetes runtime. |
 | `server.env` | Additional container environment variables | Use it with `secretKeyRef` for `OPENSANDBOX_SERVER_API_KEY`. |
 | `configToml` | Complete server configuration | Mounted at `/etc/opensandbox/config.toml`; overriding it replaces the complete default TOML, including the workload namespace. |
 | `server.gateway.enabled` | Deploy the ingress gateway with the server | Defaults to `false`. |

@@ -67,44 +67,28 @@ jobs:
           error_log="${RUNNER_TEMP}/opensandbox-server-sqlite-replica-error.log"
           if helm template opensandbox-server "$chart_path" \
             --set server.replicaCount=2 >/dev/null 2>"$error_log"; then
-            echo "::error::SQLite multi-replica render unexpectedly succeeded"
+            echo "::error::Undeclared multi-replica render unexpectedly succeeded"
             exit 1
           fi
-          grep -F 'requires [store] type = "postgresql" and [runtime] type = "kubernetes"' "$error_log"
+          grep -F 'requires server.replicaSafetyMode = "postgresql-kubernetes"' "$error_log"
           if helm template opensandbox-server "$chart_path" \
             --set server.replicaCount=2 \
-            --set-string $'configToml=[runtime]\ntype = "docker"\n\n[store]\ntype = "postgresql"\n' \
+            --set-string $'configToml=note = """\n[runtime]\ntype = "kubernetes"\n[store]\ntype = "postgresql"\n"""\n\n[runtime]\ntype = "docker"\n\n[store]\ntype = "sqlite"\n' \
             >/dev/null 2>"$error_log"; then
-            echo "::error::Docker multi-replica render unexpectedly succeeded"
+            echo "::error::TOML string content bypassed the explicit replica declaration"
             exit 1
           fi
-          grep -F 'requires [store] type = "postgresql" and [runtime] type = "kubernetes"' "$error_log"
+          grep -F 'requires server.replicaSafetyMode = "postgresql-kubernetes"' "$error_log"
           if helm template opensandbox-server "$chart_path" \
-            --set server.replicaCount=2 \
-            --set-string $'configToml=[runtime] # active runtime\ntype = "docker"\n\n[store] # active store\ntype = "sqlite"\n\n[unrelated]\ntype = "kubernetes"\n\n[unrelated.nested]\ntype = "postgresql"\n' \
+            --set-string server.replicaSafetyMode=postgresql-docker \
             >/dev/null 2>"$error_log"; then
-            echo "::error::Commented TOML headers widened replica-safety sections"
+            echo "::error::Unsupported replica safety mode unexpectedly succeeded"
             exit 1
           fi
-          grep -F 'requires [store] type = "postgresql" and [runtime] type = "kubernetes"' "$error_log"
-          if helm template opensandbox-server "$chart_path" \
-            --set server.replicaCount=2 \
-            --set-string $'configToml=[runtime]\ntype = "docker"\n\n[[runtime.backends]]\ntype = "kubernetes"\n\n[store]\ntype = "sqlite"\n\n[[store.backends]]\ntype = "postgresql"\n' \
-            >/dev/null 2>"$error_log"; then
-            echo "::error::TOML array tables widened replica-safety sections"
-            exit 1
-          fi
-          grep -F 'requires [store] type = "postgresql" and [runtime] type = "kubernetes"' "$error_log"
-          if helm template opensandbox-server "$chart_path" \
-            --set server.replicaCount=2 \
-            --set-string $'configToml=[runtime]\ntype = "docker"\nnote = """\ntype = "kubernetes"\n"""\n\n[store]\ntype = "sqlite"\nnote = """\ntype = "postgresql"\n"""\n' \
-            >/dev/null 2>"$error_log"; then
-            echo "::error::TOML multiline values widened replica-safety sections"
-            exit 1
-          fi
-          grep -F 'requires [store] type = "postgresql" and [runtime] type = "kubernetes"' "$error_log"
+          grep -F 'server.replicaSafetyMode must be empty or "postgresql-kubernetes"' "$error_log"
           helm template opensandbox-server "$chart_path" \
             --set server.replicaCount=2 \
+            --set-string server.replicaSafetyMode=postgresql-kubernetes \
             --set-string $'configToml=[runtime] # active runtime\ntype = "kubernetes" # multi-replica\n\n[store] # active store\ntype = "postgresql" # shared database\n' \
             >/dev/null
 

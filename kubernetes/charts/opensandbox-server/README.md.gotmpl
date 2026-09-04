@@ -58,9 +58,10 @@ helm install opensandbox-server "${CHART_URL}" \
 See the [Kubernetes deployment guide](../../../docs/kubernetes/deployment.md) for production configuration, verification, and upgrades.
 
 The chart defaults to one Server replica. Setting `server.replicaCount` above
-one requires `[store] type = "postgresql"` and `[runtime] type = "kubernetes"`
-in `configToml`; rendering fails closed for the default SQLite store and the
-Docker runtime. Docker snapshots remain single-active.
+one requires `server.replicaSafetyMode = "postgresql-kubernetes"`. This value is
+an explicit topology declaration; set it only when `configToml` selects
+`[store] type = "postgresql"` and `[runtime] type = "kubernetes"`. Rendering
+fails closed without the declaration. Docker snapshots remain single-active.
 
 ## Install from local source
 

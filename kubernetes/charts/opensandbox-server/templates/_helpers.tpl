@@ -88,17 +88,18 @@ Image pull policy
 {{- end }}
 
 {{/*
-Reject multiple server replicas unless the effective [store] section selects
-PostgreSQL and the effective [runtime] section selects Kubernetes. SQLite is
-process-local, and Docker snapshot execution cannot coordinate active replicas.
+Reject multiple server replicas unless the operator explicitly declares the
+supported PostgreSQL plus Kubernetes snapshot topology. Helm cannot safely
+parse arbitrary TOML, so this declaration must match configToml.
 */}}
 {{- define "opensandbox-server.validateSnapshotStoreReplicas" -}}
+{{- $mode := .Values.server.replicaSafetyMode | default "" -}}
+{{- if and (ne $mode "") (ne $mode "postgresql-kubernetes") -}}
+{{- fail "server.replicaSafetyMode must be empty or \"postgresql-kubernetes\"" -}}
+{{- end -}}
 {{- if gt (int .Values.server.replicaCount) 1 -}}
-{{- $configToml := printf "%s\n" .Values.configToml -}}
-{{- $usesPostgreSQL := regexMatch `(?m)^[ \t]*\[store\][ \t]*(?:#[^\r\n]*)?\r?\n(?:[ \t]*(?:#[^\r\n]*)?\r?\n)*[ \t]*type[ \t]*=[ \t]*["']postgresql["'][ \t]*(?:#[^\r\n]*)?\r?$` $configToml -}}
-{{- $usesKubernetes := regexMatch `(?m)^[ \t]*\[runtime\][ \t]*(?:#[^\r\n]*)?\r?\n(?:[ \t]*(?:#[^\r\n]*)?\r?\n)*[ \t]*type[ \t]*=[ \t]*["']kubernetes["'][ \t]*(?:#[^\r\n]*)?\r?$` $configToml -}}
-{{- if or (not $usesPostgreSQL) (not $usesKubernetes) -}}
-{{- fail "server.replicaCount greater than 1 requires [store] type = \"postgresql\" and [runtime] type = \"kubernetes\" in configToml; SQLite and Docker snapshot execution support one active server replica" -}}
+{{- if ne $mode "postgresql-kubernetes" -}}
+{{- fail "server.replicaCount greater than 1 requires server.replicaSafetyMode = \"postgresql-kubernetes\" and matching [store] and [runtime] settings in configToml; SQLite and Docker snapshot execution support one active server replica" -}}
 {{- end -}}
 {{- end -}}
 {{- end }}

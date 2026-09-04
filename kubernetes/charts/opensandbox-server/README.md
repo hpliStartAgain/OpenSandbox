@@ -58,9 +58,10 @@ helm install opensandbox-server "${CHART_URL}" \
 See the [Kubernetes deployment guide](../../../docs/kubernetes/deployment.md) for production configuration, verification, and upgrades.
 
 The chart defaults to one Server replica. Setting `server.replicaCount` above
-one requires `[store] type = "postgresql"` and `[runtime] type = "kubernetes"`
-in `configToml`; rendering fails closed for the default SQLite store and the
-Docker runtime. Docker snapshots remain single-active.
+one requires `server.replicaSafetyMode = "postgresql-kubernetes"`. This value is
+an explicit topology declaration; set it only when `configToml` selects
+`[store] type = "postgresql"` and `[runtime] type = "kubernetes"`. Rendering
+fails closed without the declaration. Docker snapshots remain single-active.
 
 ## Install from local source
 
@@ -159,7 +160,8 @@ The following table lists the configurable parameters of the chart and their def
 | server.podLabels | object | `{}` | Extra labels for the server pod. |
 | server.podSecurityContext | object | `{}` | Pod-level security context for the server pod. |
 | server.priorityClassName | string | `""` | Priority class name for the server pod. |
-| server.replicaCount | int | `1` | Number of server replicas. Values greater than 1 require PostgreSQL and the Kubernetes runtime in configToml. |
+| server.replicaCount | int | `1` | Number of server replicas. Values greater than 1 require replicaSafetyMode "postgresql-kubernetes" and matching configToml settings. |
+| server.replicaSafetyMode | string | `""` | Explicit snapshot topology declaration. Set to "postgresql-kubernetes" only when configToml selects PostgreSQL and the Kubernetes runtime; required when replicaCount is greater than 1. |
 | server.resources | object | `{"limits":{"cpu":"2","memory":"8Gi"},"requests":{"cpu":"1","memory":"4Gi"}}` | Resource requests and limits |
 | server.service.nodePort | string | `""` | Node port to bind when type is not ClusterIP. Empty lets Kubernetes allocate one from the cluster node-port range. |
 | server.service.type | string | `"ClusterIP"` | Service type for the server. Set to NodePort or LoadBalancer to reach the server from outside the cluster. |
