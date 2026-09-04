@@ -158,6 +158,53 @@ class BlockingRecoveryRuntime(StubSnapshotRuntime):
         )
 
 
+class BlockingDockerLikeCreateRuntime(StubSnapshotRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = Event()
+        self.release = Event()
+        self.image_ready = False
+        self.recover_calls: list[str] = []
+
+    def create_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        *,
+        namespace: str | None = None,
+    ) -> SnapshotRuntimeStatus:
+        self.calls.append((snapshot_id, sandbox_id))
+        self.started.set()
+        if not self.release.wait(timeout=2):
+            raise TimeoutError("test did not release Docker-like snapshot creation")
+        self.image_ready = True
+        return SnapshotRuntimeStatus(
+            state=SnapshotState.READY,
+            image=f"opensandbox-snapshots:{snapshot_id}",
+            reason="snapshot_runtime_ready",
+        )
+
+    def recover_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        image: str | None = None,
+        *,
+        namespace: str | None = None,
+    ) -> SnapshotRuntimeStatus:
+        self.recover_calls.append(snapshot_id)
+        if not self.image_ready:
+            return SnapshotRuntimeStatus(
+                state=SnapshotState.FAILED,
+                reason="snapshot_recovery_missing_image",
+            )
+        return SnapshotRuntimeStatus(
+            state=SnapshotState.READY,
+            image=f"opensandbox-snapshots:{snapshot_id}",
+            reason="snapshot_recovery_ready",
+        )
+
+
 class FailOnceDeleteRuntime(StubSnapshotRuntime):
     def delete_snapshot(
         self,
@@ -683,6 +730,74 @@ def test_queued_never_started_snapshot_uses_create_during_recovery(tmp_path) -> 
     finally:
         if second_heartbeat is not None:
             service._stop_lease_heartbeat(second_heartbeat)
+        service.close()
+
+
+def test_sqlite_recovery_does_not_reclaim_live_local_create(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = BlockingDockerLikeCreateRuntime()
+    recovery_saw_expired_record = Event()
+    claim_calls = 0
+    original_list_recoverable = repo.list_recoverable_operations
+    original_claim = repo.claim_operation
+
+    def observe_recovery_candidates(states: list[SnapshotState], limit: int):
+        records = original_list_recoverable(states, limit)
+        if states == [SnapshotState.CREATING] and records:
+            recovery_saw_expired_record.set()
+        return records
+
+    def count_claims(*args, **kwargs):
+        nonlocal claim_calls
+        claim_calls += 1
+        return original_claim(*args, **kwargs)
+
+    repo.list_recoverable_operations = observe_recovery_candidates
+    repo.claim_operation = count_claims
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        operation_lease_seconds=0.2,
+        lease_renew_interval_seconds=0.05,
+        recovery_interval_seconds=0.01,
+    )
+
+    try:
+        created = service.create_snapshot(
+            "sbx-001",
+            CreateSnapshotRequest(name="slow-docker-commit"),
+        )
+        assert runtime.started.wait(timeout=2)
+        with repo._connect() as conn:
+            conn.execute(
+                "UPDATE snapshots SET lease_expires_at = ? WHERE id = ?",
+                ("1970-01-01T00:00:00+00:00", created.id),
+            )
+
+        assert recovery_saw_expired_record.wait(timeout=2)
+        active = repo.get(created.id)
+        assert active is not None
+        assert active.status.state == SnapshotState.CREATING
+        assert active.operation_generation == 1
+        assert claim_calls == 1
+        assert runtime.recover_calls == []
+
+        runtime.release.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            stored = repo.get(created.id)
+            if stored is not None and stored.status.state == SnapshotState.READY:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("SQLite did not recover the completed local snapshot")
+
+        assert runtime.calls == [(created.id, "sbx-001")]
+        assert runtime.recover_calls == [created.id]
+        assert claim_calls == 2
+    finally:
+        runtime.release.set()
         service.close()
 
 

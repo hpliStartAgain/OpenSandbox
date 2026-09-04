@@ -133,6 +133,8 @@ class PersistedSnapshotService(SnapshotService):
             thread_name_prefix="snapshot-create",
         )
         self._worker_slots = BoundedSemaphore(SNAPSHOT_WORKER_MAX_WORKERS)
+        self._active_operations_lock = Lock()
+        self._active_operations: set[tuple[str, int]] = set()
         self._operation_owner = operation_owner or self._default_operation_owner()
         self._operation_lease_duration = timedelta(seconds=operation_lease_seconds)
         self._lease_renew_interval_seconds = lease_renew_interval_seconds
@@ -337,6 +339,9 @@ class PersistedSnapshotService(SnapshotService):
         release_worker_slot: bool = False,
     ) -> None:
         active_heartbeat = heartbeat or self._start_lease_heartbeat(record)
+        operation_key = (record.id, record.operation_generation)
+        with self._active_operations_lock:
+            self._active_operations.add(operation_key)
         try:
             resume_runtime = recovery and record.operation_attempt > 0
             try:
@@ -397,6 +402,8 @@ class PersistedSnapshotService(SnapshotService):
 
             self._complete_snapshot(record, runtime_status)
         finally:
+            with self._active_operations_lock:
+                self._active_operations.discard(operation_key)
             self._stop_lease_heartbeat(active_heartbeat)
             if release_worker_slot:
                 self._worker_slots.release()
@@ -491,6 +498,9 @@ class PersistedSnapshotService(SnapshotService):
 
     def _recover_unfinished_snapshot(self, record: SnapshotRecord) -> bool:
         if record.status.state == SnapshotState.CREATING:
+            if self._is_locally_active_operation(record):
+                self._ensure_recovery_thread()
+                return False
             return self._try_start_create_operation(record, recovery=True)
 
         if record.status.state == SnapshotState.DELETING:
@@ -591,6 +601,12 @@ class PersistedSnapshotService(SnapshotService):
             record.lease_owner,
             record.operation_generation,
         )
+
+    def _is_locally_active_operation(self, record: SnapshotRecord) -> bool:
+        if record.lease_owner != self._operation_owner:
+            return False
+        with self._active_operations_lock:
+            return (record.id, record.operation_generation) in self._active_operations
 
     def _try_start_create_operation(
         self,
