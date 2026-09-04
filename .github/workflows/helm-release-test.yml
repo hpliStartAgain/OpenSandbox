@@ -79,9 +79,17 @@ jobs:
             exit 1
           fi
           grep -F 'requires [store] type = "postgresql" and [runtime] type = "kubernetes"' "$error_log"
+          if helm template opensandbox-server "$chart_path" \
+            --set server.replicaCount=2 \
+            --set-string $'configToml=[runtime] # active runtime\ntype = "docker"\n\n[store] # active store\ntype = "sqlite"\n\n[unrelated]\ntype = "kubernetes"\n\n[unrelated.nested]\ntype = "postgresql"\n' \
+            >/dev/null 2>"$error_log"; then
+            echo "::error::Commented TOML headers widened replica-safety sections"
+            exit 1
+          fi
+          grep -F 'requires [store] type = "postgresql" and [runtime] type = "kubernetes"' "$error_log"
           helm template opensandbox-server "$chart_path" \
             --set server.replicaCount=2 \
-            --set-string $'configToml=[runtime]\ntype = "kubernetes"\n\n[store]\ntype = "postgresql"\n' \
+            --set-string $'configToml=[runtime] # active runtime\ntype = "kubernetes" # multi-replica\n\n[store] # active store\ntype = "postgresql" # shared database\n' \
             >/dev/null
 
       - name: Install Kind
