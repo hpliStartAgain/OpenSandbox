@@ -1315,6 +1315,20 @@ def test_sqlite_startup_recovers_creating_backlog_across_page_boundary(tmp_path)
     for record in records:
         repo.create(record)
     runtime = ReadyCreateRuntime()
+    listed_pages: list[int] = []
+    original_list = repo.list
+    original_recover = runtime.recover_snapshot
+
+    def record_page(query: SnapshotListQuery):
+        listed_pages.append(query.page)
+        return original_list(query)
+
+    def assert_all_pages_collected(*args, **kwargs):
+        assert listed_pages == [1, 2]
+        return original_recover(*args, **kwargs)
+
+    repo.list = record_page
+    runtime.recover_snapshot = assert_all_pages_collected
 
     PersistedSnapshotService(
         repo,

@@ -421,6 +421,7 @@ class PersistedSnapshotService(SnapshotService):
             self._ensure_recovery_thread()
 
     def recover_unfinished_snapshots(self) -> None:
+        records: list[SnapshotRecord] = []
         page = 1
         while True:
             result = self._snapshot_repository.list(
@@ -431,33 +432,22 @@ class PersistedSnapshotService(SnapshotService):
                 )
             )
             if not result.items:
-                return
-
-            result_set_changed = False
-            for record in result.items:
-                try:
-                    recovered = self._recover_unfinished_snapshot(record)
-                    if recovered:
-                        current = self._snapshot_repository.get(record.id)
-                        if current is None or current.status.state not in (
-                            SnapshotState.CREATING,
-                            SnapshotState.DELETING,
-                        ):
-                            result_set_changed = True
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Failed to recover unfinished snapshot %s: %s",
-                        record.id,
-                        exc,
-                        exc_info=True,
-                    )
-
-            if result_set_changed:
-                page = 1
-                continue
+                break
+            records.extend(result.items)
             if page * SNAPSHOT_RECOVERY_PAGE_SIZE >= result.total_items:
-                return
+                break
             page += 1
+
+        for record in records:
+            try:
+                self._recover_unfinished_snapshot(record)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to recover unfinished snapshot %s: %s",
+                    record.id,
+                    exc,
+                    exc_info=True,
+                )
 
     def _recover_unfinished_snapshot(self, record: SnapshotRecord) -> bool:
         if record.status.state == SnapshotState.CREATING:
