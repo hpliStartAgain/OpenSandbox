@@ -419,7 +419,12 @@ class PersistedSnapshotService(SnapshotService):
     def recover_unfinished_snapshots(self) -> None:
         page = 1
         claimed_count = 0
-        while claimed_count < SNAPSHOT_WORKER_MAX_WORKERS:
+        claim_limit = (
+            SNAPSHOT_WORKER_MAX_WORKERS
+            if self._snapshot_repository.supports_distributed_leases
+            else None
+        )
+        while claim_limit is None or claimed_count < claim_limit:
             result = self._snapshot_repository.list(
                 SnapshotListQuery(
                     page=page,
@@ -434,7 +439,7 @@ class PersistedSnapshotService(SnapshotService):
                 try:
                     if self._recover_unfinished_snapshot(record):
                         claimed_count += 1
-                        if claimed_count >= SNAPSHOT_WORKER_MAX_WORKERS:
+                        if claim_limit is not None and claimed_count >= claim_limit:
                             return
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(

@@ -760,3 +760,30 @@ def test_snapshot_service_recovers_deleting_snapshot(tmp_path) -> None:
 
     assert runtime.delete_calls == [("snap-delete", "opensandbox-snapshots:snap-delete")]
     assert repo.get("snap-delete") is None
+
+
+def test_sqlite_startup_recovers_more_than_distributed_worker_limit(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    records = [
+        _snapshot_record(
+            f"snap-delete-{index}",
+            SnapshotState.DELETING,
+            image=f"opensandbox-snapshots:snap-delete-{index}",
+        )
+        for index in range(3)
+    ]
+    for record in records:
+        repo.create(record)
+    runtime = StubSnapshotRuntime()
+
+    PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=ImmediateExecutor(),
+    )
+
+    assert sorted(call[0] for call in runtime.delete_calls) == sorted(
+        record.id for record in records
+    )
+    assert all(repo.get(record.id) is None for record in records)
