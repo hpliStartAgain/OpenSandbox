@@ -16,6 +16,8 @@
 Repository abstraction for persisted snapshot records.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Protocol
@@ -68,6 +70,14 @@ class SnapshotRepository(Protocol):
         """
         List snapshot records with optional filtering and pagination.
         """
+        ...
+
+    def list_recoverable_operations(
+        self,
+        states: list[SnapshotState],
+        limit: int,
+    ) -> list[SnapshotRecord]:
+        """List a bounded set of unowned or expired operations."""
         ...
 
     def update(self, record: SnapshotRecord) -> SnapshotRecord:

@@ -208,6 +208,35 @@ class PostgreSQLSnapshotRepository:
             total_items=int(total_row["total_items"]) if total_row is not None else 0,
         )
 
+    def list_recoverable_operations(
+        self,
+        states: list[SnapshotState],
+        limit: int,
+    ) -> list[SnapshotRecord]:
+        if not states or limit <= 0:
+            return []
+
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                sql.SQL("""
+                SELECT {}
+                FROM snapshots
+                WHERE state = ANY(%(states)s)
+                  AND (
+                      lease_owner IS NULL
+                      OR lease_expires_at IS NULL
+                      OR lease_expires_at <= CURRENT_TIMESTAMP
+                  )
+                ORDER BY created_at ASC, id ASC
+                LIMIT %(limit)s
+                """).format(sql.SQL(_SELECT_COLUMNS)),
+                {
+                    "states": [state.value for state in states],
+                    "limit": limit,
+                },
+            ).fetchall()
+        return [self._row_to_record(row) for row in rows]
+
     def update(self, record: SnapshotRecord) -> SnapshotRecord:
         with self._pool.connection() as conn:
             conn.execute(

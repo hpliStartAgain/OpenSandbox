@@ -142,8 +142,7 @@ class PersistedSnapshotService(SnapshotService):
         self._recovery_thread: Thread | None = None
         if recover_unfinished_snapshots:
             self.recover_unfinished_snapshots()
-            if self._snapshot_repository.supports_distributed_leases:
-                self._ensure_recovery_thread()
+            self._ensure_recovery_thread()
 
     def create_snapshot(self, sandbox_id: str, request: CreateSnapshotRequest) -> Snapshot:
         sandbox = self._sandbox_service.get_sandbox(sandbox_id)
@@ -425,33 +424,55 @@ class PersistedSnapshotService(SnapshotService):
             self._ensure_recovery_thread()
 
     def recover_unfinished_snapshots(self) -> None:
-        records: list[SnapshotRecord] = []
-        page = 1
-        while True:
-            result = self._snapshot_repository.list(
-                SnapshotListQuery(
-                    page=page,
-                    page_size=SNAPSHOT_RECOVERY_PAGE_SIZE,
-                    states=[SnapshotState.CREATING.value, SnapshotState.DELETING.value],
-                )
-            )
-            if not result.items:
-                break
-            records.extend(result.items)
-            if page * SNAPSHOT_RECOVERY_PAGE_SIZE >= result.total_items:
-                break
-            page += 1
+        self._recover_creating_snapshots()
+        self._recover_deleting_snapshots()
 
+    def _recover_creating_snapshots(self) -> None:
+        while self._has_available_worker_slot():
+            records = self._snapshot_repository.list_recoverable_operations(
+                [SnapshotState.CREATING],
+                SNAPSHOT_WORKER_MAX_WORKERS,
+            )
+            if not records:
+                return
+            if not self._recover_records(records):
+                self._ensure_recovery_thread()
+                return
+        self._ensure_recovery_thread()
+
+    def _recover_deleting_snapshots(self) -> None:
+        while True:
+            records = self._snapshot_repository.list_recoverable_operations(
+                [SnapshotState.DELETING],
+                SNAPSHOT_RECOVERY_PAGE_SIZE,
+            )
+            if not records:
+                return
+            if not self._recover_records(records):
+                self._ensure_recovery_thread()
+                return
+
+    def _recover_records(self, records: list[SnapshotRecord]) -> bool:
+        all_progressed = True
         for record in records:
             try:
-                self._recover_unfinished_snapshot(record)
+                if not self._recover_unfinished_snapshot(record):
+                    all_progressed = False
             except Exception as exc:  # noqa: BLE001
+                all_progressed = False
                 logger.warning(
                     "Failed to recover unfinished snapshot %s: %s",
                     record.id,
                     exc,
                     exc_info=True,
                 )
+        return all_progressed
+
+    def _has_available_worker_slot(self) -> bool:
+        if not self._worker_slots.acquire(blocking=False):
+            return False
+        self._worker_slots.release()
+        return True
 
     def _recover_unfinished_snapshot(self, record: SnapshotRecord) -> bool:
         if record.status.state == SnapshotState.CREATING:

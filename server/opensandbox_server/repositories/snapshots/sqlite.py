@@ -172,6 +172,51 @@ class SQLiteSnapshotRepository:
             total_items=total_items,
         )
 
+    def list_recoverable_operations(
+        self,
+        states: list[SnapshotState],
+        limit: int,
+    ) -> list[SnapshotRecord]:
+        if not states or limit <= 0:
+            return []
+
+        state_values = [state.value for state in states]
+        placeholders = ", ".join("?" for _ in state_values)
+        now = self._datetime_to_str(datetime.now(timezone.utc))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    id,
+                    source_sandbox_id,
+                    namespace,
+                    name,
+                    description,
+                    restore_config,
+                    state,
+                    reason,
+                    message,
+                    last_transition_at,
+                    created_at,
+                    updated_at,
+                    operation_generation,
+                    lease_owner,
+                    lease_expires_at,
+                    operation_attempt
+                FROM snapshots
+                WHERE state IN ({placeholders})
+                  AND (
+                      lease_owner IS NULL
+                      OR lease_expires_at IS NULL
+                      OR lease_expires_at <= ?
+                  )
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                tuple([*state_values, now, limit]),
+            ).fetchall()
+        return [self._row_to_record(row) for row in rows]
+
     def update(self, record: SnapshotRecord) -> SnapshotRecord:
         with self._connect() as conn:
             conn.execute(

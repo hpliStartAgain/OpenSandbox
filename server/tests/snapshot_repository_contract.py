@@ -243,3 +243,68 @@ class SnapshotRepositoryContract:
         assert stored.status.state == SnapshotState.READY
         assert stored.lease_owner is None
         assert stored.lease_expires_at is None
+
+    def test_lists_bounded_recoverable_operations(
+        self,
+        repository: SnapshotRepository,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        deleting = snapshot_record(
+            "snap-deleting",
+            "sbx-001",
+            now,
+            SnapshotState.DELETING,
+        )
+        expired = snapshot_record(
+            "snap-expired",
+            "sbx-001",
+            now + timedelta(seconds=1),
+        )
+        active = snapshot_record(
+            "snap-active",
+            "sbx-001",
+            now + timedelta(seconds=2),
+        )
+        ready = snapshot_record(
+            "snap-ready",
+            "sbx-001",
+            now + timedelta(seconds=3),
+            SnapshotState.READY,
+        )
+        for record in (deleting, expired, active, ready):
+            repository.create(record)
+
+        assert repository.claim_operation(
+            expired.id,
+            SnapshotState.CREATING,
+            "stopped-server",
+            timedelta(seconds=-1),
+        ) is not None
+        assert repository.claim_operation(
+            active.id,
+            SnapshotState.CREATING,
+            "active-server",
+            timedelta(seconds=30),
+        ) is not None
+
+        recoverable = repository.list_recoverable_operations(
+            [SnapshotState.CREATING, SnapshotState.DELETING],
+            2,
+        )
+        assert [record.id for record in recoverable] == [deleting.id, expired.id]
+        assert [
+            record.id
+            for record in repository.list_recoverable_operations(
+                [SnapshotState.CREATING, SnapshotState.DELETING],
+                1,
+            )
+        ] == [deleting.id]
+        assert [
+            record.id
+            for record in repository.list_recoverable_operations(
+                [SnapshotState.CREATING],
+                10,
+            )
+        ] == [expired.id]
+        assert repository.list_recoverable_operations([], 10) == []
+        assert repository.list_recoverable_operations([SnapshotState.CREATING], 0) == []

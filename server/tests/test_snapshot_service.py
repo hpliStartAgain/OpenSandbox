@@ -703,6 +703,14 @@ def test_recovery_claims_only_available_worker_slots(tmp_path) -> None:
     for record in records:
         repo.create(record)
     runtime = BlockingRecoveryRuntime()
+    recovery_queries: list[tuple[list[SnapshotState], int]] = []
+    original_list_recoverable = repo.list_recoverable_operations
+
+    def record_recovery_query(states: list[SnapshotState], limit: int):
+        recovery_queries.append((states, limit))
+        return original_list_recoverable(states, limit)
+
+    repo.list_recoverable_operations = record_recovery_query
     service = PersistedSnapshotService(
         repo,
         StubSandboxService(),
@@ -717,11 +725,20 @@ def test_recovery_claims_only_available_worker_slots(tmp_path) -> None:
         stored = [repo.get(record.id) for record in records]
         assert sum(item is not None and item.lease_owner is not None for item in stored) == 2
         assert sum(item is not None and item.lease_owner is None for item in stored) == 1
+        creating_query_count = sum(
+            states == [SnapshotState.CREATING]
+            for states, _limit in recovery_queries
+        )
+        assert creating_query_count == 1
 
         service.recover_unfinished_snapshots()
         stored = [repo.get(record.id) for record in records]
         assert sum(item is not None and item.lease_owner is not None for item in stored) == 2
         assert runtime.three_started.is_set() is False
+        assert sum(
+            states == [SnapshotState.CREATING]
+            for states, _limit in recovery_queries
+        ) == creating_query_count
 
         runtime.release.set()
         deadline = time.monotonic() + 2
@@ -1406,20 +1423,14 @@ def test_sqlite_startup_recovers_creating_backlog_across_page_boundary(tmp_path)
     for record in records:
         repo.create(record)
     runtime = ReadyCreateRuntime()
-    listed_pages: list[int] = []
-    original_list = repo.list
-    original_recover = runtime.recover_snapshot
+    recovery_queries: list[tuple[list[SnapshotState], int]] = []
+    original_list_recoverable = repo.list_recoverable_operations
 
-    def record_page(query: SnapshotListQuery):
-        listed_pages.append(query.page)
-        return original_list(query)
+    def record_recovery_query(states: list[SnapshotState], limit: int):
+        recovery_queries.append((states, limit))
+        return original_list_recoverable(states, limit)
 
-    def assert_all_pages_collected(*args, **kwargs):
-        assert listed_pages == [1, 2]
-        return original_recover(*args, **kwargs)
-
-    repo.list = record_page
-    runtime.recover_snapshot = assert_all_pages_collected
+    repo.list_recoverable_operations = record_recovery_query
 
     PersistedSnapshotService(
         repo,
@@ -1429,6 +1440,13 @@ def test_sqlite_startup_recovers_creating_backlog_across_page_boundary(tmp_path)
     )
 
     assert len(runtime.recover_calls) == len(records)
+    creating_limits = [
+        limit
+        for states, limit in recovery_queries
+        if states == [SnapshotState.CREATING]
+    ]
+    assert creating_limits
+    assert set(creating_limits) == {2}
     assert all(
         (stored := repo.get(record.id)) is not None
         and stored.status.state == SnapshotState.READY
