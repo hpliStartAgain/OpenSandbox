@@ -95,6 +95,27 @@ class TransientThenReadyK8sClient(TransientGetK8sClient):
         return obj
 
 
+class TransientThenPendingThenReadyK8sClient(FakeK8sClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.get_calls = 0
+        self.objects[build_public_snapshot_name(SNAPSHOT_ID)] = _snapshot_cr(phase="Pending")
+
+    def get_custom_object(self, **kwargs):
+        self.get_calls += 1
+        if self.get_calls == 1:
+            raise ApiException(status=500, reason="temporary apiserver error")
+        snapshot = deepcopy(self.objects[kwargs["name"]])
+        if self.get_calls >= 4:
+            snapshot["status"] = {
+                "phase": "Succeed",
+                "containers": [
+                    {"containerName": "sandbox", "imageUri": "registry/sandbox:snap"},
+                ],
+            }
+        return snapshot
+
+
 class ReadyOnCreateK8sClient(FakeK8sClient):
     def create_custom_object(self, **kwargs):
         stored = super().create_custom_object(**kwargs)
@@ -293,6 +314,33 @@ def test_create_snapshot_retries_transient_inspect_error_until_controller_ready(
 
     assert status.state == SnapshotState.READY
     assert status.image == "registry/sandbox:snap"
+
+
+def test_create_snapshot_uses_one_deadline_for_observation_and_completion(monkeypatch) -> None:
+    k8s_client = TransientThenPendingThenReadyK8sClient()
+    ticks = iter([0.0, 9.0, 10.0])
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(
+        "opensandbox_server.services.k8s.snapshot_runtime.time.monotonic",
+        lambda: next(ticks),
+    )
+    monkeypatch.setattr(
+        "opensandbox_server.services.k8s.snapshot_runtime.time.sleep",
+        sleep_calls.append,
+    )
+    runtime = KubernetesSnapshotRuntime(
+        k8s_client,
+        namespace="default",
+        wait_timeout_seconds=10,
+        poll_interval_seconds=1,
+    )
+
+    status = runtime.create_snapshot(SNAPSHOT_ID, SANDBOX_ID)
+
+    assert status.state == SnapshotState.FAILED
+    assert status.reason == "snapshot_runtime_timeout"
+    assert k8s_client.get_calls == 3
+    assert sleep_calls == [1]
 
 
 def test_delete_snapshot_deletes_cr_and_ignores_missing_cr() -> None:

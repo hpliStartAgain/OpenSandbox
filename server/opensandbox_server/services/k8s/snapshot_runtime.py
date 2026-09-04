@@ -92,9 +92,14 @@ class KubernetesSnapshotRuntime:
         snapshot_name = build_public_snapshot_name(snapshot_id)
         ns = namespace if namespace is not None else self._namespace
         self._snapshot_namespaces[snapshot_id] = ns
+        deadline = time.monotonic() + self._wait_timeout_seconds
         body = self._build_snapshot_body(snapshot_id, sandbox_id, snapshot_name, namespace=ns)
 
-        observed, current = self._observe_snapshot(snapshot_name, namespace=ns)
+        observed, current = self._observe_snapshot(
+            snapshot_name,
+            namespace=ns,
+            deadline=deadline,
+        )
         if not observed:
             return SnapshotRuntimeStatus(
                 state=SnapshotState.CREATING,
@@ -112,7 +117,11 @@ class KubernetesSnapshotRuntime:
                 "Kubernetes SandboxSnapshot %s already exists; resuming observation",
                 snapshot_name,
             )
-            return self._wait_for_terminal_snapshot(snapshot_id, namespace=ns)
+            return self._wait_for_terminal_snapshot(
+                snapshot_id,
+                namespace=ns,
+                deadline=deadline,
+            )
 
         try:
             self._k8s_client.create_custom_object(
@@ -130,7 +139,11 @@ class KubernetesSnapshotRuntime:
                     message=f"Failed to create Kubernetes SandboxSnapshot {snapshot_name}: {exc}",
                 )
             logger.info("Kubernetes SandboxSnapshot %s won the create race", snapshot_name)
-            observed, current = self._observe_snapshot(snapshot_name, namespace=ns)
+            observed, current = self._observe_snapshot(
+                snapshot_name,
+                namespace=ns,
+                deadline=deadline,
+            )
             if not observed:
                 return SnapshotRuntimeStatus(
                     state=SnapshotState.CREATING,
@@ -151,7 +164,11 @@ class KubernetesSnapshotRuntime:
                 message=f"Failed to create Kubernetes SandboxSnapshot {snapshot_name}: {exc}",
             )
 
-        return self._wait_for_terminal_snapshot(snapshot_id, namespace=ns)
+        return self._wait_for_terminal_snapshot(
+            snapshot_id,
+            namespace=ns,
+            deadline=deadline,
+        )
 
     def get_snapshot_status(self, snapshot_id: str) -> Optional[SnapshotRuntimeStatus]:
         ns = self._snapshot_namespaces.get(snapshot_id)
@@ -248,8 +265,8 @@ class KubernetesSnapshotRuntime:
         snapshot_name: str,
         *,
         namespace: str,
+        deadline: float,
     ) -> tuple[bool, Optional[dict]]:
-        deadline = time.monotonic() + self._wait_timeout_seconds
         while True:
             try:
                 return True, self._get_snapshot_cr(snapshot_name, namespace=namespace)
@@ -284,8 +301,13 @@ class KubernetesSnapshotRuntime:
             ),
         )
 
-    def _wait_for_terminal_snapshot(self, snapshot_id: str, *, namespace: str | None = None) -> SnapshotRuntimeStatus:
-        deadline = time.monotonic() + self._wait_timeout_seconds
+    def _wait_for_terminal_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        namespace: str | None = None,
+        deadline: float,
+    ) -> SnapshotRuntimeStatus:
         while True:
             runtime_status = self.inspect_snapshot(snapshot_id, namespace=namespace)
             if runtime_status.state in (SnapshotState.READY, SnapshotState.FAILED):
