@@ -828,7 +828,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         self._ensure_pool_mode_compatible(request, has_pool_ref)
 
         if not has_pool_ref:
-            request = resolve_sandbox_image_from_request(request)
+            request = await resolve_sandbox_image_from_request(request)
             ensure_entrypoint(request.entrypoint or [])
         ensure_metadata_labels(request.metadata)
         ensure_platform_valid(request.platform)

@@ -15,9 +15,10 @@
 import textwrap
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from opensandbox_server import config as config_module
+from opensandbox_server.cli import render_full_config
 from opensandbox_server.config import (
     AppConfig,
     LogConfig,
@@ -32,6 +33,8 @@ from opensandbox_server.config import (
     SecureAccessConfig,
     SecureAccessKey,
     ServerConfig,
+    POSTGRESQL_DSN_ENV_VAR,
+    PostgreSQLStoreConfig,
     StoreConfig,
     StorageConfig,
 )
@@ -267,6 +270,20 @@ def test_store_defaults_to_sqlite():
     assert cfg.path.endswith("opensandbox.db")
 
 
+def test_postgresql_store_requires_dsn():
+    with pytest.raises(ValidationError, match="must be set"):
+        StoreConfig(type="postgresql")
+
+
+def test_postgresql_store_validates_pool_size():
+    with pytest.raises(ValidationError, match="min_pool_size"):
+        PostgreSQLStoreConfig(
+            dsn=SecretStr("postgresql://localhost/opensandbox"),
+            min_pool_size=3,
+            max_pool_size=2,
+        )
+
+
 def test_renew_intent_defaults():
     cfg = AppConfig(runtime=RuntimeConfig(type="docker", execd_image="opensandbox/execd:latest"))
     ar = cfg.renew_intent
@@ -342,6 +359,105 @@ def test_load_config_store_block(tmp_path, monkeypatch):
     loaded = config_module.load_config(config_path)
     assert loaded.store.type == "sqlite"
     assert loaded.store.path == str(db_path)
+
+
+def test_load_config_postgresql_dsn_from_environment(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    monkeypatch.setenv(
+        POSTGRESQL_DSN_ENV_VAR,
+        "postgresql://opensandbox:secret@postgres.example/opensandbox",
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [store]
+            type = "postgresql"
+
+            [store.postgresql]
+            min_pool_size = 2
+            max_pool_size = 4
+
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.store.type == "postgresql"
+    assert loaded.store.postgresql.dsn is not None
+    assert (
+        loaded.store.postgresql.dsn.get_secret_value()
+        == "postgresql://opensandbox:secret@postgres.example/opensandbox"
+    )
+    assert loaded.store.postgresql.min_pool_size == 2
+    assert loaded.store.postgresql.max_pool_size == 4
+
+
+def test_postgresql_dsn_environment_overrides_toml(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    monkeypatch.setenv(POSTGRESQL_DSN_ENV_VAR, "postgresql://environment/opensandbox")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [store]
+            type = "postgresql"
+
+            [store.postgresql]
+            dsn = "postgresql://toml/opensandbox"
+
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.store.postgresql.dsn is not None
+    assert loaded.store.postgresql.dsn.get_secret_value() == "postgresql://environment/opensandbox"
+
+
+def test_postgresql_dsn_is_redacted_from_validation_errors(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    secret_dsn = "postgresql://opensandbox:sensitive-password@postgres/opensandbox"
+    monkeypatch.setenv(POSTGRESQL_DSN_ENV_VAR, secret_dsn)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [store]
+            type = "postgresql"
+
+            [store.postgresql]
+            min_pool_size = 3
+            max_pool_size = 2
+
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+            """
+        )
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        config_module.load_config(config_path)
+
+    assert secret_dsn not in str(exc_info.value)
+
+
+def test_full_config_includes_store_sections(tmp_path) -> None:
+    config_path = render_full_config(tmp_path / "generated.toml")
+
+    content = config_path.read_text()
+    assert "[store]" in content
+    assert "[store.postgresql]" in content
+    assert "min_pool_size" in content
 
 
 def test_load_config_renew_intent_legacy_redis_subtable(tmp_path, monkeypatch):

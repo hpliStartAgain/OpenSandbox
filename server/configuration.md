@@ -251,17 +251,48 @@ the same backend.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `type` | string | `"sqlite"` | Server persistence backend type. Currently only **`sqlite`** is supported. |
+| `type` | string | `"sqlite"` | Server persistence backend type: `sqlite` or `postgresql`. |
 | `path` | string | `"~/.opensandbox/opensandbox.db"` | Filesystem path to the SQLite database file used for server-managed metadata. Parent directories are created automatically when needed. |
+| `postgresql.dsn` | string | unset | PostgreSQL connection string. Required when `type = "postgresql"`. In production, prefer the `OPENSANDBOX_STORE_POSTGRESQL_DSN` environment variable. |
+| `postgresql.min_pool_size` | integer | `1` | Minimum number of PostgreSQL connections retained by each server process. |
+| `postgresql.max_pool_size` | integer | `10` | Maximum number of PostgreSQL connections used by each server process. |
+| `postgresql.connect_timeout_seconds` | integer | `5` | Maximum time to establish the initial PostgreSQL connections. |
+| `postgresql.pool_timeout_seconds` | number | `5` | Maximum time to wait for a pooled PostgreSQL connection. |
 
 **Notes**
 
 - The default SQLite backend gives local and single-node deployments persistent
   metadata without requiring an external database service.
+- PostgreSQL provides externally managed persistence, but snapshot recovery is
+  not coordinated across server processes. Run only one active server process
+  against a PostgreSQL database.
+- `OPENSANDBOX_STORE_POSTGRESQL_DSN` overrides `postgresql.dsn`, keeping database
+  credentials out of configuration files and Kubernetes ConfigMaps.
+- Switching backends does not copy existing snapshot metadata. Start with an
+  empty PostgreSQL database or migrate existing records separately before cutover.
 - `memory` is intentionally **not** the default because server-managed snapshot
   resources must survive process restarts.
 - Higher-level components should depend on repository abstractions rather than
   importing `sqlite3` directly.
+
+Example:
+
+```toml
+[store]
+type = "postgresql"
+
+[store.postgresql]
+min_pool_size = 1
+max_pool_size = 10
+connect_timeout_seconds = 5
+pool_timeout_seconds = 5
+```
+
+```bash
+export OPENSANDBOX_STORE_POSTGRESQL_DSN='postgresql://opensandbox:password@postgres:5432/opensandbox?sslmode=require'
+```
+
+For Kubernetes configuration, see [Kubernetes Deployment](../docs/kubernetes/deployment.md#use-postgresql-for-server-persistence).
 
 ---
 

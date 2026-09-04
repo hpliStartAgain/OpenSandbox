@@ -69,6 +69,48 @@ Use an external secret manager instead of creating the Secret manually in produc
 
 The chart installs the server into `opensandbox-system`, while the default `configToml` creates sandbox and pool resources in `opensandbox`. If you change `[kubernetes].namespace` in `configToml`, create that namespace instead of `opensandbox` before submitting workloads.
 
+### Use PostgreSQL for server persistence
+
+Create a Secret containing the PostgreSQL connection string:
+
+```bash
+read -s OPENSANDBOX_POSTGRESQL_DSN
+kubectl create secret generic opensandbox-postgresql \
+  --namespace opensandbox-system \
+  --from-literal=dsn="${OPENSANDBOX_POSTGRESQL_DSN}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+unset OPENSANDBOX_POSTGRESQL_DSN
+```
+
+In `values-server.yaml`, set `server.replicaCount` to `1`, add the Secret-backed
+environment variable below, and add the shown `[store]` tables to the complete
+`configToml` value:
+
+```yaml
+server:
+  replicaCount: 1
+  env:
+    - name: OPENSANDBOX_STORE_POSTGRESQL_DSN
+      valueFrom:
+        secretKeyRef:
+          name: opensandbox-postgresql
+          key: dsn
+
+configToml: |
+  # Keep the rest of the chart's complete server configuration here.
+  [store]
+  type = "postgresql"
+
+  [store.postgresql]
+  min_pool_size = 1
+  max_pool_size = 10
+```
+
+::: warning
+Snapshot recovery is not coordinated across server replicas. Keep
+`server.replicaCount: 1` when replicas use the same PostgreSQL database.
+:::
+
 ### Install and verify
 
 Inspect all available settings before installation:

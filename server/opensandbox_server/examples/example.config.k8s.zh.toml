@@ -43,6 +43,13 @@ allowed_host_paths = []
 # 自动创建 Kubernetes PVC 时的默认存储大小（当调用方未指定时使用）。
 volume_default_size = "1Gi"
 
+[store]
+# 仅当该路径挂载了 PersistentVolume 时，SQLite 数据才会持久保留。
+type = "sqlite"
+path = "~/.opensandbox/opensandbox.db"
+# 如需使用 PostgreSQL，请设置 type = "postgresql"，在 [store.postgresql]
+# 配置连接池，并通过 OPENSANDBOX_STORE_POSTGRESQL_DSN 注入连接串。只能运行一个活跃 Server 副本。
+
 [kubernetes]
 # Path to kubeconfig file. Leave as null to use in-cluster configuration
 kubeconfig_path = "~/.kube/config"

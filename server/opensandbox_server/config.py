@@ -29,7 +29,7 @@ import re
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Literal, Optional
 
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validator, model_validator
 
 try:  # Python 3.11+
     import tomllib  # type: ignore[attr-defined]
@@ -42,6 +42,7 @@ CONFIG_ENV_VAR = "SANDBOX_CONFIG_PATH"
 DEFAULT_CONFIG_PATH = Path.home() / ".sandbox.toml"
 
 API_KEY_ENV_VAR = "OPENSANDBOX_SERVER_API_KEY"
+POSTGRESQL_DSN_ENV_VAR = "OPENSANDBOX_STORE_POSTGRESQL_DSN"
 
 # OSEP-0011 secure-access keys may be injected via environment instead of the
 # [ingress.secure_access] TOML block, so key material can come from a Secret
@@ -958,18 +959,78 @@ class DockerConfig(BaseModel):
         return self
 
 
+class PostgreSQLStoreConfig(BaseModel):
+    """PostgreSQL connection and pool settings for server persistence."""
+
+    dsn: Optional[SecretStr] = Field(
+        default=None,
+        description=(
+            "PostgreSQL connection string. In production, inject it with "
+            f"{POSTGRESQL_DSN_ENV_VAR} instead of storing credentials in TOML."
+        ),
+    )
+    min_pool_size: int = Field(
+        default=1,
+        ge=0,
+        description="Minimum number of PostgreSQL connections retained per server process.",
+    )
+    max_pool_size: int = Field(
+        default=10,
+        ge=1,
+        description="Maximum number of PostgreSQL connections per server process.",
+    )
+    connect_timeout_seconds: int = Field(
+        default=5,
+        ge=1,
+        description="Maximum time in seconds to establish initial PostgreSQL connections.",
+    )
+    pool_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description="Maximum time in seconds to wait for a pooled PostgreSQL connection.",
+    )
+
+    @model_validator(mode="after")
+    def validate_pool_size(self) -> "PostgreSQLStoreConfig":
+        if self.min_pool_size > self.max_pool_size:
+            raise ValueError(
+                "store.postgresql.min_pool_size must be less than or equal to "
+                "store.postgresql.max_pool_size."
+            )
+        return self
+
+
 class StoreConfig(BaseModel):
     """Persistence backend for server-managed server resources."""
 
-    type: Literal["sqlite"] = Field(
+    type: Literal["sqlite", "postgresql"] = Field(
         default="sqlite",
-        description="Server persistence backend type. SQLite is the default local persistent backend.",
+        description=(
+            "Server persistence backend type. SQLite is the default local persistent backend; "
+            "PostgreSQL provides external persistence."
+        ),
     )
     path: str = Field(
         default=str(Path.home() / ".opensandbox" / "opensandbox.db"),
         description="Filesystem path to the SQLite database used for server metadata persistence.",
         min_length=1,
     )
+    postgresql: PostgreSQLStoreConfig = Field(
+        default_factory=PostgreSQLStoreConfig,
+        description="PostgreSQL settings used when store.type is 'postgresql'.",
+    )
+
+    @model_validator(mode="after")
+    def require_postgresql_dsn(self) -> "StoreConfig":
+        if self.type != "postgresql":
+            return self
+        dsn = self.postgresql.dsn
+        if dsn is None or not dsn.get_secret_value().strip():
+            raise ValueError(
+                "store.postgresql.dsn or "
+                f"{POSTGRESQL_DSN_ENV_VAR} must be set when store.type is 'postgresql'."
+            )
+        return self
 
 
 class TenantsConfig(BaseModel):
@@ -1101,6 +1162,22 @@ def _load_toml_data(path: Path) -> dict[str, Any]:
         raise
 
 
+def _apply_raw_env_overrides(raw_data: dict[str, Any]) -> None:
+    """Apply environment overrides that must participate in model validation."""
+    postgresql_dsn = os.environ.get(POSTGRESQL_DSN_ENV_VAR)
+    if postgresql_dsn is None:
+        return
+
+    store_data = raw_data.setdefault("store", {})
+    if not isinstance(store_data, dict):
+        raise ValueError("[store] must be a TOML table.")
+    postgresql_data = store_data.setdefault("postgresql", {})
+    if not isinstance(postgresql_data, dict):
+        raise ValueError("[store.postgresql] must be a TOML table.")
+    # Wrap before validation so errors from sibling fields cannot expose credentials.
+    postgresql_data["dsn"] = SecretStr(postgresql_dsn)
+
+
 def _apply_env_overrides(config: AppConfig) -> None:
     """Apply environment variable overrides to parsed configuration."""
     if API_KEY_ENV_VAR in os.environ:
@@ -1164,6 +1241,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
 
     resolved_path = _resolve_config_path(path)
     raw_data = _load_toml_data(resolved_path)
+    _apply_raw_env_overrides(raw_data)
 
     try:
         _config = AppConfig(**raw_data)
@@ -1214,6 +1292,7 @@ __all__ = [
     "DockerConfig",
     "StorageConfig",
     "StoreConfig",
+    "PostgreSQLStoreConfig",
     "KubernetesRuntimeConfig",
     "EgressConfig",
     "EGRESS_MODE_DNS",
@@ -1221,6 +1300,7 @@ __all__ = [
     "SecureRuntimeConfig",
     "DEFAULT_CONFIG_PATH",
     "CONFIG_ENV_VAR",
+    "POSTGRESQL_DSN_ENV_VAR",
     "get_config",
     "get_config_path",
     "load_config",

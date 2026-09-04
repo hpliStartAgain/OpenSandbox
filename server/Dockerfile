@@ -55,6 +55,16 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 
 WORKDIR /app
 
+# The base image packages predate the fixed OpenSSL build available in the
+# Debian repository. Upgrade only the affected runtime packages.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends --only-upgrade \
+        openssl \
+        libssl3t64 \
+        openssl-provider-legacy \
+    && python -m pip uninstall -y setuptools \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/opensandbox_server /app/opensandbox_server
 COPY --from=builder /app/opensandbox_server/examples/example.config.k8s.toml /etc/opensandbox/config.toml
