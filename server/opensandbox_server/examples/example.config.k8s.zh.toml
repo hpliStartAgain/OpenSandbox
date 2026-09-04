@@ -55,7 +55,8 @@ volume_default_size = "1Gi"
 type = "sqlite"
 path = "~/.opensandbox/opensandbox.db"
 # 如需使用 PostgreSQL，请设置 type = "postgresql"，在 [store.postgresql]
-# 配置连接池，并通过 OPENSANDBOX_STORE_POSTGRESQL_DSN 注入连接串。只能运行一个活跃 Server 副本。
+# 配置连接池，并通过 OPENSANDBOX_STORE_POSTGRESQL_DSN 注入连接串。PostgreSQL 可协调
+# 多个活跃 Server 副本的公共 Kubernetes Snapshot；SQLite 和 Docker Snapshot 执行仍只支持单活。
 
 [kubernetes]
 # Path to kubeconfig file. Leave as null to use in-cluster configuration
