@@ -64,6 +64,18 @@ class DockerSnapshotRuntime:
     def get_snapshot_status(self, snapshot_id: str) -> Optional[SnapshotRuntimeStatus]:
         return None
 
+    def recover_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        image: Optional[str] = None,
+        *,
+        namespace: str | None = None,
+    ) -> SnapshotRuntimeStatus:
+        # Re-running docker commit after lease takeover can race registry side
+        # effects, so Docker recovery remains observe-only and single-active.
+        return self.inspect_snapshot(snapshot_id, image=image, namespace=namespace)
+
     def delete_snapshot(self, snapshot_id: str, image: Optional[str] = None, *, namespace: str | None = None) -> None:
         image_ref = image or build_snapshot_image_ref(snapshot_id)
         try:

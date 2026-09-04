@@ -69,6 +69,7 @@ def test_sqlite_snapshot_repository_indexes_name_queries_after_migration(
     repo = SQLiteSnapshotRepository(db_path)
 
     with repo._connect() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(snapshots)")}
         indexes = {row["name"] for row in conn.execute("PRAGMA index_list(snapshots)")}
         name_plan = conn.execute(
             "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM snapshots WHERE name = ?",
@@ -82,6 +83,12 @@ def test_sqlite_snapshot_repository_indexes_name_queries_after_migration(
             ("tenant-a", "cache-key"),
         ).fetchall()
 
+    assert {
+        "operation_generation",
+        "operation_attempt",
+        "lease_owner",
+        "lease_expires_at",
+    } <= columns
     assert "idx_snapshots_name_namespace" in indexes
     assert any("idx_snapshots_name_namespace" in row["detail"] for row in name_plan)
     assert any("idx_snapshots_name_namespace" in row["detail"] for row in tenant_plan)

@@ -17,6 +17,7 @@ Repository abstraction for persisted snapshot records.
 """
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Protocol
 
 from opensandbox_server.services.snapshot_models import SnapshotRecord, SnapshotState
@@ -55,21 +56,25 @@ class SnapshotRepository(Protocol):
         """
         Persist a new snapshot record.
         """
+        ...
 
     def get(self, snapshot_id: str) -> SnapshotRecord | None:
         """
         Fetch a snapshot record by id.
         """
+        ...
 
     def list(self, query: SnapshotListQuery) -> SnapshotListResult:
         """
         List snapshot records with optional filtering and pagination.
         """
+        ...
 
     def update(self, record: SnapshotRecord) -> SnapshotRecord:
         """
         Replace the persisted contents of an existing snapshot record.
         """
+        ...
 
     def update_if_state(
         self,
@@ -79,16 +84,65 @@ class SnapshotRepository(Protocol):
         """
         Replace a snapshot record only if its current state matches the expected state.
         """
+        ...
 
     def delete(self, snapshot_id: str) -> None:
         """
         Delete a snapshot record by id.
         """
+        ...
+
+    @property
+    def supports_distributed_leases(self) -> bool:
+        """Whether operation leases coordinate independent server processes."""
+        ...
+
+    def claim_operation(
+        self,
+        snapshot_id: str,
+        expected_state: SnapshotState,
+        lease_owner: str,
+        lease_duration: timedelta,
+    ) -> SnapshotRecord | None:
+        """Atomically claim an unowned or expired snapshot operation."""
+        ...
+
+    def renew_operation(
+        self,
+        snapshot_id: str,
+        expected_state: SnapshotState,
+        lease_owner: str,
+        operation_generation: int,
+        lease_duration: timedelta,
+    ) -> bool:
+        """Extend a live operation lease owned by the supplied generation."""
+        ...
+
+    def update_if_operation_owner(
+        self,
+        record: SnapshotRecord,
+        expected_state: SnapshotState,
+        lease_owner: str,
+        operation_generation: int,
+    ) -> bool:
+        """Update only while the caller still owns the live operation lease."""
+        ...
+
+    def delete_if_operation_owner(
+        self,
+        snapshot_id: str,
+        expected_state: SnapshotState,
+        lease_owner: str,
+        operation_generation: int,
+    ) -> bool:
+        """Delete only while the caller still owns the live operation lease."""
+        ...
 
     def close(self) -> None:
         """
         Release resources owned by the repository.
         """
+        ...
 
 
 __all__ = [

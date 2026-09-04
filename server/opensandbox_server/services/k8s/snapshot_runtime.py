@@ -93,7 +93,26 @@ class KubernetesSnapshotRuntime:
         ns = namespace if namespace is not None else self._namespace
         self._snapshot_namespaces[snapshot_id] = ns
         body = self._build_snapshot_body(snapshot_id, sandbox_id, snapshot_name, namespace=ns)
-        should_validate_existing_source = False
+
+        observed, current = self._observe_snapshot(snapshot_name, namespace=ns)
+        if not observed:
+            return SnapshotRuntimeStatus(
+                state=SnapshotState.CREATING,
+                reason="snapshot_runtime_inspect_failed",
+                message=(
+                    "Could not determine whether Kubernetes SandboxSnapshot "
+                    f"{snapshot_name} already exists."
+                ),
+            )
+        if current is not None:
+            conflict = self._validate_existing_source(current, sandbox_id)
+            if conflict is not None:
+                return conflict
+            logger.info(
+                "Kubernetes SandboxSnapshot %s already exists; resuming observation",
+                snapshot_name,
+            )
+            return self._wait_for_terminal_snapshot(snapshot_id, namespace=ns)
 
         try:
             self._k8s_client.create_custom_object(
@@ -110,8 +129,20 @@ class KubernetesSnapshotRuntime:
                     reason="snapshot_runtime_create_failed",
                     message=f"Failed to create Kubernetes SandboxSnapshot {snapshot_name}: {exc}",
                 )
-            logger.info("Kubernetes SandboxSnapshot %s already exists; continuing", snapshot_name)
-            should_validate_existing_source = True
+            logger.info("Kubernetes SandboxSnapshot %s won the create race", snapshot_name)
+            observed, current = self._observe_snapshot(snapshot_name, namespace=ns)
+            if not observed:
+                return SnapshotRuntimeStatus(
+                    state=SnapshotState.CREATING,
+                    reason="snapshot_runtime_inspect_failed",
+                    message=(
+                        "Could not inspect Kubernetes SandboxSnapshot "
+                        f"{snapshot_name} after a create conflict."
+                    ),
+                )
+            conflict = self._validate_existing_source(current, sandbox_id)
+            if conflict is not None:
+                return conflict
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to create Kubernetes SandboxSnapshot %s: %s", snapshot_name, exc)
             return SnapshotRuntimeStatus(
@@ -120,25 +151,30 @@ class KubernetesSnapshotRuntime:
                 message=f"Failed to create Kubernetes SandboxSnapshot {snapshot_name}: {exc}",
             )
 
-        if should_validate_existing_source:
-            try:
-                current = self._get_snapshot_cr(snapshot_name, namespace=ns)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to inspect existing Kubernetes SandboxSnapshot %s after create conflict: %s",
-                    snapshot_name,
-                    exc,
-                )
-            else:
-                conflict = self._validate_existing_source(current, sandbox_id)
-                if conflict is not None:
-                    return conflict
-
         return self._wait_for_terminal_snapshot(snapshot_id, namespace=ns)
 
     def get_snapshot_status(self, snapshot_id: str) -> Optional[SnapshotRuntimeStatus]:
         ns = self._snapshot_namespaces.get(snapshot_id)
         return self.inspect_snapshot(snapshot_id, namespace=ns)
+
+    def recover_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        image: Optional[str] = None,
+        *,
+        namespace: str | None = None,
+    ) -> SnapshotRuntimeStatus:
+        # create_snapshot observes the deterministic CR first and creates it
+        # only when the live API confirms that it is absent.
+        result = self.create_snapshot(snapshot_id, sandbox_id, namespace=namespace)
+        if result is None:
+            return SnapshotRuntimeStatus(
+                state=SnapshotState.CREATING,
+                reason="snapshot_runtime_missing_result",
+                message="Kubernetes snapshot recovery did not return a status.",
+            )
+        return result
 
     def delete_snapshot(self, snapshot_id: str, image: Optional[str] = None, *, namespace: str | None = None) -> None:
         snapshot_name = build_public_snapshot_name(snapshot_id)
@@ -206,6 +242,26 @@ class KubernetesSnapshotRuntime:
             plural=_PLURAL,
             name=snapshot_name,
         )
+
+    def _observe_snapshot(
+        self,
+        snapshot_name: str,
+        *,
+        namespace: str,
+    ) -> tuple[bool, Optional[dict]]:
+        deadline = time.monotonic() + self._wait_timeout_seconds
+        while True:
+            try:
+                return True, self._get_snapshot_cr(snapshot_name, namespace=namespace)
+            except Exception as exc:  # noqa: BLE001
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "Failed to observe Kubernetes SandboxSnapshot %s before create: %s",
+                        snapshot_name,
+                        exc,
+                    )
+                    return False, None
+                time.sleep(self._poll_interval_seconds)
 
     def _validate_existing_source(self, snapshot: Optional[dict], sandbox_id: str) -> Optional[SnapshotRuntimeStatus]:
         if snapshot is None:

@@ -41,11 +41,13 @@ class SnapshotRuntime(Protocol):
         """
         Whether this runtime supports creating snapshots.
         """
+        ...
 
     def create_snapshot_unsupported_message(self) -> str:
         """
         Human-readable message used when snapshot creation is unsupported.
         """
+        ...
 
     def create_snapshot(
         self,
@@ -57,21 +59,36 @@ class SnapshotRuntime(Protocol):
         """
         Create a snapshot for a sandbox and return the final runtime status.
         """
+        ...
 
     def get_snapshot_status(self, snapshot_id: str) -> Optional[SnapshotRuntimeStatus]:
         """
         Return the most recent runtime view for a snapshot if known.
         """
+        ...
+
+    def recover_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        image: Optional[str] = None,
+        *,
+        namespace: str | None = None,
+    ) -> SnapshotRuntimeStatus:
+        """Observe or safely resume an interrupted snapshot creation."""
+        ...
 
     def delete_snapshot(self, snapshot_id: str, image: Optional[str] = None, *, namespace: str | None = None) -> None:
         """
         Delete runtime-managed artifacts for a snapshot.
         """
+        ...
 
     def inspect_snapshot(self, snapshot_id: str, image: Optional[str] = None, *, namespace: str | None = None) -> SnapshotRuntimeStatus:
         """
         Inspect runtime-managed artifacts for startup recovery.
         """
+        ...
 
 
 class NoopSnapshotRuntime:
@@ -96,6 +113,16 @@ class NoopSnapshotRuntime:
 
     def get_snapshot_status(self, snapshot_id: str) -> Optional[SnapshotRuntimeStatus]:
         return None
+
+    def recover_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        image: Optional[str] = None,
+        *,
+        namespace: str | None = None,
+    ) -> SnapshotRuntimeStatus:
+        return self.inspect_snapshot(snapshot_id, image=image, namespace=namespace)
 
     def delete_snapshot(self, snapshot_id: str, image: Optional[str] = None, *, namespace: str | None = None) -> None:
         return None

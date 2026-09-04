@@ -38,6 +38,10 @@ def test_snapshot_record_defaults_are_runtime_agnostic() -> None:
     assert record.status.message is None
     assert isinstance(record.created_at, datetime)
     assert isinstance(record.updated_at, datetime)
+    assert record.operation_generation == 0
+    assert record.operation_attempt == 0
+    assert record.lease_owner is None
+    assert record.lease_expires_at is None
 
 
 def test_snapshot_record_supports_ready_restore_config() -> None:

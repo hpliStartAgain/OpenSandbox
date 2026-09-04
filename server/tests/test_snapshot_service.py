@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from concurrent.futures import Future
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -273,7 +274,7 @@ def test_snapshot_service_marks_snapshot_failed_when_worker_returns_none(tmp_pat
     assert stored.status.reason == "snapshot_runtime_missing_result"
 
 
-def test_recover_unfinished_snapshot_reschedules_creating_runtime_status_without_progress(tmp_path) -> None:
+def test_recover_unfinished_snapshot_claims_and_reschedules_creating_runtime_status(tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     record = _snapshot_record("snap-in-progress", SnapshotState.CREATING)
     repo.create(record)
@@ -295,10 +296,111 @@ def test_recover_unfinished_snapshot_reschedules_creating_runtime_status_without
     progressed = service._recover_unfinished_snapshot(record)
 
     stored = repo.get(record.id)
-    assert progressed is False
+    assert progressed is True
     assert stored is not None
     assert stored.status.state == SnapshotState.CREATING
+    assert stored.lease_owner is not None
+    assert stored.operation_generation == 1
     assert len(executor.submitted) == 1
+
+    heartbeat = executor.submitted[0][1][2]
+    service._stop_lease_heartbeat(heartbeat)
+
+
+def test_two_services_share_one_unfinished_operation_owner(tmp_path) -> None:
+    db_path = tmp_path / "snapshots.db"
+    first_repo = SQLiteSnapshotRepository(db_path)
+    second_repo = SQLiteSnapshotRepository(db_path)
+    record = _snapshot_record("snap-shared", SnapshotState.CREATING)
+    first_repo.create(record)
+    first_executor = CapturingExecutor()
+    second_executor = CapturingExecutor()
+    first_service = PersistedSnapshotService(
+        first_repo,
+        StubSandboxService(),
+        snapshot_runtime=StubSnapshotRuntime(),
+        snapshot_executor=first_executor,
+        recover_unfinished_snapshots=False,
+        operation_owner="server-a",
+    )
+    second_service = PersistedSnapshotService(
+        second_repo,
+        StubSandboxService(),
+        snapshot_runtime=StubSnapshotRuntime(),
+        snapshot_executor=second_executor,
+        recover_unfinished_snapshots=False,
+        operation_owner="server-b",
+    )
+
+    assert first_service._recover_unfinished_snapshot(record) is True
+    current = second_repo.get(record.id)
+    assert current is not None
+    assert second_service._recover_unfinished_snapshot(current) is False
+    assert len(first_executor.submitted) == 1
+    assert second_executor.submitted == []
+
+    stored = first_repo.get(record.id)
+    assert stored is not None
+    assert stored.lease_owner == "server-a"
+    assert stored.operation_generation == 1
+    heartbeat = first_executor.submitted[0][1][2]
+    first_service._stop_lease_heartbeat(heartbeat)
+
+
+def test_stale_service_completion_is_rejected_after_takeover(tmp_path) -> None:
+    db_path = tmp_path / "snapshots.db"
+    first_repo = SQLiteSnapshotRepository(db_path)
+    second_repo = SQLiteSnapshotRepository(db_path)
+    record = _snapshot_record("snap-stale", SnapshotState.CREATING)
+    first_repo.create(record)
+    first_claim = first_repo.claim_operation(
+        record.id,
+        SnapshotState.CREATING,
+        "server-a",
+        timedelta(seconds=30),
+    )
+    assert first_claim is not None
+    with first_repo._connect() as conn:
+        conn.execute(
+            "UPDATE snapshots SET lease_expires_at = ? WHERE id = ?",
+            ("1970-01-01T00:00:00+00:00", record.id),
+        )
+    second_claim = second_repo.claim_operation(
+        record.id,
+        SnapshotState.CREATING,
+        "server-b",
+        timedelta(seconds=30),
+    )
+    assert second_claim is not None
+    first_service = PersistedSnapshotService(
+        first_repo,
+        StubSandboxService(),
+        recover_unfinished_snapshots=False,
+        operation_owner="server-a",
+    )
+    second_service = PersistedSnapshotService(
+        second_repo,
+        StubSandboxService(),
+        recover_unfinished_snapshots=False,
+        operation_owner="server-b",
+    )
+    ready_status = SnapshotRuntimeStatus(
+        state=SnapshotState.READY,
+        image="registry/sandbox:snap-stale",
+        reason="snapshot_runtime_ready",
+    )
+
+    first_service._complete_snapshot(first_claim, ready_status)
+    after_stale = second_repo.get(record.id)
+    assert after_stale is not None
+    assert after_stale.status.state == SnapshotState.CREATING
+    assert after_stale.lease_owner == "server-b"
+
+    second_service._complete_snapshot(second_claim, ready_status)
+    completed = first_repo.get(record.id)
+    assert completed is not None
+    assert completed.status.state == SnapshotState.READY
+    assert completed.restore_config.image == "registry/sandbox:snap-stale"
 
 
 def test_snapshot_service_lists_and_deletes_records(tmp_path) -> None:
@@ -456,12 +558,12 @@ def test_snapshot_service_recovers_delete_after_runtime_cleanup_succeeds(tmp_pat
     )
     repo.create(record)
 
-    original_delete = repo.delete
+    original_delete_if_owner = repo.delete_if_operation_owner
 
-    def crash_delete(snapshot_id: str) -> None:
+    def crash_delete(*args, **kwargs) -> bool:
         raise RuntimeError("simulated metadata delete crash")
 
-    repo.delete = crash_delete
+    repo.delete_if_operation_owner = crash_delete
     with pytest.raises(RuntimeError, match="simulated metadata delete crash"):
         service.delete_snapshot("snap-delete-crash")
 
@@ -470,7 +572,20 @@ def test_snapshot_service_recovers_delete_after_runtime_cleanup_succeeds(tmp_pat
     assert stored.status.state == SnapshotState.DELETING
     assert runtime.delete_calls == [("snap-delete-crash", "opensandbox-snapshots:snap-delete-crash")]
 
-    repo.delete = original_delete
+    repo.delete_if_operation_owner = original_delete_if_owner
+    before_expiry_runtime = StubSnapshotRuntime()
+    PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=before_expiry_runtime,
+    )
+    assert before_expiry_runtime.delete_calls == []
+
+    with repo._connect() as conn:
+        conn.execute(
+            "UPDATE snapshots SET lease_expires_at = ? WHERE id = ?",
+            ("1970-01-01T00:00:00+00:00", "snap-delete-crash"),
+        )
     recovery_runtime = StubSnapshotRuntime()
     PersistedSnapshotService(repo, StubSandboxService(), snapshot_runtime=recovery_runtime)
 
@@ -478,7 +593,7 @@ def test_snapshot_service_recovers_delete_after_runtime_cleanup_succeeds(tmp_pat
     assert repo.get("snap-delete-crash") is None
 
 
-def test_snapshot_service_worker_cleans_up_snapshot_deleted_during_creation(tmp_path) -> None:
+def test_snapshot_service_stale_worker_does_not_cleanup_runtime_artifact(tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     runtime = StubSnapshotRuntime()
     service = PersistedSnapshotService(
@@ -505,7 +620,7 @@ def test_snapshot_service_worker_cleans_up_snapshot_deleted_during_creation(tmp_
 
     service._create_snapshot_worker(_snapshot_record(created.id, SnapshotState.CREATING))
 
-    assert runtime.delete_calls == [(created.id, "opensandbox-snapshots:snap-ready")]
+    assert runtime.delete_calls == []
     assert repo.get(created.id) is None
 
 
@@ -599,7 +714,12 @@ def test_snapshot_service_recovers_creating_snapshot_with_existing_artifact(tmp_
         message="Recovered snapshot image after server restart.",
     )
 
-    PersistedSnapshotService(repo, StubSandboxService(), snapshot_runtime=runtime)
+    PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=ImmediateExecutor(),
+    )
 
     recovered = repo.get("snap-ready")
     assert recovered is not None
@@ -612,7 +732,12 @@ def test_snapshot_service_recovers_creating_snapshot_without_artifact(tmp_path) 
     repo.create(_snapshot_record("snap-missing", SnapshotState.CREATING))
     runtime = StubSnapshotRuntime()
 
-    PersistedSnapshotService(repo, StubSandboxService(), snapshot_runtime=runtime)
+    PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=ImmediateExecutor(),
+    )
 
     recovered = repo.get("snap-missing")
     assert recovered is not None

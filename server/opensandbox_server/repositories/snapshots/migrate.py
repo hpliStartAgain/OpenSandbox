@@ -51,6 +51,10 @@ _SNAPSHOT_TABLE_COLUMNS = (
     "last_transition_at",
     "created_at",
     "updated_at",
+    "operation_generation",
+    "lease_owner",
+    "lease_expires_at",
+    "operation_attempt",
 )
 
 _CREATE_SCHEMA_STATEMENTS = (
@@ -67,13 +71,22 @@ _CREATE_SCHEMA_STATEMENTS = (
         message TEXT,
         last_transition_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL
+        updated_at TIMESTAMPTZ NOT NULL,
+        operation_generation BIGINT NOT NULL DEFAULT 0,
+        lease_owner TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        operation_attempt BIGINT NOT NULL DEFAULT 0
     )
     """,
+    "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS operation_generation BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS lease_owner TEXT",
+    "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
+    "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS operation_attempt BIGINT NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS idx_snapshots_source_sandbox_id ON snapshots(source_sandbox_id)",
     "CREATE INDEX IF NOT EXISTS idx_snapshots_state ON snapshots(state)",
     "CREATE INDEX IF NOT EXISTS idx_snapshots_created_at ON snapshots(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_snapshots_name_namespace ON snapshots(name, namespace)",
+    "CREATE INDEX IF NOT EXISTS idx_snapshots_operation_recovery ON snapshots(state, lease_expires_at) WHERE state IN ('Creating', 'Deleting')",
 )
 
 _INSERT_SNAPSHOT = """
@@ -89,7 +102,11 @@ _INSERT_SNAPSHOT = """
         message,
         last_transition_at,
         created_at,
-        updated_at
+        updated_at,
+        operation_generation,
+        lease_owner,
+        lease_expires_at,
+        operation_attempt
     ) VALUES (
         %(id)s,
         %(source_sandbox_id)s,
@@ -102,7 +119,11 @@ _INSERT_SNAPSHOT = """
         %(message)s,
         %(last_transition_at)s,
         %(created_at)s,
-        %(updated_at)s
+        %(updated_at)s,
+        %(operation_generation)s,
+        %(lease_owner)s,
+        %(lease_expires_at)s,
+        %(operation_attempt)s
     )
     ON CONFLICT (id) DO NOTHING
     RETURNING id
@@ -226,6 +247,10 @@ def _write_postgresql_snapshots(dsn: str, records: list[dict[str, Any]]) -> int:
                 "last_transition_at": _normalize_datetime(record["last_transition_at"]),
                 "created_at": _require_datetime(record["created_at"]),
                 "updated_at": _require_datetime(record["updated_at"]),
+                "operation_generation": int(record["operation_generation"] or 0),
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "operation_attempt": int(record["operation_attempt"] or 0),
             }
             if conn.execute(_INSERT_SNAPSHOT, params).fetchone() is not None:
                 migrated += 1

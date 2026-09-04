@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -131,6 +131,43 @@ def test_migrate_is_idempotent(tmp_path, postgresql_dsn: str) -> None:
     assert second.migrated == 0
     assert second.skipped == 1
     assert len(_records_from_postgresql(postgresql_dsn)) == 1
+
+
+def test_migrate_preserves_attempt_counters_but_clears_source_lease(
+    tmp_path,
+    postgresql_dsn: str,
+) -> None:
+    _truncate_postgresql(postgresql_dsn)
+    sqlite_repo = _create_sqlite_repository(
+        tmp_path,
+        [
+            snapshot_record(
+                "snap-leased",
+                "sbx-001",
+                datetime(2026, 1, 2, 3, 4, 5),
+            )
+        ],
+    )
+    claim = sqlite_repo.claim_operation(
+        "snap-leased",
+        SnapshotState.CREATING,
+        "old-server",
+        timedelta(minutes=5),
+    )
+    assert claim is not None
+    sqlite_repo.close()
+
+    migrate_sqlite_snapshots_to_postgresql(
+        tmp_path / "opensandbox.db",
+        postgresql_dsn,
+    )
+
+    stored = _records_from_postgresql(postgresql_dsn)
+    assert len(stored) == 1
+    assert stored[0].operation_generation == claim.operation_generation
+    assert stored[0].operation_attempt == claim.operation_attempt
+    assert stored[0].lease_owner is None
+    assert stored[0].lease_expires_at is None
 
 
 def test_migrate_skips_records_already_in_postgresql(tmp_path, postgresql_dsn: str) -> None:

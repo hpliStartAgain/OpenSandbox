@@ -88,9 +88,11 @@ export OPENSANDBOX_STORE_POSTGRESQL_DSN='postgresql://opensandbox:password@postg
 opensandbox-server
 ```
 
-::: warning
-Snapshot recovery is not coordinated across server processes. Run only one active server process against a PostgreSQL database.
+::: tip
+PostgreSQL coordinates server-managed Kubernetes snapshot operations across active Server processes with expiring leases and fenced terminal writes. SQLite remains limited to one active Server process. Docker snapshot execution also remains single-active because Docker image and registry side effects are not fenced across hosts.
 :::
+
+The coordination guarantee is one current database owner, takeover after lease expiry, and a unique fenced terminal database result. Kubernetes recovery observes the deterministic `SandboxSnapshot` before creating it. This is not an exactly-once guarantee across PostgreSQL, Kubernetes, and the image registry.
 
 For Kubernetes Secret and Helm values wiring, see [Kubernetes Deployment](/kubernetes/deployment#use-postgresql-for-server-persistence).
 

@@ -286,10 +286,19 @@ the same backend.
 **Notes**
 
 - The default SQLite backend gives local and single-node deployments persistent
-  metadata without requiring an external database service.
-- PostgreSQL provides externally managed persistence, but snapshot recovery is
-  not coordinated across server processes. Run only one active server process
-  against a PostgreSQL database.
+  metadata without requiring an external database service. Run one active Server
+  process when SQLite is selected.
+- PostgreSQL coordinates Kubernetes public snapshot creation and deletion across
+  active Server processes with expiring operation leases, periodic takeover, and
+  owner/generation-fenced terminal writes. Runtime work never holds a database
+  transaction open.
+- Docker snapshot execution remains single-active. PostgreSQL fencing prevents a
+  stale database write but cannot fence Docker image or registry side effects
+  across hosts.
+- Kubernetes recovery observes the deterministic `SandboxSnapshot` before create.
+  The resulting guarantee is one current operation owner and one fenced terminal
+  database result, not exactly-once behavior across the database, Kubernetes, and
+  the OCI registry.
 - `OPENSANDBOX_STORE_POSTGRESQL_DSN` overrides `postgresql.dsn`, keeping database
   credentials out of configuration files and Kubernetes ConfigMaps.
 - Switching backends does not copy existing snapshot metadata. Start with an
@@ -298,6 +307,9 @@ the same backend.
   resources must survive process restarts.
 - Higher-level components should depend on repository abstractions rather than
   importing `sqlite3` directly.
+- Existing PostgreSQL tables are upgraded in place with additive lease columns.
+  Older Server versions ignore these columns, but a rollback must first return to
+  one active Server because older versions do not enforce operation ownership.
 
 Example:
 

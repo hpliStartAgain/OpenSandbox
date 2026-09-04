@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, overload
 
 from psycopg import sql
@@ -50,7 +50,11 @@ _SELECT_COLUMNS = """
     message,
     last_transition_at,
     created_at,
-    updated_at
+    updated_at,
+    operation_generation,
+    lease_owner,
+    lease_expires_at,
+    operation_attempt
 """
 
 _UPDATE_COLUMNS = """
@@ -64,7 +68,11 @@ _UPDATE_COLUMNS = """
     message = %(message)s,
     last_transition_at = %(last_transition_at)s,
     created_at = %(created_at)s,
-    updated_at = %(updated_at)s
+    updated_at = %(updated_at)s,
+    operation_generation = %(operation_generation)s,
+    lease_owner = %(lease_owner)s,
+    lease_expires_at = %(lease_expires_at)s,
+    operation_attempt = %(operation_attempt)s
 """
 
 
@@ -98,6 +106,10 @@ class PostgreSQLSnapshotRepository:
             self._pool.close()
             raise
 
+    @property
+    def supports_distributed_leases(self) -> bool:
+        return True
+
     def create(self, record: SnapshotRecord) -> SnapshotRecord:
         with self._pool.connection() as conn:
             conn.execute(
@@ -114,7 +126,11 @@ class PostgreSQLSnapshotRepository:
                     message,
                     last_transition_at,
                     created_at,
-                    updated_at
+                    updated_at,
+                    operation_generation,
+                    lease_owner,
+                    lease_expires_at,
+                    operation_attempt
                 ) VALUES (
                     %(id)s,
                     %(source_sandbox_id)s,
@@ -127,7 +143,11 @@ class PostgreSQLSnapshotRepository:
                     %(message)s,
                     %(last_transition_at)s,
                     %(created_at)s,
-                    %(updated_at)s
+                    %(updated_at)s,
+                    %(operation_generation)s,
+                    %(lease_owner)s,
+                    %(lease_expires_at)s,
+                    %(operation_attempt)s
                 )
                 """,
                 self._to_db_params(record),
@@ -223,6 +243,128 @@ class PostgreSQLSnapshotRepository:
         with self._pool.connection() as conn:
             conn.execute("DELETE FROM snapshots WHERE id = %s", (snapshot_id,))
 
+    def claim_operation(
+        self,
+        snapshot_id: str,
+        expected_state: SnapshotState,
+        lease_owner: str,
+        lease_duration: timedelta,
+    ) -> SnapshotRecord | None:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                f"""
+                UPDATE snapshots
+                SET
+                    operation_generation = operation_generation + 1,
+                    operation_attempt = operation_attempt + 1,
+                    lease_owner = %(lease_owner)s,
+                    lease_expires_at = CURRENT_TIMESTAMP + %(lease_duration)s
+                WHERE id = %(id)s
+                  AND state = %(expected_state)s
+                  AND (
+                      lease_owner IS NULL
+                      OR lease_expires_at IS NULL
+                      OR lease_expires_at <= CURRENT_TIMESTAMP
+                  )
+                RETURNING {_SELECT_COLUMNS}
+                """,
+                {
+                    "id": snapshot_id,
+                    "expected_state": expected_state.value,
+                    "lease_owner": lease_owner,
+                    "lease_duration": lease_duration,
+                },
+            ).fetchone()
+        return self._row_to_record(row) if row is not None else None
+
+    def renew_operation(
+        self,
+        snapshot_id: str,
+        expected_state: SnapshotState,
+        lease_owner: str,
+        operation_generation: int,
+        lease_duration: timedelta,
+    ) -> bool:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """
+                UPDATE snapshots
+                SET lease_expires_at = CURRENT_TIMESTAMP + %(lease_duration)s
+                WHERE id = %(id)s
+                  AND state = %(expected_state)s
+                  AND lease_owner = %(lease_owner)s
+                  AND operation_generation = %(operation_generation)s
+                  AND lease_expires_at > CURRENT_TIMESTAMP
+                RETURNING id
+                """,
+                {
+                    "id": snapshot_id,
+                    "expected_state": expected_state.value,
+                    "lease_owner": lease_owner,
+                    "operation_generation": operation_generation,
+                    "lease_duration": lease_duration,
+                },
+            ).fetchone()
+        return row is not None
+
+    def update_if_operation_owner(
+        self,
+        record: SnapshotRecord,
+        expected_state: SnapshotState,
+        lease_owner: str,
+        operation_generation: int,
+    ) -> bool:
+        params = self._to_db_params(record)
+        params.update(
+            {
+                "expected_state": expected_state.value,
+                "expected_lease_owner": lease_owner,
+                "expected_operation_generation": operation_generation,
+            }
+        )
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                f"""
+                UPDATE snapshots
+                SET {_UPDATE_COLUMNS}
+                WHERE id = %(id)s
+                  AND state = %(expected_state)s
+                  AND lease_owner = %(expected_lease_owner)s
+                  AND operation_generation = %(expected_operation_generation)s
+                  AND lease_expires_at > CURRENT_TIMESTAMP
+                RETURNING id
+                """,
+                params,
+            ).fetchone()
+        return row is not None
+
+    def delete_if_operation_owner(
+        self,
+        snapshot_id: str,
+        expected_state: SnapshotState,
+        lease_owner: str,
+        operation_generation: int,
+    ) -> bool:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """
+                DELETE FROM snapshots
+                WHERE id = %(id)s
+                  AND state = %(expected_state)s
+                  AND lease_owner = %(lease_owner)s
+                  AND operation_generation = %(operation_generation)s
+                  AND lease_expires_at > CURRENT_TIMESTAMP
+                RETURNING id
+                """,
+                {
+                    "id": snapshot_id,
+                    "expected_state": expected_state.value,
+                    "lease_owner": lease_owner,
+                    "operation_generation": operation_generation,
+                },
+            ).fetchone()
+        return row is not None
+
     def close(self) -> None:
         self._pool.close()
 
@@ -246,9 +388,27 @@ class PostgreSQLSnapshotRepository:
                     message TEXT,
                     last_transition_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    operation_generation BIGINT NOT NULL DEFAULT 0,
+                    lease_owner TEXT,
+                    lease_expires_at TIMESTAMPTZ,
+                    operation_attempt BIGINT NOT NULL DEFAULT 0
                 )
                 """
+            )
+            conn.execute(
+                "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS "
+                "operation_generation BIGINT NOT NULL DEFAULT 0"
+            )
+            conn.execute(
+                "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS lease_owner TEXT"
+            )
+            conn.execute(
+                "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ"
+            )
+            conn.execute(
+                "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS "
+                "operation_attempt BIGINT NOT NULL DEFAULT 0"
             )
             conn.execute(
                 """
@@ -274,6 +434,13 @@ class PostgreSQLSnapshotRepository:
                     ON snapshots(name, namespace)
                 """
             )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_snapshots_operation_recovery
+                    ON snapshots(state, lease_expires_at)
+                    WHERE state IN ('Creating', 'Deleting')
+                """
+            )
 
     @staticmethod
     def _to_db_params(record: SnapshotRecord) -> dict[str, Any]:
@@ -292,6 +459,12 @@ class PostgreSQLSnapshotRepository:
             ),
             "created_at": PostgreSQLSnapshotRepository._normalize_datetime(record.created_at),
             "updated_at": PostgreSQLSnapshotRepository._normalize_datetime(record.updated_at),
+            "operation_generation": record.operation_generation,
+            "lease_owner": record.lease_owner,
+            "lease_expires_at": PostgreSQLSnapshotRepository._normalize_datetime(
+                record.lease_expires_at
+            ),
+            "operation_attempt": record.operation_attempt,
         }
 
     @staticmethod
@@ -330,6 +503,12 @@ class PostgreSQLSnapshotRepository:
             ),
             created_at=PostgreSQLSnapshotRepository._normalize_datetime(row["created_at"]),
             updated_at=PostgreSQLSnapshotRepository._normalize_datetime(row["updated_at"]),
+            operation_generation=int(row["operation_generation"]),
+            lease_owner=row["lease_owner"],
+            lease_expires_at=PostgreSQLSnapshotRepository._normalize_datetime(
+                row["lease_expires_at"]
+            ),
+            operation_attempt=int(row["operation_attempt"]),
         )
 
 

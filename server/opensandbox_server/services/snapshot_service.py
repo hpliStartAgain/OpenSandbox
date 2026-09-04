@@ -24,9 +24,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 from math import ceil
+import os
+import socket
+from threading import Event, Thread
 from uuid import uuid4
 
 from fastapi import HTTPException, status
@@ -62,6 +65,9 @@ from opensandbox_server.tenants.context import get_current_tenant
 logger = logging.getLogger(__name__)
 SNAPSHOT_RECOVERY_PAGE_SIZE = 200
 SNAPSHOT_WORKER_MAX_WORKERS = 2
+SNAPSHOT_OPERATION_LEASE_SECONDS = 30.0
+SNAPSHOT_LEASE_RENEW_INTERVAL_SECONDS = 10.0
+SNAPSHOT_RECOVERY_INTERVAL_SECONDS = 5.0
 
 
 class SnapshotService(ABC):
@@ -104,7 +110,21 @@ class PersistedSnapshotService(SnapshotService):
         snapshot_executor=None,
         *,
         recover_unfinished_snapshots: bool = True,
+        operation_owner: str | None = None,
+        operation_lease_seconds: float = SNAPSHOT_OPERATION_LEASE_SECONDS,
+        lease_renew_interval_seconds: float = SNAPSHOT_LEASE_RENEW_INTERVAL_SECONDS,
+        recovery_interval_seconds: float = SNAPSHOT_RECOVERY_INTERVAL_SECONDS,
     ) -> None:
+        if operation_lease_seconds <= 0:
+            raise ValueError("operation_lease_seconds must be greater than zero")
+        if not 0 < lease_renew_interval_seconds < operation_lease_seconds:
+            raise ValueError(
+                "lease_renew_interval_seconds must be greater than zero and less than "
+                "operation_lease_seconds"
+            )
+        if recovery_interval_seconds <= 0:
+            raise ValueError("recovery_interval_seconds must be greater than zero")
+
         self._snapshot_repository = snapshot_repository
         self._sandbox_service = sandbox_service
         self._snapshot_runtime = snapshot_runtime or NoopSnapshotRuntime()
@@ -112,8 +132,21 @@ class PersistedSnapshotService(SnapshotService):
             max_workers=SNAPSHOT_WORKER_MAX_WORKERS,
             thread_name_prefix="snapshot-create",
         )
+        self._operation_owner = operation_owner or self._default_operation_owner()
+        self._operation_lease_duration = timedelta(seconds=operation_lease_seconds)
+        self._lease_renew_interval_seconds = lease_renew_interval_seconds
+        self._recovery_interval_seconds = recovery_interval_seconds
+        self._recovery_stop = Event()
+        self._recovery_thread: Thread | None = None
         if recover_unfinished_snapshots:
             self.recover_unfinished_snapshots()
+            if self._snapshot_repository.supports_distributed_leases:
+                self._recovery_thread = Thread(
+                    target=self._recovery_loop,
+                    name="snapshot-recovery",
+                    daemon=True,
+                )
+                self._recovery_thread.start()
 
     def create_snapshot(self, sandbox_id: str, request: CreateSnapshotRequest) -> Snapshot:
         sandbox = self._sandbox_service.get_sandbox(sandbox_id)
@@ -145,11 +178,9 @@ class PersistedSnapshotService(SnapshotService):
             updated_at=now,
         )
         self._snapshot_repository.create(record)
-        future = self._snapshot_executor.submit(
-            self._create_snapshot_worker,
-            record,
-        )
-        future.add_done_callback(self._log_worker_failure)
+        claimed = self._claim_operation(record)
+        if claimed is not None:
+            self._submit_create_worker(claimed, recovery=False)
         return self._to_snapshot_response(record)
 
     def list_snapshots(self, request: ListSnapshotsRequest) -> ListSnapshotsResponse:
@@ -217,17 +248,18 @@ class PersistedSnapshotService(SnapshotService):
             if record is None:
                 return
 
-        self._snapshot_runtime.delete_snapshot(
-            snapshot_id,
-            image=record.restore_config.image,
-            namespace=record.namespace,
-        )
-        self._snapshot_repository.delete(snapshot_id)
+        claimed = self._claim_operation(record)
+        if claimed is None:
+            return
+        self._delete_snapshot_worker(claimed, propagate=True)
 
     def close(self) -> None:
         """
         Stop accepting new snapshot work and wait for in-flight workers.
         """
+        self._recovery_stop.set()
+        if self._recovery_thread is not None:
+            self._recovery_thread.join(timeout=self._recovery_interval_seconds + 1)
         self._snapshot_executor.shutdown(wait=True)
 
     @staticmethod
@@ -238,7 +270,7 @@ class PersistedSnapshotService(SnapshotService):
     def _default_pagination():
         from opensandbox_server.api.schema import PaginationRequest
 
-        return PaginationRequest()
+        return PaginationRequest(page=1, pageSize=20)
 
     @staticmethod
     def _get_tenant_namespace() -> str | None:
@@ -276,6 +308,8 @@ class PersistedSnapshotService(SnapshotService):
             ),
             created_at=record.created_at,
             updated_at=now,
+            operation_generation=record.operation_generation,
+            operation_attempt=record.operation_attempt,
         )
         if self._snapshot_repository.update_if_state(
             deleting_record,
@@ -297,13 +331,35 @@ class PersistedSnapshotService(SnapshotService):
             },
         )
 
-    def _create_snapshot_worker(self, record: SnapshotRecord) -> None:
+    def _create_snapshot_worker(
+        self,
+        record: SnapshotRecord,
+        recovery: bool = False,
+        heartbeat: tuple[Event, Thread | None] | None = None,
+    ) -> None:
+        active_heartbeat = heartbeat or self._start_lease_heartbeat(record)
         try:
-            runtime_status = self._snapshot_runtime.create_snapshot(
-                record.id,
-                record.source_sandbox_id,
-                namespace=record.namespace,
-            )
+            if recovery:
+                recover_snapshot = getattr(self._snapshot_runtime, "recover_snapshot", None)
+                if recover_snapshot is None:
+                    runtime_status = self._snapshot_runtime.inspect_snapshot(
+                        record.id,
+                        image=record.restore_config.image,
+                        namespace=record.namespace,
+                    )
+                else:
+                    runtime_status = recover_snapshot(
+                        record.id,
+                        record.source_sandbox_id,
+                        image=record.restore_config.image,
+                        namespace=record.namespace,
+                    )
+            else:
+                runtime_status = self._snapshot_runtime.create_snapshot(
+                    record.id,
+                    record.source_sandbox_id,
+                    namespace=record.namespace,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "Failed to create snapshot %s from sandbox %s: %s",
@@ -316,17 +372,18 @@ class PersistedSnapshotService(SnapshotService):
                 reason="snapshot_runtime_failed",
                 message=str(exc),
             )
+
+        try:
+            if runtime_status is None:
+                runtime_status = SnapshotRuntimeStatus(
+                    state=SnapshotState.FAILED,
+                    reason="snapshot_runtime_missing_result",
+                    message="Snapshot runtime did not return a final status.",
+                )
+
             self._complete_snapshot(record, runtime_status)
-            return
-
-        if runtime_status is None:
-            runtime_status = SnapshotRuntimeStatus(
-                state=SnapshotState.FAILED,
-                reason="snapshot_runtime_missing_result",
-                message="Snapshot runtime did not return a final status.",
-            )
-
-        self._complete_snapshot(record, runtime_status)
+        finally:
+            self._stop_lease_heartbeat(active_heartbeat)
 
     def _log_worker_failure(self, future: Future) -> None:
         try:
@@ -335,38 +392,37 @@ class PersistedSnapshotService(SnapshotService):
             logger.exception("Snapshot worker exited unexpectedly: %s", exc)
 
     def _complete_snapshot(self, record: SnapshotRecord, runtime_status) -> None:
-        current_record = self._snapshot_repository.get(record.id)
-        if current_record is None:
-            self._cleanup_runtime_artifact(record.id, runtime_status.image, record.namespace)
+        if record.lease_owner is None:
+            logger.warning(
+                "Snapshot %s worker completed without an operation lease; skipping update",
+                record.id,
+            )
             return
 
-        if current_record.status.state == SnapshotState.DELETING:
-            self._cleanup_runtime_artifact(current_record.id, runtime_status.image, current_record.namespace)
-            self._snapshot_repository.delete(current_record.id)
-            return
-
-        if current_record.status.state != SnapshotState.CREATING:
-            return
-
-        updated = self._build_runtime_status_record(current_record, runtime_status)
+        updated = self._build_runtime_status_record(record, runtime_status)
         if updated is None:
             return
 
-        updated_applied = self._snapshot_repository.update_if_state(
+        updated_applied = self._snapshot_repository.update_if_operation_owner(
             updated,
             SnapshotState.CREATING,
+            record.lease_owner,
+            record.operation_generation,
         )
         if not updated_applied:
             logger.info(
-                "Snapshot %s was already transitioned before worker completion; skipping update",
-                current_record.id,
+                "Snapshot %s lease generation %s is stale; skipping terminal update",
+                record.id,
+                record.operation_generation,
             )
 
     def recover_unfinished_snapshots(self) -> None:
-        while True:
+        page = 1
+        claimed_count = 0
+        while claimed_count < SNAPSHOT_WORKER_MAX_WORKERS:
             result = self._snapshot_repository.list(
                 SnapshotListQuery(
-                    page=1,
+                    page=page,
                     page_size=SNAPSHOT_RECOVERY_PAGE_SIZE,
                     states=[SnapshotState.CREATING.value, SnapshotState.DELETING.value],
                 )
@@ -374,10 +430,12 @@ class PersistedSnapshotService(SnapshotService):
             if not result.items:
                 return
 
-            progressed = False
             for record in result.items:
                 try:
-                    progressed = self._recover_unfinished_snapshot(record) or progressed
+                    if self._recover_unfinished_snapshot(record):
+                        claimed_count += 1
+                        if claimed_count >= SNAPSHOT_WORKER_MAX_WORKERS:
+                            return
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "Failed to recover unfinished snapshot %s: %s",
@@ -385,51 +443,22 @@ class PersistedSnapshotService(SnapshotService):
                         exc,
                         exc_info=True,
                     )
-                    failed_status = SnapshotRuntimeStatus(
-                        state=SnapshotState.FAILED,
-                        reason="snapshot_recovery_failed",
-                        message=f"Failed to recover unfinished snapshot: {exc}",
-                    )
-                    self._complete_snapshot(record, failed_status)
-                    progressed = True
 
-            if not progressed:
+            if page * SNAPSHOT_RECOVERY_PAGE_SIZE >= result.total_items:
                 return
+            page += 1
 
     def _recover_unfinished_snapshot(self, record: SnapshotRecord) -> bool:
-        if record.status.state == SnapshotState.CREATING:
-            runtime_status = self._snapshot_runtime.inspect_snapshot(
-                record.id,
-                image=record.restore_config.image,
-                namespace=record.namespace,
-            )
-            if runtime_status.state == SnapshotState.CREATING:
-                future = self._snapshot_executor.submit(
-                    self._create_snapshot_worker,
-                    record,
-                )
-                future.add_done_callback(self._log_worker_failure)
-                return False
-            self._complete_snapshot(record, runtime_status)
+        claimed = self._claim_operation(record)
+        if claimed is None:
+            return False
+
+        if claimed.status.state == SnapshotState.CREATING:
+            self._submit_create_worker(claimed, recovery=True)
             return True
 
-        if record.status.state == SnapshotState.DELETING:
-            try:
-                self._snapshot_runtime.delete_snapshot(
-                    record.id,
-                    image=record.restore_config.image,
-                    namespace=record.namespace,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to recover deleting snapshot %s: %s",
-                    record.id,
-                    exc,
-                    exc_info=True,
-                )
-                return False
-
-            self._snapshot_repository.delete(record.id)
+        if claimed.status.state == SnapshotState.DELETING:
+            self._delete_snapshot_worker(claimed, propagate=False)
             return True
 
         return False
@@ -457,6 +486,8 @@ class PersistedSnapshotService(SnapshotService):
                     ),
                     created_at=record.created_at,
                     updated_at=now,
+                    operation_generation=record.operation_generation,
+                    operation_attempt=record.operation_attempt,
                 )
 
             return SnapshotRecord(
@@ -474,6 +505,8 @@ class PersistedSnapshotService(SnapshotService):
                 ),
                 created_at=record.created_at,
                 updated_at=now,
+                operation_generation=record.operation_generation,
+                operation_attempt=record.operation_attempt,
             )
 
         if runtime_status.state == SnapshotState.FAILED:
@@ -492,23 +525,123 @@ class PersistedSnapshotService(SnapshotService):
                 ),
                 created_at=record.created_at,
                 updated_at=now,
+                operation_generation=record.operation_generation,
+                operation_attempt=record.operation_attempt,
             )
 
         return None
 
-    def _cleanup_runtime_artifact(self, snapshot_id: str, image: str | None, namespace: str = "default") -> None:
-        if not image:
-            return
+    def _claim_operation(self, record: SnapshotRecord) -> SnapshotRecord | None:
+        return self._snapshot_repository.claim_operation(
+            record.id,
+            record.status.state,
+            self._operation_owner,
+            self._operation_lease_duration,
+        )
 
+    def _submit_create_worker(self, record: SnapshotRecord, *, recovery: bool) -> None:
+        heartbeat = self._start_lease_heartbeat(record)
         try:
-            self._snapshot_runtime.delete_snapshot(snapshot_id, image=image, namespace=namespace)
+            future = self._snapshot_executor.submit(
+                self._create_snapshot_worker,
+                record,
+                recovery,
+                heartbeat,
+            )
+        except BaseException:
+            self._stop_lease_heartbeat(heartbeat)
+            raise
+        future.add_done_callback(self._log_worker_failure)
+
+    def _delete_snapshot_worker(self, record: SnapshotRecord, *, propagate: bool) -> None:
+        heartbeat = self._start_lease_heartbeat(record)
+        try:
+            self._snapshot_runtime.delete_snapshot(
+                record.id,
+                image=record.restore_config.image,
+                namespace=record.namespace,
+            )
+            deleted = self._snapshot_repository.delete_if_operation_owner(
+                record.id,
+                SnapshotState.DELETING,
+                record.lease_owner or "",
+                record.operation_generation,
+            )
+            if not deleted:
+                logger.info(
+                    "Snapshot %s lease generation %s is stale; retaining metadata for recovery",
+                    record.id,
+                    record.operation_generation,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Failed to cleanup snapshot artifact for %s: %s",
-                snapshot_id,
+                "Failed to delete snapshot %s while holding generation %s: %s",
+                record.id,
+                record.operation_generation,
                 exc,
                 exc_info=True,
             )
+            if propagate:
+                raise
+            return
+        finally:
+            self._stop_lease_heartbeat(heartbeat)
+
+    def _start_lease_heartbeat(self, record: SnapshotRecord) -> tuple[Event, Thread | None]:
+        stop = Event()
+        if record.lease_owner is None:
+            return stop, None
+
+        def renew() -> None:
+            while not stop.wait(self._lease_renew_interval_seconds):
+                try:
+                    renewed = self._snapshot_repository.renew_operation(
+                        record.id,
+                        record.status.state,
+                        record.lease_owner or "",
+                        record.operation_generation,
+                        self._operation_lease_duration,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to renew snapshot %s lease generation %s: %s",
+                        record.id,
+                        record.operation_generation,
+                        exc,
+                    )
+                    continue
+                if not renewed:
+                    logger.info(
+                        "Snapshot %s lease generation %s is no longer owned by this worker",
+                        record.id,
+                        record.operation_generation,
+                    )
+                    return
+
+        thread = Thread(
+            target=renew,
+            name=f"snapshot-lease-{record.id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+        return stop, thread
+
+    def _stop_lease_heartbeat(self, heartbeat: tuple[Event, Thread | None]) -> None:
+        stop, thread = heartbeat
+        stop.set()
+        if thread is not None:
+            thread.join(timeout=self._lease_renew_interval_seconds + 1)
+
+    def _recovery_loop(self) -> None:
+        while not self._recovery_stop.wait(self._recovery_interval_seconds):
+            try:
+                self.recover_unfinished_snapshots()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Snapshot recovery scan failed: %s", exc, exc_info=True)
+
+    @staticmethod
+    def _default_operation_owner() -> str:
+        return f"{socket.gethostname()}:{os.getpid()}:{uuid4()}"
 
     @staticmethod
     def _ensure_source_sandbox_running(sandbox) -> None:

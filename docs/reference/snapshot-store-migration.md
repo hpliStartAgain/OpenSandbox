@@ -5,7 +5,7 @@ description: Migration guide for switching the server snapshot store from SQLite
 
 # Snapshot Store Migration Guide
 
-Feature: [#1653](https://github.com/opensandbox-group/OpenSandbox/pull/1653)
+Features: [PostgreSQL store #1653](https://github.com/opensandbox-group/OpenSandbox/pull/1653), [migration #1669](https://github.com/opensandbox-group/OpenSandbox/issues/1669)
 
 ## Background
 
@@ -62,6 +62,9 @@ Snapshots migrated: total=42, migrated=42, skipped=0
 - The PostgreSQL schema is created only on a real migration run, when the table does not
   already exist.
 - Timestamps stored as naive UTC in SQLite are written as `TIMESTAMPTZ` in UTC.
+- Operation generation and attempt counters are preserved, while any source
+  lease owner and expiry are cleared. Stop the SQLite Server before migration;
+  a lease from that stopped process must not block PostgreSQL recovery.
 
 ## Switch the server
 
@@ -79,7 +82,19 @@ dsn = "postgresql://user:password@localhost:5432/opensandbox"
 Restart the server. Snapshot lookups and restore requests now read the shared PostgreSQL
 catalog, including the migrated records.
 
+For Kubernetes public snapshots, you may then increase the active Server replica
+count. Every replica must use this same PostgreSQL database. Docker public
+snapshots remain limited to one active Server.
+
 ## Verify
 
 - `GET /v1/sandboxes/{id}/snapshots` returns the migrated snapshot records.
 - Restoring a sandbox with an existing `snapshotId` succeeds.
+
+## Roll back the Server version
+
+The PostgreSQL schema upgrade adds columns with backward-compatible defaults, so
+an older Server can still read the snapshot table. Before starting an older
+version, scale back to one active Server because versions without operation
+leases cannot coordinate in-flight snapshot work. The migration command is
+one-way and does not copy later PostgreSQL changes back to SQLite.

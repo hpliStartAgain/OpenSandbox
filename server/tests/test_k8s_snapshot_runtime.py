@@ -95,6 +95,37 @@ class TransientThenReadyK8sClient(TransientGetK8sClient):
         return obj
 
 
+class ReadyOnCreateK8sClient(FakeK8sClient):
+    def create_custom_object(self, **kwargs):
+        stored = super().create_custom_object(**kwargs)
+        name = stored["metadata"]["name"]
+        stored["status"] = {
+            "phase": "Succeed",
+            "containers": [
+                {"containerName": "sandbox", "imageUri": "registry/sandbox:snap"},
+            ],
+        }
+        self.objects[name] = deepcopy(stored)
+        return stored
+
+
+class CreateRaceK8sClient(FakeK8sClient):
+    def __init__(self, existing: dict) -> None:
+        super().__init__()
+        self.existing = deepcopy(existing)
+        self.get_calls = 0
+
+    def get_custom_object(self, **kwargs):
+        self.get_calls += 1
+        if self.get_calls == 1:
+            return None
+        return deepcopy(self.existing)
+
+    def create_custom_object(self, **kwargs):
+        self.created.append(deepcopy(kwargs["body"]))
+        raise ApiException(status=409, reason="Already Exists")
+
+
 def _snapshot_cr(*, phase: str, containers: list[dict] | None = None, sandbox_id: str = SANDBOX_ID) -> dict:
     name = build_public_snapshot_name(SNAPSHOT_ID)
     return {
@@ -124,7 +155,7 @@ def test_public_snapshot_name_and_tag_are_derived_from_snapshot_id() -> None:
     assert build_public_snapshot_tag(SNAPSHOT_ID) == f"snap-{SNAPSHOT_HEX}"
 
 
-def test_create_snapshot_creates_cr_and_maps_succeed_to_ready() -> None:
+def test_create_snapshot_observes_existing_cr_without_duplicate_create() -> None:
     k8s_client = FakeK8sClient()
     snapshot_name = build_public_snapshot_name(SNAPSHOT_ID)
     k8s_client.objects[snapshot_name] = _snapshot_cr(
@@ -143,27 +174,50 @@ def test_create_snapshot_creates_cr_and_maps_succeed_to_ready() -> None:
 
     status = runtime.create_snapshot(SNAPSHOT_ID, SANDBOX_ID)
 
-    assert k8s_client.created == [
-        {
-            "apiVersion": "sandbox.opensandbox.io/v1alpha1",
-            "kind": "SandboxSnapshot",
-            "metadata": {
-                "name": snapshot_name,
-                "namespace": "default",
-                "labels": {
-                    "opensandbox.io/snapshot-id": SNAPSHOT_ID,
-                    "opensandbox.io/source-sandbox-id": SANDBOX_ID,
-                    "opensandbox.io/snapshot-scope": "public",
-                },
-            },
-            "spec": {
-                "sandboxName": SANDBOX_ID,
-            },
-        }
-    ]
+    assert k8s_client.created == []
     assert status.state == SnapshotState.READY
     assert status.image == "registry/sandbox:snap"
     assert status.reason == "snapshot_runtime_ready"
+
+
+def test_create_snapshot_creates_cr_only_after_observing_it_is_missing() -> None:
+    k8s_client = ReadyOnCreateK8sClient()
+    snapshot_name = build_public_snapshot_name(SNAPSHOT_ID)
+    runtime = KubernetesSnapshotRuntime(
+        k8s_client,
+        namespace="default",
+        wait_timeout_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    status = runtime.create_snapshot(SNAPSHOT_ID, SANDBOX_ID)
+
+    assert [item["metadata"]["name"] for item in k8s_client.created] == [snapshot_name]
+    assert status.state == SnapshotState.READY
+    assert status.image == "registry/sandbox:snap"
+
+
+def test_create_snapshot_observes_the_winner_after_create_race() -> None:
+    k8s_client = CreateRaceK8sClient(
+        _snapshot_cr(
+            phase="Succeed",
+            containers=[
+                {"containerName": "sandbox", "imageUri": "registry/sandbox:snap"},
+            ],
+        )
+    )
+    runtime = KubernetesSnapshotRuntime(
+        k8s_client,
+        namespace="default",
+        wait_timeout_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    status = runtime.create_snapshot(SNAPSHOT_ID, SANDBOX_ID)
+
+    assert len(k8s_client.created) == 1
+    assert status.state == SnapshotState.READY
+    assert status.image == "registry/sandbox:snap"
 
 
 def test_inspect_snapshot_keeps_pending_snapshot_creating() -> None:

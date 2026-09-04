@@ -182,3 +182,64 @@ class SnapshotRepositoryContract:
         repository.delete(original.id)
         repository.delete(original.id)
         assert repository.get(original.id) is None
+
+    def test_operation_lease_claim_renew_and_fenced_completion(
+        self,
+        repository: SnapshotRepository,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        original = snapshot_record("snap-lease", "sbx-001", now)
+        repository.create(original)
+
+        claim = repository.claim_operation(
+            original.id,
+            SnapshotState.CREATING,
+            "server-a",
+            timedelta(seconds=30),
+        )
+
+        assert claim is not None
+        assert claim.operation_generation == 1
+        assert claim.operation_attempt == 1
+        assert claim.lease_owner == "server-a"
+        assert claim.lease_expires_at is not None
+        assert repository.claim_operation(
+            original.id,
+            SnapshotState.CREATING,
+            "server-b",
+            timedelta(seconds=30),
+        ) is None
+        assert repository.renew_operation(
+            original.id,
+            SnapshotState.CREATING,
+            "server-a",
+            claim.operation_generation,
+            timedelta(seconds=30),
+        ) is True
+
+        ready = snapshot_record(
+            original.id,
+            original.source_sandbox_id,
+            original.created_at,
+            SnapshotState.READY,
+        )
+        ready.operation_generation = claim.operation_generation
+        ready.operation_attempt = claim.operation_attempt
+        assert repository.update_if_operation_owner(
+            ready,
+            SnapshotState.CREATING,
+            "server-b",
+            claim.operation_generation,
+        ) is False
+        assert repository.update_if_operation_owner(
+            ready,
+            SnapshotState.CREATING,
+            "server-a",
+            claim.operation_generation,
+        ) is True
+
+        stored = repository.get(original.id)
+        assert stored is not None
+        assert stored.status.state == SnapshotState.READY
+        assert stored.lease_owner is None
+        assert stored.lease_expires_at is None

@@ -87,6 +87,10 @@ class SnapshotRecord:
     )
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
+    operation_generation: int = 0
+    lease_owner: str | None = None
+    lease_expires_at: datetime | None = None
+    operation_attempt: int = 0
 
 
 __all__ = [
