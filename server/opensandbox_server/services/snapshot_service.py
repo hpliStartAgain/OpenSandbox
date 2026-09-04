@@ -458,7 +458,11 @@ class PersistedSnapshotService(SnapshotService):
             return self._try_start_create_operation(record, recovery=True)
 
         if record.status.state == SnapshotState.DELETING:
-            claimed = self._claim_operation(record)
+            try:
+                claimed = self._claim_operation(record)
+            except Exception:
+                self._ensure_recovery_thread()
+                raise
             if claimed is None:
                 self._ensure_recovery_thread()
                 return False

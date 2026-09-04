@@ -1301,6 +1301,50 @@ def test_snapshot_service_recovers_deleting_snapshot(tmp_path) -> None:
     assert repo.get("snap-delete") is None
 
 
+def test_sqlite_startup_retries_failed_delete_claim(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    record = _snapshot_record(
+        "snap-delete-startup-claim-retry",
+        SnapshotState.DELETING,
+        image="opensandbox-snapshots:snap-delete-startup-claim-retry",
+    )
+    repo.create(record)
+    runtime = StubSnapshotRuntime()
+    original_claim = repo.claim_operation
+    claim_attempts = 0
+
+    def fail_first_claim(*args, **kwargs):
+        nonlocal claim_attempts
+        claim_attempts += 1
+        if claim_attempts == 1:
+            raise RuntimeError("transient startup claim failure")
+        return original_claim(*args, **kwargs)
+
+    repo.claim_operation = fail_first_claim
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        recovery_interval_seconds=0.01,
+    )
+
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if repo.get(record.id) is None:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("SQLite startup deletion was not retried after its claim failed")
+
+        assert claim_attempts == 2
+        assert runtime.delete_calls == [
+            (record.id, "opensandbox-snapshots:snap-delete-startup-claim-retry"),
+        ]
+    finally:
+        service.close()
+
+
 def test_sqlite_startup_recovers_more_than_distributed_worker_limit(tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     records = [
