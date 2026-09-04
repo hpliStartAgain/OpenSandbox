@@ -414,6 +414,7 @@ class PersistedSnapshotService(SnapshotService):
                 record.id,
                 record.operation_generation,
             )
+            self._ensure_recovery_thread()
 
     def recover_unfinished_snapshots(self) -> None:
         page = 1
@@ -598,6 +599,7 @@ class PersistedSnapshotService(SnapshotService):
                     record.id,
                     record.operation_generation,
                 )
+                self._ensure_recovery_thread()
             return deleted
         except Exception as exc:  # noqa: BLE001
             logger.warning(

@@ -193,6 +193,41 @@ class CreatingOnceRuntime(StubSnapshotRuntime):
         )
 
 
+class ReadyCreateRuntime(StubSnapshotRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recover_calls: list[str] = []
+
+    def create_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        *,
+        namespace: str | None = None,
+    ) -> SnapshotRuntimeStatus:
+        self.calls.append((snapshot_id, sandbox_id))
+        return SnapshotRuntimeStatus(
+            state=SnapshotState.READY,
+            image=f"registry/snapshots:{snapshot_id}",
+            reason="snapshot_runtime_ready",
+        )
+
+    def recover_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        image: str | None = None,
+        *,
+        namespace: str | None = None,
+    ) -> SnapshotRuntimeStatus:
+        self.recover_calls.append(snapshot_id)
+        return SnapshotRuntimeStatus(
+            state=SnapshotState.READY,
+            image=f"registry/snapshots:{snapshot_id}",
+            reason="snapshot_runtime_ready",
+        )
+
+
 class DistributedSQLiteSnapshotRepository(SQLiteSnapshotRepository):
     @property
     def supports_distributed_leases(self) -> bool:
@@ -390,6 +425,53 @@ def test_sqlite_nonterminal_create_is_recovered_after_lease_expiry(tmp_path) -> 
             pytest.fail("SQLite nonterminal creation was not recovered after lease expiry")
 
         assert runtime.calls == [(created.id, "sbx-001")]
+        assert runtime.recover_calls == [created.id]
+    finally:
+        service.close()
+
+
+def test_sqlite_rejected_terminal_update_is_recovered(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = ReadyCreateRuntime()
+    original_update = repo.update_if_operation_owner
+    update_attempts = 0
+
+    def reject_first_terminal_update(*args, **kwargs) -> bool:
+        nonlocal update_attempts
+        update_attempts += 1
+        if update_attempts == 1:
+            with repo._connect() as conn:
+                conn.execute(
+                    "UPDATE snapshots SET lease_expires_at = ? WHERE id = ?",
+                    ("1970-01-01T00:00:00+00:00", args[0].id),
+                )
+            return False
+        return original_update(*args, **kwargs)
+
+    repo.update_if_operation_owner = reject_first_terminal_update
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=ImmediateExecutor(),
+        recovery_interval_seconds=0.01,
+    )
+
+    try:
+        created = service.create_snapshot(
+            "sbx-001",
+            CreateSnapshotRequest(name="fenced-terminal-retry"),
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            stored = repo.get(created.id)
+            if stored is not None and stored.status.state == SnapshotState.READY:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("SQLite rejected terminal update was not recovered")
+
+        assert update_attempts == 2
         assert runtime.recover_calls == [created.id]
     finally:
         service.close()
@@ -803,6 +885,57 @@ def test_sqlite_failed_delete_schedules_recovery_after_lease_expiry(tmp_path) ->
         assert runtime.delete_calls == [
             (record.id, "opensandbox-snapshots:snap-delete-retry"),
             (record.id, "opensandbox-snapshots:snap-delete-retry"),
+        ]
+    finally:
+        service.close()
+
+
+def test_sqlite_rejected_metadata_delete_is_recovered(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    record = _snapshot_record(
+        "snap-delete-fenced",
+        SnapshotState.READY,
+        image="opensandbox-snapshots:snap-delete-fenced",
+    )
+    repo.create(record)
+    runtime = StubSnapshotRuntime()
+    original_delete = repo.delete_if_operation_owner
+    delete_attempts = 0
+
+    def reject_first_metadata_delete(*args, **kwargs) -> bool:
+        nonlocal delete_attempts
+        delete_attempts += 1
+        if delete_attempts == 1:
+            with repo._connect() as conn:
+                conn.execute(
+                    "UPDATE snapshots SET lease_expires_at = ? WHERE id = ?",
+                    ("1970-01-01T00:00:00+00:00", args[0]),
+                )
+            return False
+        return original_delete(*args, **kwargs)
+
+    repo.delete_if_operation_owner = reject_first_metadata_delete
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        recovery_interval_seconds=0.01,
+    )
+
+    try:
+        service.delete_snapshot(record.id)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if repo.get(record.id) is None:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("SQLite rejected metadata deletion was not recovered")
+
+        assert delete_attempts == 2
+        assert runtime.delete_calls == [
+            (record.id, "opensandbox-snapshots:snap-delete-fenced"),
+            (record.id, "opensandbox-snapshots:snap-delete-fenced"),
         ]
     finally:
         service.close()
