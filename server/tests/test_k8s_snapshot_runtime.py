@@ -284,6 +284,29 @@ def test_create_snapshot_rechecks_deadline_before_creating_missing_cr(monkeypatc
     assert k8s_client.created == []
 
 
+def test_create_snapshot_leaves_slow_success_recoverable(monkeypatch) -> None:
+    k8s_client = FakeK8sClient()
+    ticks = iter([0.0, 1.0, 11.0])
+    monkeypatch.setattr(
+        "opensandbox_server.services.k8s.snapshot_runtime.time.monotonic",
+        lambda: next(ticks),
+    )
+    runtime = KubernetesSnapshotRuntime(
+        k8s_client,
+        namespace="default",
+        wait_timeout_seconds=10,
+        poll_interval_seconds=0,
+    )
+
+    status = runtime.create_snapshot(SNAPSHOT_ID, SANDBOX_ID)
+
+    assert status.state == SnapshotState.CREATING
+    assert status.reason == "snapshot_runtime_timeout"
+    assert "recovery will continue" in (status.message or "")
+    assert len(k8s_client.created) == 1
+    assert build_public_snapshot_name(SNAPSHOT_ID) in k8s_client.objects
+
+
 def test_create_snapshot_observes_the_winner_after_create_race() -> None:
     k8s_client = CreateRaceK8sClient(
         _snapshot_cr(

@@ -180,7 +180,14 @@ class KubernetesSnapshotRuntime:
             )
 
         if time.monotonic() >= deadline:
-            return self._timeout_status(snapshot_id)
+            return SnapshotRuntimeStatus(
+                state=SnapshotState.CREATING,
+                reason="snapshot_runtime_timeout",
+                message=(
+                    "Kubernetes SandboxSnapshot was created, but the observation "
+                    "deadline elapsed before terminal status; recovery will continue."
+                ),
+            )
         return self._wait_for_terminal_snapshot(
             snapshot_id,
             namespace=ns,
