@@ -238,8 +238,28 @@ def _write_postgresql_snapshots(dsn: str, records: list[dict[str, Any]]) -> int:
             "SELECT pg_advisory_xact_lock(hashtext(%s))",
             (_SCHEMA_LOCK_NAME,),
         )
+        operation_attempt_row = conn.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'snapshots'
+                  AND column_name = 'operation_attempt'
+            )
+            """
+        ).fetchone()
+        operation_attempt_existed = bool(
+            operation_attempt_row is not None and operation_attempt_row[0]
+        )
         for statement in _CREATE_SCHEMA_STATEMENTS:
             conn.execute(statement)
+        if not operation_attempt_existed:
+            conn.execute(
+                "UPDATE snapshots SET operation_attempt = 1 "
+                "WHERE state = %s AND operation_attempt = 0",
+                ("Creating",),
+            )
         for record in records:
             source_operation_attempt = record["operation_attempt"]
             params = {

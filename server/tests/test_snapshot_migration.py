@@ -201,6 +201,64 @@ def test_migrate_skips_records_already_in_postgresql(tmp_path, postgresql_dsn: s
     assert len(stored) == 2
 
 
+def test_migrate_backfills_existing_legacy_target_creating_row(
+    tmp_path,
+    postgresql_dsn: str,
+) -> None:
+    now = datetime(2026, 1, 2, 3, 4, 5)
+    sqlite_repo = _create_sqlite_repository(
+        tmp_path,
+        [snapshot_record("snap-existing", "sbx-001", now, SnapshotState.CREATING)],
+    )
+    sqlite_repo.close()
+
+    with psycopg.connect(postgresql_dsn) as conn:
+        conn.execute("DROP TABLE IF EXISTS snapshots")
+        conn.execute(
+            """
+            CREATE TABLE snapshots (
+                id TEXT PRIMARY KEY,
+                source_sandbox_id TEXT NOT NULL,
+                namespace TEXT DEFAULT NULL,
+                name TEXT,
+                description TEXT,
+                restore_config JSONB NOT NULL,
+                state TEXT NOT NULL,
+                reason TEXT,
+                message TEXT,
+                last_transition_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO snapshots (
+                id, source_sandbox_id, namespace, name, description,
+                restore_config, state, reason, message, last_transition_at,
+                created_at, updated_at
+            ) VALUES (
+                'snap-existing', 'sbx-001', NULL, 'legacy', NULL,
+                '{"image": null}'::jsonb, 'Creating', 'snapshot_accepted', NULL,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+    result = migrate_sqlite_snapshots_to_postgresql(
+        tmp_path / "opensandbox.db",
+        postgresql_dsn,
+    )
+
+    assert result.migrated == 0
+    assert result.skipped == 1
+    stored = _records_from_postgresql(postgresql_dsn)
+    assert len(stored) == 1
+    assert stored[0].id == "snap-existing"
+    assert stored[0].operation_attempt == 1
+
+
 def test_migrate_dry_run_writes_nothing(tmp_path, postgresql_dsn: str) -> None:
     _truncate_postgresql(postgresql_dsn)
     now = datetime(2026, 1, 2, 3, 4, 5)
