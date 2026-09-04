@@ -14,6 +14,8 @@
 
 from concurrent.futures import Future
 from datetime import timedelta
+from threading import Event, Lock
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -109,6 +111,44 @@ class StubSnapshotRuntime:
                 message="Snapshot creation was interrupted and no snapshot image was found.",
             ),
         )
+
+
+class BlockingRecoveryRuntime(StubSnapshotRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = Event()
+        self.two_started = Event()
+        self.three_started = Event()
+        self._started_ids: list[str] = []
+        self._started_lock = Lock()
+
+    def recover_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        image: str | None = None,
+        *,
+        namespace: str | None = None,
+    ) -> SnapshotRuntimeStatus:
+        with self._started_lock:
+            self._started_ids.append(snapshot_id)
+            if len(self._started_ids) >= 2:
+                self.two_started.set()
+            if len(self._started_ids) >= 3:
+                self.three_started.set()
+        if not self.release.wait(timeout=2):
+            raise TimeoutError("test did not release snapshot recovery")
+        return SnapshotRuntimeStatus(
+            state=SnapshotState.READY,
+            image=f"registry/snapshots:{snapshot_id}",
+            reason="snapshot_runtime_ready",
+        )
+
+
+class DistributedSQLiteSnapshotRepository(SQLiteSnapshotRepository):
+    @property
+    def supports_distributed_leases(self) -> bool:
+        return True
 
 
 def _snapshot_record(
@@ -345,6 +385,62 @@ def test_two_services_share_one_unfinished_operation_owner(tmp_path) -> None:
     assert stored.operation_generation == 1
     heartbeat = first_executor.submitted[0][1][2]
     first_service._stop_lease_heartbeat(heartbeat)
+
+
+def test_recovery_claims_only_available_worker_slots(tmp_path) -> None:
+    repo = DistributedSQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    records = [
+        _snapshot_record(f"snap-queued-{index}", SnapshotState.CREATING)
+        for index in range(3)
+    ]
+    for record in records:
+        repo.create(record)
+    runtime = BlockingRecoveryRuntime()
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        recover_unfinished_snapshots=False,
+        recovery_interval_seconds=60,
+    )
+
+    try:
+        service.recover_unfinished_snapshots()
+        assert runtime.two_started.wait(timeout=2)
+        stored = [repo.get(record.id) for record in records]
+        assert sum(item is not None and item.lease_owner is not None for item in stored) == 2
+        assert sum(item is not None and item.lease_owner is None for item in stored) == 1
+
+        service.recover_unfinished_snapshots()
+        stored = [repo.get(record.id) for record in records]
+        assert sum(item is not None and item.lease_owner is not None for item in stored) == 2
+        assert runtime.three_started.is_set() is False
+
+        runtime.release.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if sum(
+                item is not None and item.status.state == SnapshotState.READY
+                for item in (repo.get(record.id) for record in records)
+            ) >= 2:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("initial recovery workers did not complete")
+
+        service.recover_unfinished_snapshots()
+        assert runtime.three_started.wait(timeout=2)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            final = [repo.get(record.id) for record in records]
+            if all(item is not None and item.status.state == SnapshotState.READY for item in final):
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("queued recovery did not complete after a worker slot became free")
+    finally:
+        runtime.release.set()
+        service.close()
 
 
 def test_stale_service_completion_is_rejected_after_takeover(tmp_path) -> None:

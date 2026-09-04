@@ -29,7 +29,7 @@ import logging
 from math import ceil
 import os
 import socket
-from threading import Event, Thread
+from threading import BoundedSemaphore, Event, Lock, Thread
 from uuid import uuid4
 
 from fastapi import HTTPException, status
@@ -132,21 +132,18 @@ class PersistedSnapshotService(SnapshotService):
             max_workers=SNAPSHOT_WORKER_MAX_WORKERS,
             thread_name_prefix="snapshot-create",
         )
+        self._worker_slots = BoundedSemaphore(SNAPSHOT_WORKER_MAX_WORKERS)
         self._operation_owner = operation_owner or self._default_operation_owner()
         self._operation_lease_duration = timedelta(seconds=operation_lease_seconds)
         self._lease_renew_interval_seconds = lease_renew_interval_seconds
         self._recovery_interval_seconds = recovery_interval_seconds
         self._recovery_stop = Event()
+        self._recovery_thread_lock = Lock()
         self._recovery_thread: Thread | None = None
         if recover_unfinished_snapshots:
             self.recover_unfinished_snapshots()
             if self._snapshot_repository.supports_distributed_leases:
-                self._recovery_thread = Thread(
-                    target=self._recovery_loop,
-                    name="snapshot-recovery",
-                    daemon=True,
-                )
-                self._recovery_thread.start()
+                self._ensure_recovery_thread()
 
     def create_snapshot(self, sandbox_id: str, request: CreateSnapshotRequest) -> Snapshot:
         sandbox = self._sandbox_service.get_sandbox(sandbox_id)
@@ -178,9 +175,7 @@ class PersistedSnapshotService(SnapshotService):
             updated_at=now,
         )
         self._snapshot_repository.create(record)
-        claimed = self._claim_operation(record)
-        if claimed is not None:
-            self._submit_create_worker(claimed, recovery=False)
+        self._try_start_create_operation(record, recovery=False)
         return self._to_snapshot_response(record)
 
     def list_snapshots(self, request: ListSnapshotsRequest) -> ListSnapshotsResponse:
@@ -336,44 +331,45 @@ class PersistedSnapshotService(SnapshotService):
         record: SnapshotRecord,
         recovery: bool = False,
         heartbeat: tuple[Event, Thread | None] | None = None,
+        release_worker_slot: bool = False,
     ) -> None:
         active_heartbeat = heartbeat or self._start_lease_heartbeat(record)
         try:
-            if recovery:
-                recover_snapshot = getattr(self._snapshot_runtime, "recover_snapshot", None)
-                if recover_snapshot is None:
-                    runtime_status = self._snapshot_runtime.inspect_snapshot(
-                        record.id,
-                        image=record.restore_config.image,
-                        namespace=record.namespace,
-                    )
+            try:
+                if recovery:
+                    recover_snapshot = getattr(self._snapshot_runtime, "recover_snapshot", None)
+                    if recover_snapshot is None:
+                        runtime_status = self._snapshot_runtime.inspect_snapshot(
+                            record.id,
+                            image=record.restore_config.image,
+                            namespace=record.namespace,
+                        )
+                    else:
+                        runtime_status = recover_snapshot(
+                            record.id,
+                            record.source_sandbox_id,
+                            image=record.restore_config.image,
+                            namespace=record.namespace,
+                        )
                 else:
-                    runtime_status = recover_snapshot(
+                    runtime_status = self._snapshot_runtime.create_snapshot(
                         record.id,
                         record.source_sandbox_id,
-                        image=record.restore_config.image,
                         namespace=record.namespace,
                     )
-            else:
-                runtime_status = self._snapshot_runtime.create_snapshot(
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Failed to create snapshot %s from sandbox %s: %s",
                     record.id,
                     record.source_sandbox_id,
-                    namespace=record.namespace,
+                    exc,
                 )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "Failed to create snapshot %s from sandbox %s: %s",
-                record.id,
-                record.source_sandbox_id,
-                exc,
-            )
-            runtime_status = SnapshotRuntimeStatus(
-                state=SnapshotState.FAILED,
-                reason="snapshot_runtime_failed",
-                message=str(exc),
-            )
+                runtime_status = SnapshotRuntimeStatus(
+                    state=SnapshotState.FAILED,
+                    reason="snapshot_runtime_failed",
+                    message=str(exc),
+                )
 
-        try:
             if runtime_status is None:
                 runtime_status = SnapshotRuntimeStatus(
                     state=SnapshotState.FAILED,
@@ -384,6 +380,8 @@ class PersistedSnapshotService(SnapshotService):
             self._complete_snapshot(record, runtime_status)
         finally:
             self._stop_lease_heartbeat(active_heartbeat)
+            if release_worker_slot:
+                self._worker_slots.release()
 
     def _log_worker_failure(self, future: Future) -> None:
         try:
@@ -418,13 +416,7 @@ class PersistedSnapshotService(SnapshotService):
 
     def recover_unfinished_snapshots(self) -> None:
         page = 1
-        claimed_count = 0
-        claim_limit = (
-            SNAPSHOT_WORKER_MAX_WORKERS
-            if self._snapshot_repository.supports_distributed_leases
-            else None
-        )
-        while claim_limit is None or claimed_count < claim_limit:
+        while True:
             result = self._snapshot_repository.list(
                 SnapshotListQuery(
                     page=page,
@@ -437,10 +429,7 @@ class PersistedSnapshotService(SnapshotService):
 
             for record in result.items:
                 try:
-                    if self._recover_unfinished_snapshot(record):
-                        claimed_count += 1
-                        if claim_limit is not None and claimed_count >= claim_limit:
-                            return
+                    self._recover_unfinished_snapshot(record)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "Failed to recover unfinished snapshot %s: %s",
@@ -454,15 +443,13 @@ class PersistedSnapshotService(SnapshotService):
             page += 1
 
     def _recover_unfinished_snapshot(self, record: SnapshotRecord) -> bool:
-        claimed = self._claim_operation(record)
-        if claimed is None:
-            return False
+        if record.status.state == SnapshotState.CREATING:
+            return self._try_start_create_operation(record, recovery=True)
 
-        if claimed.status.state == SnapshotState.CREATING:
-            self._submit_create_worker(claimed, recovery=True)
-            return True
-
-        if claimed.status.state == SnapshotState.DELETING:
+        if record.status.state == SnapshotState.DELETING:
+            claimed = self._claim_operation(record)
+            if claimed is None:
+                return False
             self._delete_snapshot_worker(claimed, propagate=False)
             return True
 
@@ -544,17 +531,44 @@ class PersistedSnapshotService(SnapshotService):
             self._operation_lease_duration,
         )
 
-    def _submit_create_worker(self, record: SnapshotRecord, *, recovery: bool) -> None:
-        heartbeat = self._start_lease_heartbeat(record)
+    def _try_start_create_operation(
+        self,
+        record: SnapshotRecord,
+        *,
+        recovery: bool,
+    ) -> bool:
+        if not self._worker_slots.acquire(blocking=False):
+            self._ensure_recovery_thread()
+            return False
+
+        claimed = None
         try:
+            claimed = self._claim_operation(record)
+            if claimed is None:
+                self._worker_slots.release()
+                return False
+            self._submit_claimed_create_worker(claimed, recovery=recovery)
+        except BaseException:
+            if claimed is None:
+                self._worker_slots.release()
+            raise
+        return True
+
+    def _submit_claimed_create_worker(self, record: SnapshotRecord, *, recovery: bool) -> None:
+        heartbeat: tuple[Event, Thread | None] | None = None
+        try:
+            heartbeat = self._start_lease_heartbeat(record)
             future = self._snapshot_executor.submit(
                 self._create_snapshot_worker,
                 record,
                 recovery,
                 heartbeat,
+                True,
             )
         except BaseException:
-            self._stop_lease_heartbeat(heartbeat)
+            if heartbeat is not None:
+                self._stop_lease_heartbeat(heartbeat)
+            self._worker_slots.release()
             raise
         future.add_done_callback(self._log_worker_failure)
 
@@ -643,6 +657,19 @@ class PersistedSnapshotService(SnapshotService):
                 self.recover_unfinished_snapshots()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Snapshot recovery scan failed: %s", exc, exc_info=True)
+
+    def _ensure_recovery_thread(self) -> None:
+        if self._recovery_stop.is_set():
+            return
+        with self._recovery_thread_lock:
+            if self._recovery_thread is not None and self._recovery_thread.is_alive():
+                return
+            self._recovery_thread = Thread(
+                target=self._recovery_loop,
+                name="snapshot-recovery",
+                daemon=True,
+            )
+            self._recovery_thread.start()
 
     @staticmethod
     def _default_operation_owner() -> str:
