@@ -402,12 +402,16 @@ class PersistedSnapshotService(SnapshotService):
             self._ensure_recovery_thread()
             return
 
-        updated_applied = self._snapshot_repository.update_if_operation_owner(
-            updated,
-            SnapshotState.CREATING,
-            record.lease_owner,
-            record.operation_generation,
-        )
+        try:
+            updated_applied = self._snapshot_repository.update_if_operation_owner(
+                updated,
+                SnapshotState.CREATING,
+                record.lease_owner,
+                record.operation_generation,
+            )
+        except Exception:
+            self._ensure_recovery_thread()
+            raise
         if not updated_applied:
             logger.info(
                 "Snapshot %s lease generation %s is stale; skipping terminal update",

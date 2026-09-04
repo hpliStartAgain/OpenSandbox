@@ -477,6 +477,53 @@ def test_sqlite_rejected_terminal_update_is_recovered(tmp_path) -> None:
         service.close()
 
 
+def test_sqlite_terminal_update_exception_is_recovered(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = ReadyCreateRuntime()
+    original_update = repo.update_if_operation_owner
+    update_attempts = 0
+
+    def fail_first_terminal_update(*args, **kwargs) -> bool:
+        nonlocal update_attempts
+        update_attempts += 1
+        if update_attempts == 1:
+            with repo._connect() as conn:
+                conn.execute(
+                    "UPDATE snapshots SET lease_expires_at = ? WHERE id = ?",
+                    ("1970-01-01T00:00:00+00:00", args[0].id),
+                )
+            raise RuntimeError("simulated SQLite writer contention")
+        return original_update(*args, **kwargs)
+
+    repo.update_if_operation_owner = fail_first_terminal_update
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=ImmediateExecutor(),
+        recovery_interval_seconds=0.01,
+    )
+
+    try:
+        created = service.create_snapshot(
+            "sbx-001",
+            CreateSnapshotRequest(name="terminal-write-exception"),
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            stored = repo.get(created.id)
+            if stored is not None and stored.status.state == SnapshotState.READY:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("SQLite terminal update exception was not recovered")
+
+        assert update_attempts == 2
+        assert runtime.recover_calls == [created.id]
+    finally:
+        service.close()
+
+
 def test_recover_unfinished_snapshot_claims_and_reschedules_creating_runtime_status(tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     record = _snapshot_record("snap-in-progress", SnapshotState.CREATING)
