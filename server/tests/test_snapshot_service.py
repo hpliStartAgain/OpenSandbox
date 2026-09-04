@@ -30,6 +30,7 @@ from opensandbox_server.services.snapshot_models import (
     SnapshotStatusRecord,
 )
 from opensandbox_server.services.snapshot_runtime import NoopSnapshotRuntime, SnapshotRuntimeStatus
+from opensandbox_server.services.snapshot_repository import SnapshotListQuery
 from opensandbox_server.services.snapshot_service import PersistedSnapshotService
 
 
@@ -63,6 +64,18 @@ class ImmediateExecutor:
 
     def shutdown(self, wait: bool = True) -> None:
         self.shutdown_called = True
+
+
+class FailOnceSubmitExecutor(ImmediateExecutor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submit_attempts = 0
+
+    def submit(self, fn, *args, **kwargs) -> Future:
+        self.submit_attempts += 1
+        if self.submit_attempts == 1:
+            raise RuntimeError("simulated executor submission failure")
+        return super().submit(fn, *args, **kwargs)
 
 
 class CapturingExecutor:
@@ -520,6 +533,90 @@ def test_sqlite_terminal_update_exception_is_recovered(tmp_path) -> None:
 
         assert update_attempts == 2
         assert runtime.recover_calls == [created.id]
+    finally:
+        service.close()
+
+
+def test_sqlite_claim_exception_after_create_is_recovered(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = ReadyCreateRuntime()
+    original_claim = repo.claim_operation
+    claim_attempts = 0
+
+    def fail_first_claim(*args, **kwargs):
+        nonlocal claim_attempts
+        claim_attempts += 1
+        if claim_attempts == 1:
+            raise RuntimeError("simulated SQLite claim contention")
+        return original_claim(*args, **kwargs)
+
+    repo.claim_operation = fail_first_claim
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=ImmediateExecutor(),
+        recovery_interval_seconds=0.01,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="simulated SQLite claim contention"):
+            service.create_snapshot(
+                "sbx-001",
+                CreateSnapshotRequest(name="claim-exception"),
+            )
+
+        deadline = time.monotonic() + 2
+        recovered = None
+        while time.monotonic() < deadline:
+            records = repo.list(SnapshotListQuery(page=1, page_size=10)).items
+            if records and records[0].status.state == SnapshotState.READY:
+                recovered = records[0]
+                break
+            time.sleep(0.01)
+        if recovered is None:
+            pytest.fail("SQLite claim exception left an orphaned Creating row")
+
+        assert claim_attempts == 2
+        assert runtime.recover_calls == [recovered.id]
+    finally:
+        service.close()
+
+
+def test_sqlite_submit_exception_after_claim_is_recovered(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = ReadyCreateRuntime()
+    executor = FailOnceSubmitExecutor()
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=executor,
+        operation_lease_seconds=0.1,
+        lease_renew_interval_seconds=0.02,
+        recovery_interval_seconds=0.01,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="simulated executor submission failure"):
+            service.create_snapshot(
+                "sbx-001",
+                CreateSnapshotRequest(name="submit-exception"),
+            )
+
+        deadline = time.monotonic() + 2
+        recovered = None
+        while time.monotonic() < deadline:
+            records = repo.list(SnapshotListQuery(page=1, page_size=10)).items
+            if records and records[0].status.state == SnapshotState.READY:
+                recovered = records[0]
+                break
+            time.sleep(0.01)
+        if recovered is None:
+            pytest.fail("SQLite submit exception left an orphaned Creating row")
+
+        assert executor.submit_attempts == 2
+        assert runtime.recover_calls == [recovered.id]
     finally:
         service.close()
 

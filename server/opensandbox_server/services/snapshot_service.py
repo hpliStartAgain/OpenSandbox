@@ -559,9 +559,11 @@ class PersistedSnapshotService(SnapshotService):
                 self._worker_slots.release()
                 return False
             self._submit_claimed_create_worker(claimed, recovery=recovery)
-        except BaseException:
+        except BaseException as exc:
             if claimed is None:
                 self._worker_slots.release()
+            if isinstance(exc, Exception):
+                self._ensure_recovery_thread()
             raise
         return True
 
