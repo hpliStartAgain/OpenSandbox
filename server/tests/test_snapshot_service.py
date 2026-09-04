@@ -93,6 +93,14 @@ class CapturingExecutor:
         self.shutdown_wait = wait
 
 
+class CapturingJoinThread:
+    def __init__(self) -> None:
+        self.join_timeout: float | None | str = "not-called"
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_timeout = timeout
+
+
 class StubSnapshotRuntime:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
@@ -1419,6 +1427,25 @@ def test_snapshot_service_close_shuts_down_executor(tmp_path) -> None:
 
     assert executor.shutdown_called is True
     assert executor.shutdown_wait is True
+
+
+def test_snapshot_service_close_waits_for_recovery_thread(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    executor = CapturingExecutor()
+    recovery_thread = CapturingJoinThread()
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=StubSnapshotRuntime(),
+        snapshot_executor=executor,
+        recover_unfinished_snapshots=False,
+    )
+    service._recovery_thread = recovery_thread
+
+    service.close()
+
+    assert recovery_thread.join_timeout is None
+    assert executor.shutdown_called is True
 
 
 def test_snapshot_service_propagates_missing_sandbox(tmp_path) -> None:

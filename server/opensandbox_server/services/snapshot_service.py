@@ -259,7 +259,7 @@ class PersistedSnapshotService(SnapshotService):
         """
         self._recovery_stop.set()
         if self._recovery_thread is not None:
-            self._recovery_thread.join(timeout=self._recovery_interval_seconds + 1)
+            self._recovery_thread.join()
         self._snapshot_executor.shutdown(wait=True)
 
     @staticmethod
