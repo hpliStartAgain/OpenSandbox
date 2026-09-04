@@ -166,7 +166,7 @@ curl --fail http://127.0.0.1:8080/health
 |-------|---------|-------|
 | `server.image.repository` | Server image registry and repository | Override for a private mirror or custom build. |
 | `server.image.tag` | Server image version | The release install command pins it to `APP_VERSION`. |
-| `server.replicaCount` | Number of server Pods | Defaults to `1`. Values greater than `1` require `[store] type = "postgresql"` in `configToml`. |
+| `server.replicaCount` | Number of server Pods | Defaults to `1`. Values greater than `1` require `[store] type = "postgresql"` and `[runtime] type = "kubernetes"` in `configToml`. |
 | `server.env` | Additional container environment variables | Use it with `secretKeyRef` for `OPENSANDBOX_SERVER_API_KEY`. |
 | `configToml` | Complete server configuration | Mounted at `/etc/opensandbox/config.toml`; overriding it replaces the complete default TOML, including the workload namespace. |
 | `server.gateway.enabled` | Deploy the ingress gateway with the server | Defaults to `false`. |
