@@ -56,7 +56,7 @@ Reference the Secret from a values file:
 ```yaml
 # values-server.yaml
 server:
-  replicaCount: 2
+  replicaCount: 1
   env:
     - name: OPENSANDBOX_SERVER_API_KEY
       valueFrom:
@@ -82,13 +82,13 @@ kubectl create secret generic opensandbox-postgresql \
 unset OPENSANDBOX_POSTGRESQL_DSN
 ```
 
-In `values-server.yaml`, set `server.replicaCount` to `1`, add the Secret-backed
-environment variable below, and add the shown `[store]` tables to the complete
-`configToml` value:
+In `values-server.yaml`, set the desired Server replica count, add the
+Secret-backed environment variable below, and add the shown `[store]` tables to
+the complete `configToml` value:
 
 ```yaml
 server:
-  replicaCount: 1
+  replicaCount: 2
   env:
     - name: OPENSANDBOX_STORE_POSTGRESQL_DSN
       valueFrom:
@@ -106,10 +106,24 @@ configToml: |
   max_pool_size = 10
 ```
 
-::: warning
-Snapshot recovery is not coordinated across server replicas. Keep
-`server.replicaCount: 1` when replicas use the same PostgreSQL database.
+::: info
+Multiple active Server replicas are supported for Kubernetes public snapshots
+when every replica uses the same PostgreSQL database. The chart rejects
+`server.replicaCount > 1` unless `configToml` selects PostgreSQL. It does not add
+session affinity because any healthy replica can read or restore a terminal
+snapshot.
 :::
+
+PostgreSQL operation leases select one worker for each `Creating` or `Deleting`
+snapshot. A surviving replica takes over after lease expiry. Kubernetes recovery
+reads the deterministic `SandboxSnapshot` before it creates anything, so an
+existing CR and its commit Job are observed instead of duplicated. Terminal
+database writes are fenced by owner and generation. These controls do not claim
+exactly-once behavior across PostgreSQL, the Kubernetes API, the controller, and
+the OCI registry.
+
+Docker public snapshots remain limited to one active Server because Docker image
+and registry side effects cannot be safely fenced by the PostgreSQL lease alone.
 
 ### Install and verify
 
@@ -152,7 +166,7 @@ curl --fail http://127.0.0.1:8080/health
 |-------|---------|-------|
 | `server.image.repository` | Server image registry and repository | Override for a private mirror or custom build. |
 | `server.image.tag` | Server image version | The release install command pins it to `APP_VERSION`. |
-| `server.replicaCount` | Number of server Pods | Defaults to `2`. |
+| `server.replicaCount` | Number of server Pods | Defaults to `1`. Values greater than `1` require `[store] type = "postgresql"` in `configToml`. |
 | `server.env` | Additional container environment variables | Use it with `secretKeyRef` for `OPENSANDBOX_SERVER_API_KEY`. |
 | `configToml` | Complete server configuration | Mounted at `/etc/opensandbox/config.toml`; overriding it replaces the complete default TOML, including the workload namespace. |
 | `server.gateway.enabled` | Deploy the ingress gateway with the server | Defaults to `false`. |

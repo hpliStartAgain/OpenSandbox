@@ -1,5 +1,6 @@
 # Copyright 2026 Alibaba Group Holding Ltd.
 # Server resources: ServiceAccount, ClusterRole, ClusterRoleBinding, ConfigMap, Deployment, Service.
+{{- include "opensandbox-server.validateSnapshotStoreReplicas" . }}
 ---
 apiVersion: v1
 kind: ServiceAccount

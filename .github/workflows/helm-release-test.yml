@@ -60,6 +60,22 @@ jobs:
         with:
           version: 'v3.21.3'
 
+      - name: Verify server snapshot-store replica safety
+        run: |
+          set -euo pipefail
+          chart_path="kubernetes/charts/opensandbox-server"
+          error_log="${RUNNER_TEMP}/opensandbox-server-sqlite-replica-error.log"
+          if helm template opensandbox-server "$chart_path" \
+            --set server.replicaCount=2 >/dev/null 2>"$error_log"; then
+            echo "::error::SQLite multi-replica render unexpectedly succeeded"
+            exit 1
+          fi
+          grep -F 'requires [store] type = "postgresql"' "$error_log"
+          helm template opensandbox-server "$chart_path" \
+            --set server.replicaCount=2 \
+            --set-string $'configToml=[store]\ntype = "postgresql"\n' \
+            >/dev/null
+
       - name: Install Kind
         run: |
           go install sigs.k8s.io/kind@v0.31.0

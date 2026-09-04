@@ -72,7 +72,7 @@ The following table lists the configurable parameters of the chart and their def
 | opensandbox-controller.controller.snapshot.resumePullSecret | string | `""` | Secret name injected into resumed sandboxes for pulling snapshot images. |
 | opensandbox-controller.controller.snapshot.snapshotPushSecret | string | `""` | Secret name used by commit Jobs to push snapshot images. |
 | opensandbox-node-agent.enabled | bool | `false` | Whether the node agent is enabled. |
-| opensandbox-server.server.replicaCount | int | `2` | Number of server replicas. |
+| opensandbox-server.server.replicaCount | int | `1` | Number of server replicas. |
 
 ### Override Sub-chart Values
 
@@ -104,7 +104,7 @@ opensandbox-controller:
 
 opensandbox-server:
   server:
-    replicaCount: 2
+    replicaCount: 1
     gateway:
       enabled: true
       host: gateway.example.com

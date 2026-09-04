@@ -57,6 +57,12 @@ helm install opensandbox-server "${CHART_URL}" \
 
 See the [Kubernetes deployment guide](../../../docs/kubernetes/deployment.md) for production configuration, verification, and upgrades.
 
+The chart defaults to one Server replica. Setting `server.replicaCount` above
+one requires `[store] type = "postgresql"` in `configToml`; rendering fails
+closed for the default SQLite store. Multi-replica snapshot execution is
+supported for the Kubernetes runtime only. Docker snapshots remain
+single-active.
+
 ## Install from local source
 
 ```bash

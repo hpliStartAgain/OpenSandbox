@@ -88,6 +88,20 @@ Image pull policy
 {{- end }}
 
 {{/*
+Reject multiple server replicas unless the effective [store] section selects
+PostgreSQL. SQLite is process-local and cannot coordinate active replicas.
+*/}}
+{{- define "opensandbox-server.validateSnapshotStoreReplicas" -}}
+{{- if gt (int .Values.server.replicaCount) 1 -}}
+{{- $storeSection := regexFind `(?ms)^[[:space:]]*\[store\][[:space:]]*(?:#.*)?$.*?(?:^[[:space:]]*\[[^]]+\][[:space:]]*(?:#.*)?$|\z)` (printf "%s\n" .Values.configToml) -}}
+{{- $usesPostgreSQL := regexMatch `(?m)^[[:space:]]*type[[:space:]]*=[[:space:]]*["']postgresql["'][[:space:]]*(?:#.*)?$` $storeSection -}}
+{{- if not $usesPostgreSQL -}}
+{{- fail "server.replicaCount greater than 1 requires [store] type = \"postgresql\" in configToml; SQLite supports one active server replica" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 RBAC apiVersion
 */}}
 {{- define "opensandbox-server.rbac.apiVersion" -}}

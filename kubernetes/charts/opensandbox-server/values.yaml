@@ -29,8 +29,8 @@ server:
     # -- Server image tag. Defaults to the chart appVersion when empty.
     tag: "v0.2.2"
 
-  # -- Number of server replicas
-  replicaCount: 2
+  # -- Number of server replicas. Values greater than 1 require PostgreSQL in configToml.
+  replicaCount: 1
 
   # -- Resource requests and limits
   resources:
