@@ -399,6 +399,7 @@ class PersistedSnapshotService(SnapshotService):
 
         updated = self._build_runtime_status_record(record, runtime_status)
         if updated is None:
+            self._ensure_recovery_thread()
             return
 
         updated_applied = self._snapshot_repository.update_if_operation_owner(

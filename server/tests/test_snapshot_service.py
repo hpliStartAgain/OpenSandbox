@@ -158,6 +158,41 @@ class FailOnceDeleteRuntime(StubSnapshotRuntime):
             raise RuntimeError("transient delete failure")
 
 
+class CreatingOnceRuntime(StubSnapshotRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recover_calls: list[str] = []
+
+    def create_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        *,
+        namespace: str | None = None,
+    ) -> SnapshotRuntimeStatus:
+        self.calls.append((snapshot_id, sandbox_id))
+        return SnapshotRuntimeStatus(
+            state=SnapshotState.CREATING,
+            reason="snapshot_runtime_inspect_failed",
+            message="Kubernetes API observation timed out.",
+        )
+
+    def recover_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        image: str | None = None,
+        *,
+        namespace: str | None = None,
+    ) -> SnapshotRuntimeStatus:
+        self.recover_calls.append(snapshot_id)
+        return SnapshotRuntimeStatus(
+            state=SnapshotState.READY,
+            image=f"registry/snapshots:{snapshot_id}",
+            reason="snapshot_runtime_ready",
+        )
+
+
 class DistributedSQLiteSnapshotRepository(SQLiteSnapshotRepository):
     @property
     def supports_distributed_leases(self) -> bool:
@@ -325,6 +360,39 @@ def test_snapshot_service_marks_snapshot_failed_when_worker_returns_none(tmp_pat
     assert stored is not None
     assert stored.status.state == SnapshotState.FAILED
     assert stored.status.reason == "snapshot_runtime_missing_result"
+
+
+def test_sqlite_nonterminal_create_is_recovered_after_lease_expiry(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = CreatingOnceRuntime()
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=ImmediateExecutor(),
+        operation_lease_seconds=0.1,
+        lease_renew_interval_seconds=0.02,
+        recovery_interval_seconds=0.01,
+    )
+
+    try:
+        created = service.create_snapshot(
+            "sbx-001",
+            CreateSnapshotRequest(name="eventually-observed"),
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            stored = repo.get(created.id)
+            if stored is not None and stored.status.state == SnapshotState.READY:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("SQLite nonterminal creation was not recovered after lease expiry")
+
+        assert runtime.calls == [(created.id, "sbx-001")]
+        assert runtime.recover_calls == [created.id]
+    finally:
+        service.close()
 
 
 def test_recover_unfinished_snapshot_claims_and_reschedules_creating_runtime_status(tmp_path) -> None:
