@@ -155,6 +155,13 @@ def test_migrate_preserves_attempt_counters_but_clears_source_lease(
         timedelta(minutes=5),
     )
     assert claim is not None
+    started = sqlite_repo.mark_operation_started(
+        "snap-leased",
+        SnapshotState.CREATING,
+        "old-server",
+        claim.operation_generation,
+    )
+    assert started is not None
     sqlite_repo.close()
 
     migrate_sqlite_snapshots_to_postgresql(
@@ -164,8 +171,8 @@ def test_migrate_preserves_attempt_counters_but_clears_source_lease(
 
     stored = _records_from_postgresql(postgresql_dsn)
     assert len(stored) == 1
-    assert stored[0].operation_generation == claim.operation_generation
-    assert stored[0].operation_attempt == claim.operation_attempt
+    assert stored[0].operation_generation == started.operation_generation
+    assert stored[0].operation_attempt == started.operation_attempt
     assert stored[0].lease_owner is None
     assert stored[0].lease_expires_at is None
 
@@ -309,7 +316,7 @@ def test_migrate_reads_old_sqlite_schema_without_modifying_it(
             "name-snap-legacy",
             "description-snap-legacy",
             json.dumps({"image": "registry.example.com/snapshots/snap-legacy:latest"}),
-            "Ready",
+            "Creating",
             "reason-snap-legacy",
             "message-snap-legacy",
             "2026-01-02T03:04:05",
@@ -338,7 +345,8 @@ def test_migrate_reads_old_sqlite_schema_without_modifying_it(
     legacy = stored[0]
     assert legacy.id == "snap-legacy"
     assert legacy.namespace is None
-    assert legacy.status.state == SnapshotState.READY
+    assert legacy.status.state == SnapshotState.CREATING
+    assert legacy.operation_attempt == 1
     assert legacy.restore_config.image == "registry.example.com/snapshots/snap-legacy:latest"
 
 

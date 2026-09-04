@@ -241,6 +241,23 @@ class ReadyCreateRuntime(StubSnapshotRuntime):
         )
 
 
+class MissingOnRecoveryRuntime(ReadyCreateRuntime):
+    def recover_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        image: str | None = None,
+        *,
+        namespace: str | None = None,
+    ) -> SnapshotRuntimeStatus:
+        self.recover_calls.append(snapshot_id)
+        return SnapshotRuntimeStatus(
+            state=SnapshotState.FAILED,
+            reason="snapshot_recovery_missing_image",
+            message="Snapshot creation never started and no image exists.",
+        )
+
+
 class DistributedSQLiteSnapshotRepository(SQLiteSnapshotRepository):
     @property
     def supports_distributed_leases(self) -> bool:
@@ -578,7 +595,8 @@ def test_sqlite_claim_exception_after_create_is_recovered(tmp_path) -> None:
             pytest.fail("SQLite claim exception left an orphaned Creating row")
 
         assert claim_attempts == 2
-        assert runtime.recover_calls == [recovered.id]
+        assert runtime.calls == [(recovered.id, "sbx-001")]
+        assert runtime.recover_calls == []
     finally:
         service.close()
 
@@ -616,14 +634,62 @@ def test_sqlite_submit_exception_after_claim_is_recovered(tmp_path) -> None:
             pytest.fail("SQLite submit exception left an orphaned Creating row")
 
         assert executor.submit_attempts == 2
-        assert runtime.recover_calls == [recovered.id]
+        assert runtime.calls == [(recovered.id, "sbx-001")]
+        assert runtime.recover_calls == []
     finally:
+        service.close()
+
+
+def test_queued_never_started_snapshot_uses_create_during_recovery(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = MissingOnRecoveryRuntime()
+    executor = CapturingExecutor()
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=executor,
+        recovery_interval_seconds=60,
+    )
+    second_heartbeat = None
+
+    try:
+        first = service.create_snapshot("sbx-001", CreateSnapshotRequest(name="first"))
+        second = service.create_snapshot("sbx-001", CreateSnapshotRequest(name="second"))
+        queued = service.create_snapshot("sbx-001", CreateSnapshotRequest(name="queued"))
+
+        assert len(executor.submitted) == 2
+        queued_record = repo.get(queued.id)
+        assert queued_record is not None
+        assert queued_record.operation_attempt == 0
+        assert queued_record.lease_owner is None
+
+        first_work = next(item for item in executor.submitted if item[1][0].id == first.id)
+        first_work[0](*first_work[1], **first_work[2])
+        service.recover_unfinished_snapshots()
+
+        assert len(executor.submitted) == 3
+        queued_work = next(item for item in executor.submitted if item[1][0].id == queued.id)
+        queued_work[0](*queued_work[1], **queued_work[2])
+
+        stored = repo.get(queued.id)
+        assert stored is not None
+        assert stored.status.state == SnapshotState.READY
+        assert (queued.id, "sbx-001") in runtime.calls
+        assert queued.id not in runtime.recover_calls
+
+        second_work = next(item for item in executor.submitted if item[1][0].id == second.id)
+        second_heartbeat = second_work[1][2]
+    finally:
+        if second_heartbeat is not None:
+            service._stop_lease_heartbeat(second_heartbeat)
         service.close()
 
 
 def test_recover_unfinished_snapshot_claims_and_reschedules_creating_runtime_status(tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     record = _snapshot_record("snap-in-progress", SnapshotState.CREATING)
+    record.operation_attempt = 1
     repo.create(record)
     runtime = StubSnapshotRuntime()
     runtime.inspect_status_by_snapshot_id[record.id] = SnapshotRuntimeStatus(
@@ -659,6 +725,7 @@ def test_two_services_share_one_unfinished_operation_owner(tmp_path) -> None:
     first_repo = SQLiteSnapshotRepository(db_path)
     second_repo = SQLiteSnapshotRepository(db_path)
     record = _snapshot_record("snap-shared", SnapshotState.CREATING)
+    record.operation_attempt = 1
     first_repo.create(record)
     first_executor = CapturingExecutor()
     second_executor = CapturingExecutor()
@@ -701,6 +768,7 @@ def test_recovery_claims_only_available_worker_slots(tmp_path) -> None:
         for index in range(3)
     ]
     for record in records:
+        record.operation_attempt = 1
         repo.create(record)
     runtime = BlockingRecoveryRuntime()
     recovery_queries: list[tuple[list[SnapshotState], int]] = []
@@ -1261,7 +1329,9 @@ def test_snapshot_service_returns_501_when_runtime_is_not_supported(tmp_path) ->
 
 def test_snapshot_service_recovers_creating_snapshot_with_existing_artifact(tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
-    repo.create(_snapshot_record("snap-ready", SnapshotState.CREATING))
+    record = _snapshot_record("snap-ready", SnapshotState.CREATING)
+    record.operation_attempt = 1
+    repo.create(record)
     runtime = StubSnapshotRuntime()
     runtime.inspect_status_by_snapshot_id["snap-ready"] = SnapshotRuntimeStatus(
         state=SnapshotState.READY,
@@ -1285,7 +1355,9 @@ def test_snapshot_service_recovers_creating_snapshot_with_existing_artifact(tmp_
 
 def test_snapshot_service_recovers_creating_snapshot_without_artifact(tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
-    repo.create(_snapshot_record("snap-missing", SnapshotState.CREATING))
+    record = _snapshot_record("snap-missing", SnapshotState.CREATING)
+    record.operation_attempt = 1
+    repo.create(record)
     runtime = StubSnapshotRuntime()
 
     PersistedSnapshotService(
@@ -1421,6 +1493,7 @@ def test_sqlite_startup_recovers_creating_backlog_across_page_boundary(tmp_path)
         for index in range(205)
     ]
     for record in records:
+        record.operation_attempt = 1
         repo.create(record)
     runtime = ReadyCreateRuntime()
     recovery_queries: list[tuple[list[SnapshotState], int]] = []
@@ -1461,6 +1534,7 @@ def test_sqlite_startup_continues_creating_backlog_after_slots_free(tmp_path) ->
         for index in range(3)
     ]
     for record in records:
+        record.operation_attempt = 1
         repo.create(record)
     runtime = BlockingRecoveryRuntime()
     service = PersistedSnapshotService(
@@ -1513,6 +1587,14 @@ def test_sqlite_startup_retries_after_previous_owner_lease_expires(
         timedelta(seconds=0.1),
     )
     assert old_claim is not None
+    if state == SnapshotState.CREATING:
+        old_claim = first_repo.mark_operation_started(
+            record.id,
+            state,
+            "stopped-server",
+            old_claim.operation_generation,
+        )
+        assert old_claim is not None
     first_repo.close()
 
     second_repo = SQLiteSnapshotRepository(db_path)

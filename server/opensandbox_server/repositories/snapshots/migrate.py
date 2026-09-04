@@ -241,6 +241,7 @@ def _write_postgresql_snapshots(dsn: str, records: list[dict[str, Any]]) -> int:
         for statement in _CREATE_SCHEMA_STATEMENTS:
             conn.execute(statement)
         for record in records:
+            source_operation_attempt = record["operation_attempt"]
             params = {
                 **record,
                 "restore_config": Jsonb(json.loads(record["restore_config"])),
@@ -250,7 +251,11 @@ def _write_postgresql_snapshots(dsn: str, records: list[dict[str, Any]]) -> int:
                 "operation_generation": int(record["operation_generation"] or 0),
                 "lease_owner": None,
                 "lease_expires_at": None,
-                "operation_attempt": int(record["operation_attempt"] or 0),
+                "operation_attempt": (
+                    int(source_operation_attempt)
+                    if source_operation_attempt is not None
+                    else int(record["state"] == "Creating")
+                ),
             }
             if conn.execute(_INSERT_SNAPSHOT, params).fetchone() is not None:
                 migrated += 1

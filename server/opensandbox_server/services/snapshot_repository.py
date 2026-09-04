@@ -128,6 +128,16 @@ class SnapshotRepository(Protocol):
         """Extend a live operation lease owned by the supplied generation."""
         ...
 
+    def mark_operation_started(
+        self,
+        snapshot_id: str,
+        expected_state: SnapshotState,
+        lease_owner: str,
+        operation_generation: int,
+    ) -> SnapshotRecord | None:
+        """Record that the fenced owner is about to begin runtime side effects."""
+        ...
+
     def update_if_operation_owner(
         self,
         record: SnapshotRecord,

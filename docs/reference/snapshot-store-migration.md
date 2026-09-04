@@ -65,6 +65,9 @@ Snapshots migrated: total=42, migrated=42, skipped=0
 - Operation generation and attempt counters are preserved, while any source
   lease owner and expiry are cleared. Stop the SQLite Server before migration;
   a lease from that stopped process must not block PostgreSQL recovery.
+- Legacy unfinished `Creating` rows that predate the attempt counter are
+  conservatively marked as already started, so recovery observes existing
+  runtime state instead of repeating external creation side effects.
 
 ## Switch the server
 

@@ -125,6 +125,11 @@ database writes are fenced by owner and generation. These controls do not claim
 exactly-once behavior across PostgreSQL, the Kubernetes API, the controller, and
 the OCI registry.
 
+The operation-attempt counter is incremented immediately before runtime side
+effects begin, rather than when a lease is claimed. This lets a queued snapshot
+whose execution never started use the normal create path when capacity becomes
+available, while a previously started operation uses observation-first recovery.
+
 Docker public snapshots remain limited to one active Server because Docker image
 and registry side effects cannot be safely fenced by the PostgreSQL lease alone.
 

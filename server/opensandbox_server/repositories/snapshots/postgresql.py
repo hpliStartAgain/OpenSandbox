@@ -285,7 +285,6 @@ class PostgreSQLSnapshotRepository:
                 UPDATE snapshots
                 SET
                     operation_generation = operation_generation + 1,
-                    operation_attempt = operation_attempt + 1,
                     lease_owner = %(lease_owner)s,
                     lease_expires_at = CURRENT_TIMESTAMP + %(lease_duration)s
                 WHERE id = %(id)s
@@ -335,6 +334,34 @@ class PostgreSQLSnapshotRepository:
                 },
             ).fetchone()
         return row is not None
+
+    def mark_operation_started(
+        self,
+        snapshot_id: str,
+        expected_state: SnapshotState,
+        lease_owner: str,
+        operation_generation: int,
+    ) -> SnapshotRecord | None:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                f"""
+                UPDATE snapshots
+                SET operation_attempt = operation_attempt + 1
+                WHERE id = %(id)s
+                  AND state = %(expected_state)s
+                  AND lease_owner = %(lease_owner)s
+                  AND operation_generation = %(operation_generation)s
+                  AND lease_expires_at > CURRENT_TIMESTAMP
+                RETURNING {_SELECT_COLUMNS}
+                """,
+                {
+                    "id": snapshot_id,
+                    "expected_state": expected_state.value,
+                    "lease_owner": lease_owner,
+                    "operation_generation": operation_generation,
+                },
+            ).fetchone()
+        return self._row_to_record(row) if row is not None else None
 
     def update_if_operation_owner(
         self,
@@ -425,6 +452,17 @@ class PostgreSQLSnapshotRepository:
                 )
                 """
             )
+            operation_attempt_exists = conn.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'snapshots'
+                      AND column_name = 'operation_attempt'
+                ) AS present
+                """
+            ).fetchone()
             conn.execute(
                 "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS "
                 "operation_generation BIGINT NOT NULL DEFAULT 0"
@@ -439,6 +477,12 @@ class PostgreSQLSnapshotRepository:
                 "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS "
                 "operation_attempt BIGINT NOT NULL DEFAULT 0"
             )
+            if operation_attempt_exists is not None and not operation_attempt_exists["present"]:
+                conn.execute(
+                    "UPDATE snapshots SET operation_attempt = 1 "
+                    "WHERE state = %s AND operation_attempt = 0",
+                    (SnapshotState.CREATING.value,),
+                )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_snapshots_source_sandbox_id

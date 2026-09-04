@@ -338,8 +338,23 @@ class PersistedSnapshotService(SnapshotService):
     ) -> None:
         active_heartbeat = heartbeat or self._start_lease_heartbeat(record)
         try:
+            resume_runtime = recovery and record.operation_attempt > 0
             try:
-                if recovery:
+                started = self._mark_operation_started(record)
+            except Exception:
+                self._ensure_recovery_thread()
+                raise
+            if started is None:
+                logger.info(
+                    "Snapshot %s lease generation %s became stale before runtime execution",
+                    record.id,
+                    record.operation_generation,
+                )
+                self._ensure_recovery_thread()
+                return
+            record = started
+            try:
+                if resume_runtime:
                     recover_snapshot = getattr(self._snapshot_runtime, "recover_snapshot", None)
                     if recover_snapshot is None:
                         runtime_status = self._snapshot_runtime.inspect_snapshot(
@@ -567,6 +582,16 @@ class PersistedSnapshotService(SnapshotService):
             self._operation_lease_duration,
         )
 
+    def _mark_operation_started(self, record: SnapshotRecord) -> SnapshotRecord | None:
+        if record.lease_owner is None:
+            return None
+        return self._snapshot_repository.mark_operation_started(
+            record.id,
+            record.status.state,
+            record.lease_owner,
+            record.operation_generation,
+        )
+
     def _try_start_create_operation(
         self,
         record: SnapshotRecord,
@@ -614,6 +639,16 @@ class PersistedSnapshotService(SnapshotService):
     def _delete_snapshot_worker(self, record: SnapshotRecord, *, propagate: bool) -> bool:
         heartbeat = self._start_lease_heartbeat(record)
         try:
+            started = self._mark_operation_started(record)
+            if started is None:
+                logger.info(
+                    "Snapshot %s lease generation %s became stale before runtime deletion",
+                    record.id,
+                    record.operation_generation,
+                )
+                self._ensure_recovery_thread()
+                return False
+            record = started
             self._snapshot_runtime.delete_snapshot(
                 record.id,
                 image=record.restore_config.image,

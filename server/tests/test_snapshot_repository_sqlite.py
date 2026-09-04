@@ -65,6 +65,27 @@ def test_sqlite_snapshot_repository_indexes_name_queries_after_migration(
             )
             """
         )
+        conn.execute(
+            """
+            INSERT INTO snapshots (
+                id, source_sandbox_id, name, description, restore_config,
+                state, reason, message, last_transition_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-creating",
+                "sbx-001",
+                "legacy",
+                None,
+                '{"image": null}',
+                "Creating",
+                "snapshot_accepted",
+                None,
+                "2026-01-02T03:04:05+00:00",
+                "2026-01-02T03:04:05+00:00",
+                "2026-01-02T03:04:05+00:00",
+            ),
+        )
 
     repo = SQLiteSnapshotRepository(db_path)
 
@@ -92,6 +113,9 @@ def test_sqlite_snapshot_repository_indexes_name_queries_after_migration(
     assert "idx_snapshots_name_namespace" in indexes
     assert any("idx_snapshots_name_namespace" in row["detail"] for row in name_plan)
     assert any("idx_snapshots_name_namespace" in row["detail"] for row in tenant_plan)
+    legacy = repo.get("legacy-creating")
+    assert legacy is not None
+    assert legacy.operation_attempt == 1
 
 
 def test_snapshot_repository_factory_defaults_to_sqlite(tmp_path) -> None:

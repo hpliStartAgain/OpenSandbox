@@ -405,7 +405,7 @@ def test_postgresql_operation_claim_has_one_winner(postgresql_dsn: str) -> None:
         winners = [claim for claim in claims if claim is not None]
         assert len(winners) == 1
         assert winners[0].operation_generation == 1
-        assert winners[0].operation_attempt == 1
+        assert winners[0].operation_attempt == 0
         assert winners[0].lease_owner in {"server-a", "server-b"}
         assert winners[0].lease_expires_at is not None
     finally:
@@ -435,6 +435,13 @@ def test_postgresql_lease_renew_expiry_takeover_and_fencing(
             timedelta(seconds=30),
         )
         assert first_claim is not None
+        first_started = first_repo.mark_operation_started(
+            record.id,
+            SnapshotState.CREATING,
+            "server-a",
+            first_claim.operation_generation,
+        )
+        assert first_started is not None
         assert first_repo.renew_operation(
             record.id,
             SnapshotState.CREATING,
@@ -464,7 +471,15 @@ def test_postgresql_lease_renew_expiry_takeover_and_fencing(
         )
         assert second_claim is not None
         assert second_claim.operation_generation == first_claim.operation_generation + 1
-        assert second_claim.operation_attempt == first_claim.operation_attempt + 1
+        assert second_claim.operation_attempt == first_started.operation_attempt
+        second_started = second_repo.mark_operation_started(
+            record.id,
+            SnapshotState.CREATING,
+            "server-b",
+            second_claim.operation_generation,
+        )
+        assert second_started is not None
+        assert second_started.operation_attempt == first_started.operation_attempt + 1
         assert first_repo.renew_operation(
             record.id,
             SnapshotState.CREATING,
@@ -480,7 +495,7 @@ def test_postgresql_lease_renew_expiry_takeover_and_fencing(
             SnapshotState.READY,
         )
         stale_ready.operation_generation = first_claim.operation_generation
-        stale_ready.operation_attempt = first_claim.operation_attempt
+        stale_ready.operation_attempt = first_started.operation_attempt
         assert first_repo.update_if_operation_owner(
             stale_ready,
             SnapshotState.CREATING,
@@ -494,13 +509,13 @@ def test_postgresql_lease_renew_expiry_takeover_and_fencing(
             record.created_at,
             SnapshotState.READY,
         )
-        ready.operation_generation = second_claim.operation_generation
-        ready.operation_attempt = second_claim.operation_attempt
+        ready.operation_generation = second_started.operation_generation
+        ready.operation_attempt = second_started.operation_attempt
         assert second_repo.update_if_operation_owner(
             ready,
             SnapshotState.CREATING,
             "server-b",
-            second_claim.operation_generation,
+            second_started.operation_generation,
         ) is True
         stored = first_repo.get(record.id)
         assert stored is not None
@@ -578,6 +593,19 @@ def test_postgresql_schema_upgrade_adds_operation_lease_columns(
             )
             """
         )
+        conn.execute(
+            """
+            INSERT INTO snapshots (
+                id, source_sandbox_id, namespace, name, description,
+                restore_config, state, reason, message, last_transition_at,
+                created_at, updated_at
+            ) VALUES (
+                'legacy-creating', 'sbx-001', NULL, 'legacy', NULL,
+                '{"image": null}'::jsonb, 'Creating', 'snapshot_accepted', NULL,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            """
+        )
 
     repo = _repository(postgresql_dsn)
     repo.close()
@@ -593,10 +621,15 @@ def test_postgresql_schema_upgrade_adds_operation_lease_columns(
                 """
             ).fetchall()
         }
+        legacy_attempt = conn.execute(
+            "SELECT operation_attempt FROM snapshots WHERE id = 'legacy-creating'"
+        ).fetchone()
     assert columns["operation_generation"][0] == "NO"
     assert columns["operation_attempt"][0] == "NO"
     assert "lease_owner" in columns
     assert "lease_expires_at" in columns
+    assert legacy_attempt is not None
+    assert legacy_attempt[0] == 1
 
 
 def test_postgresql_close_releases_pool(postgresql_dsn: str) -> None:

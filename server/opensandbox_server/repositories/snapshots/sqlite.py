@@ -328,7 +328,6 @@ class SQLiteSnapshotRepository:
                 UPDATE snapshots
                 SET
                     operation_generation = operation_generation + 1,
-                    operation_attempt = operation_attempt + 1,
                     lease_owner = ?,
                     lease_expires_at = ?
                 WHERE id = ?
@@ -381,6 +380,37 @@ class SQLiteSnapshotRepository:
                 ),
             )
             return cursor.rowcount == 1
+
+    def mark_operation_started(
+        self,
+        snapshot_id: str,
+        expected_state: SnapshotState,
+        lease_owner: str,
+        operation_generation: int,
+    ) -> SnapshotRecord | None:
+        now = datetime.now(timezone.utc)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE snapshots
+                SET operation_attempt = operation_attempt + 1
+                WHERE id = ?
+                  AND state = ?
+                  AND lease_owner = ?
+                  AND operation_generation = ?
+                  AND lease_expires_at > ?
+                """,
+                (
+                    snapshot_id,
+                    expected_state.value,
+                    lease_owner,
+                    operation_generation,
+                    self._datetime_to_str(now),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+        return self.get(snapshot_id)
 
     def update_if_operation_owner(
         self,
@@ -527,6 +557,7 @@ class SQLiteSnapshotRepository:
     def _migrate_add_operation_leases(conn: sqlite3.Connection) -> None:
         rows = conn.execute("PRAGMA table_info(snapshots)").fetchall()
         columns = {row["name"] for row in rows}
+        had_operation_attempt = "operation_attempt" in columns
         additions = {
             "operation_generation": "INTEGER NOT NULL DEFAULT 0",
             "lease_owner": "TEXT",
@@ -536,6 +567,12 @@ class SQLiteSnapshotRepository:
         for column, definition in additions.items():
             if column not in columns:
                 conn.execute(f"ALTER TABLE snapshots ADD COLUMN {column} {definition}")
+        if not had_operation_attempt:
+            conn.execute(
+                "UPDATE snapshots SET operation_attempt = 1 "
+                "WHERE state = ? AND operation_attempt = 0",
+                (SnapshotState.CREATING.value,),
+            )
 
     @staticmethod
     def _migrate_namespace_nullable(conn: sqlite3.Connection) -> None:

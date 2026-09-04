@@ -200,7 +200,7 @@ class SnapshotRepositoryContract:
 
         assert claim is not None
         assert claim.operation_generation == 1
-        assert claim.operation_attempt == 1
+        assert claim.operation_attempt == 0
         assert claim.lease_owner == "server-a"
         assert claim.lease_expires_at is not None
         assert repository.claim_operation(
@@ -216,6 +216,20 @@ class SnapshotRepositoryContract:
             claim.operation_generation,
             timedelta(seconds=30),
         ) is True
+        assert repository.mark_operation_started(
+            original.id,
+            SnapshotState.CREATING,
+            "server-b",
+            claim.operation_generation,
+        ) is None
+        started = repository.mark_operation_started(
+            original.id,
+            SnapshotState.CREATING,
+            "server-a",
+            claim.operation_generation,
+        )
+        assert started is not None
+        assert started.operation_attempt == 1
 
         ready = snapshot_record(
             original.id,
@@ -224,7 +238,7 @@ class SnapshotRepositoryContract:
             SnapshotState.READY,
         )
         ready.operation_generation = claim.operation_generation
-        ready.operation_attempt = claim.operation_attempt
+        ready.operation_attempt = started.operation_attempt
         assert repository.update_if_operation_owner(
             ready,
             SnapshotState.CREATING,
