@@ -228,6 +228,27 @@ def test_create_snapshot_creates_cr_only_after_observing_it_is_missing() -> None
     assert status.image == "registry/sandbox:snap"
 
 
+def test_create_snapshot_rechecks_deadline_before_creating_missing_cr(monkeypatch) -> None:
+    k8s_client = ReadyOnCreateK8sClient()
+    ticks = iter([0.0, 11.0])
+    monkeypatch.setattr(
+        "opensandbox_server.services.k8s.snapshot_runtime.time.monotonic",
+        lambda: next(ticks),
+    )
+    runtime = KubernetesSnapshotRuntime(
+        k8s_client,
+        namespace="default",
+        wait_timeout_seconds=10,
+        poll_interval_seconds=0,
+    )
+
+    status = runtime.create_snapshot(SNAPSHOT_ID, SANDBOX_ID)
+
+    assert status.state == SnapshotState.FAILED
+    assert status.reason == "snapshot_runtime_timeout"
+    assert k8s_client.created == []
+
+
 def test_create_snapshot_observes_the_winner_after_create_race() -> None:
     k8s_client = CreateRaceK8sClient(
         _snapshot_cr(

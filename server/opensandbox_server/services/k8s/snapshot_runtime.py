@@ -124,6 +124,8 @@ class KubernetesSnapshotRuntime:
                 namespace=ns,
                 deadline=deadline,
             )
+        if time.monotonic() >= deadline:
+            return self._timeout_status(snapshot_id)
 
         try:
             self._k8s_client.create_custom_object(
@@ -350,16 +352,20 @@ class KubernetesSnapshotRuntime:
                 return runtime_status
 
             if time.monotonic() >= deadline:
-                return SnapshotRuntimeStatus(
-                    state=SnapshotState.FAILED,
-                    reason="snapshot_runtime_timeout",
-                    message=(
-                        "Timed out waiting for Kubernetes SandboxSnapshot "
-                        f"{build_public_snapshot_name(snapshot_id)} to complete."
-                    ),
-                )
+                return self._timeout_status(snapshot_id)
 
             time.sleep(self._poll_interval_seconds)
+
+    @staticmethod
+    def _timeout_status(snapshot_id: str) -> SnapshotRuntimeStatus:
+        return SnapshotRuntimeStatus(
+            state=SnapshotState.FAILED,
+            reason="snapshot_runtime_timeout",
+            message=(
+                "Timed out waiting for Kubernetes SandboxSnapshot "
+                f"{build_public_snapshot_name(snapshot_id)} to complete."
+            ),
+        )
 
     def _snapshot_status_from_cr(self, snapshot: dict) -> SnapshotRuntimeStatus:
         status = snapshot.get("status", {})
