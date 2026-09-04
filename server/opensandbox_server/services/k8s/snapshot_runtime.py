@@ -119,6 +119,11 @@ class KubernetesSnapshotRuntime:
                 "Kubernetes SandboxSnapshot %s already exists; resuming observation",
                 snapshot_name,
             )
+            current_status = self._snapshot_status_from_cr(current)
+            if current_status.state in (SnapshotState.READY, SnapshotState.FAILED):
+                return current_status
+            if time.monotonic() >= deadline:
+                return self._timeout_status(snapshot_id)
             return self._wait_for_terminal_snapshot(
                 snapshot_id,
                 namespace=ns,
@@ -162,6 +167,10 @@ class KubernetesSnapshotRuntime:
             conflict = self._validate_existing_source(current, sandbox_id)
             if conflict is not None:
                 return conflict
+            if current is not None:
+                current_status = self._snapshot_status_from_cr(current)
+                if current_status.state in (SnapshotState.READY, SnapshotState.FAILED):
+                    return current_status
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to create Kubernetes SandboxSnapshot %s: %s", snapshot_name, exc)
             return SnapshotRuntimeStatus(
@@ -170,6 +179,8 @@ class KubernetesSnapshotRuntime:
                 message=f"Failed to create Kubernetes SandboxSnapshot {snapshot_name}: {exc}",
             )
 
+        if time.monotonic() >= deadline:
+            return self._timeout_status(snapshot_id)
         return self._wait_for_terminal_snapshot(
             snapshot_id,
             namespace=ns,
