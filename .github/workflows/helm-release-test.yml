@@ -87,6 +87,22 @@ jobs:
             exit 1
           fi
           grep -F 'requires [store] type = "postgresql" and [runtime] type = "kubernetes"' "$error_log"
+          if helm template opensandbox-server "$chart_path" \
+            --set server.replicaCount=2 \
+            --set-string $'configToml=[runtime]\ntype = "docker"\n\n[[runtime.backends]]\ntype = "kubernetes"\n\n[store]\ntype = "sqlite"\n\n[[store.backends]]\ntype = "postgresql"\n' \
+            >/dev/null 2>"$error_log"; then
+            echo "::error::TOML array tables widened replica-safety sections"
+            exit 1
+          fi
+          grep -F 'requires [store] type = "postgresql" and [runtime] type = "kubernetes"' "$error_log"
+          if helm template opensandbox-server "$chart_path" \
+            --set server.replicaCount=2 \
+            --set-string $'configToml=[runtime]\ntype = "docker"\nnote = """\ntype = "kubernetes"\n"""\n\n[store]\ntype = "sqlite"\nnote = """\ntype = "postgresql"\n"""\n' \
+            >/dev/null 2>"$error_log"; then
+            echo "::error::TOML multiline values widened replica-safety sections"
+            exit 1
+          fi
+          grep -F 'requires [store] type = "postgresql" and [runtime] type = "kubernetes"' "$error_log"
           helm template opensandbox-server "$chart_path" \
             --set server.replicaCount=2 \
             --set-string $'configToml=[runtime] # active runtime\ntype = "kubernetes" # multi-replica\n\n[store] # active store\ntype = "postgresql" # shared database\n' \

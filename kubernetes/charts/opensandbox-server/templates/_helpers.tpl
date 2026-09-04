@@ -95,10 +95,8 @@ process-local, and Docker snapshot execution cannot coordinate active replicas.
 {{- define "opensandbox-server.validateSnapshotStoreReplicas" -}}
 {{- if gt (int .Values.server.replicaCount) 1 -}}
 {{- $configToml := printf "%s\n" .Values.configToml -}}
-{{- $storeSection := regexFind `(?ms)^[[:space:]]*\[store\][[:space:]]*(?:#[^\r\n]*)?$.*?(?:^[[:space:]]*\[[^]]+\][[:space:]]*(?:#[^\r\n]*)?$|\z)` $configToml -}}
-{{- $usesPostgreSQL := regexMatch `(?m)^[[:space:]]*type[[:space:]]*=[[:space:]]*["']postgresql["'][[:space:]]*(?:#[^\r\n]*)?$` $storeSection -}}
-{{- $runtimeSection := regexFind `(?ms)^[[:space:]]*\[runtime\][[:space:]]*(?:#[^\r\n]*)?$.*?(?:^[[:space:]]*\[[^]]+\][[:space:]]*(?:#[^\r\n]*)?$|\z)` $configToml -}}
-{{- $usesKubernetes := regexMatch `(?m)^[[:space:]]*type[[:space:]]*=[[:space:]]*["']kubernetes["'][[:space:]]*(?:#[^\r\n]*)?$` $runtimeSection -}}
+{{- $usesPostgreSQL := regexMatch `(?m)^[ \t]*\[store\][ \t]*(?:#[^\r\n]*)?\r?\n(?:[ \t]*(?:#[^\r\n]*)?\r?\n)*[ \t]*type[ \t]*=[ \t]*["']postgresql["'][ \t]*(?:#[^\r\n]*)?\r?$` $configToml -}}
+{{- $usesKubernetes := regexMatch `(?m)^[ \t]*\[runtime\][ \t]*(?:#[^\r\n]*)?\r?\n(?:[ \t]*(?:#[^\r\n]*)?\r?\n)*[ \t]*type[ \t]*=[ \t]*["']kubernetes["'][ \t]*(?:#[^\r\n]*)?\r?$` $configToml -}}
 {{- if or (not $usesPostgreSQL) (not $usesKubernetes) -}}
 {{- fail "server.replicaCount greater than 1 requires [store] type = \"postgresql\" and [runtime] type = \"kubernetes\" in configToml; SQLite and Docker snapshot execution support one active server replica" -}}
 {{- end -}}
