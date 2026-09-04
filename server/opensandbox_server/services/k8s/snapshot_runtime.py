@@ -95,11 +95,13 @@ class KubernetesSnapshotRuntime:
         deadline = time.monotonic() + self._wait_timeout_seconds
         body = self._build_snapshot_body(snapshot_id, sandbox_id, snapshot_name, namespace=ns)
 
-        observed, current = self._observe_snapshot(
+        observed, current, observation_error = self._observe_snapshot(
             snapshot_name,
             namespace=ns,
             deadline=deadline,
         )
+        if observation_error is not None:
+            return observation_error
         if not observed:
             return SnapshotRuntimeStatus(
                 state=SnapshotState.CREATING,
@@ -139,11 +141,13 @@ class KubernetesSnapshotRuntime:
                     message=f"Failed to create Kubernetes SandboxSnapshot {snapshot_name}: {exc}",
                 )
             logger.info("Kubernetes SandboxSnapshot %s won the create race", snapshot_name)
-            observed, current = self._observe_snapshot(
+            observed, current, observation_error = self._observe_snapshot(
                 snapshot_name,
                 namespace=ns,
                 deadline=deadline,
             )
+            if observation_error is not None:
+                return observation_error
             if not observed:
                 return SnapshotRuntimeStatus(
                     state=SnapshotState.CREATING,
@@ -266,10 +270,37 @@ class KubernetesSnapshotRuntime:
         *,
         namespace: str,
         deadline: float,
-    ) -> tuple[bool, Optional[dict]]:
+    ) -> tuple[bool, Optional[dict], Optional[SnapshotRuntimeStatus]]:
         while True:
             try:
-                return True, self._get_snapshot_cr(snapshot_name, namespace=namespace)
+                return True, self._get_snapshot_cr(snapshot_name, namespace=namespace), None
+            except ApiException as exc:
+                if not self._is_retryable_observation_error(exc):
+                    logger.error(
+                        "Failed to observe Kubernetes SandboxSnapshot %s: %s",
+                        snapshot_name,
+                        exc,
+                    )
+                    return (
+                        False,
+                        None,
+                        SnapshotRuntimeStatus(
+                            state=SnapshotState.FAILED,
+                            reason="snapshot_runtime_inspect_failed",
+                            message=(
+                                "Failed to inspect Kubernetes SandboxSnapshot "
+                                f"{snapshot_name}: {exc}"
+                            ),
+                        ),
+                    )
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "Failed to observe Kubernetes SandboxSnapshot %s before create: %s",
+                        snapshot_name,
+                        exc,
+                    )
+                    return False, None, None
+                time.sleep(self._poll_interval_seconds)
             except Exception as exc:  # noqa: BLE001
                 if time.monotonic() >= deadline:
                     logger.warning(
@@ -277,8 +308,13 @@ class KubernetesSnapshotRuntime:
                         snapshot_name,
                         exc,
                     )
-                    return False, None
+                    return False, None, None
                 time.sleep(self._poll_interval_seconds)
+
+    @staticmethod
+    def _is_retryable_observation_error(exc: ApiException) -> bool:
+        api_status = exc.status or 0
+        return api_status == 0 or api_status in (408, 409, 425, 429) or api_status >= 500
 
     def _validate_existing_source(self, snapshot: Optional[dict], sandbox_id: str) -> Optional[SnapshotRuntimeStatus]:
         if snapshot is None:

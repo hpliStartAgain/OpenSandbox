@@ -75,6 +75,16 @@ class TransientGetK8sClient(FakeK8sClient):
         )
 
 
+class ForbiddenGetK8sClient(FakeK8sClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.get_calls = 0
+
+    def get_custom_object(self, **kwargs):
+        self.get_calls += 1
+        raise ApiException(status=403, reason="forbidden")
+
+
 class TransientThenReadyK8sClient(TransientGetK8sClient):
     def get_custom_object(self, *, group: str, version: str, namespace: str, plural: str, name: str):
         obj = super().get_custom_object(
@@ -314,6 +324,29 @@ def test_create_snapshot_retries_transient_inspect_error_until_controller_ready(
 
     assert status.state == SnapshotState.READY
     assert status.image == "registry/sandbox:snap"
+
+
+def test_create_snapshot_fails_fast_on_permanent_inspect_error(monkeypatch) -> None:
+    k8s_client = ForbiddenGetK8sClient()
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(
+        "opensandbox_server.services.k8s.snapshot_runtime.time.sleep",
+        sleep_calls.append,
+    )
+    runtime = KubernetesSnapshotRuntime(
+        k8s_client,
+        namespace="default",
+        wait_timeout_seconds=900,
+        poll_interval_seconds=2,
+    )
+
+    status = runtime.create_snapshot(SNAPSHOT_ID, SANDBOX_ID)
+
+    assert status.state == SnapshotState.FAILED
+    assert status.reason == "snapshot_runtime_inspect_failed"
+    assert "forbidden" in (status.message or "")
+    assert k8s_client.get_calls == 1
+    assert sleep_calls == []
 
 
 def test_create_snapshot_uses_one_deadline_for_observation_and_completion(monkeypatch) -> None:
