@@ -89,14 +89,18 @@ Image pull policy
 
 {{/*
 Reject multiple server replicas unless the effective [store] section selects
-PostgreSQL. SQLite is process-local and cannot coordinate active replicas.
+PostgreSQL and the effective [runtime] section selects Kubernetes. SQLite is
+process-local, and Docker snapshot execution cannot coordinate active replicas.
 */}}
 {{- define "opensandbox-server.validateSnapshotStoreReplicas" -}}
 {{- if gt (int .Values.server.replicaCount) 1 -}}
-{{- $storeSection := regexFind `(?ms)^[[:space:]]*\[store\][[:space:]]*(?:#.*)?$.*?(?:^[[:space:]]*\[[^]]+\][[:space:]]*(?:#.*)?$|\z)` (printf "%s\n" .Values.configToml) -}}
+{{- $configToml := printf "%s\n" .Values.configToml -}}
+{{- $storeSection := regexFind `(?ms)^[[:space:]]*\[store\][[:space:]]*(?:#.*)?$.*?(?:^[[:space:]]*\[[^]]+\][[:space:]]*(?:#.*)?$|\z)` $configToml -}}
 {{- $usesPostgreSQL := regexMatch `(?m)^[[:space:]]*type[[:space:]]*=[[:space:]]*["']postgresql["'][[:space:]]*(?:#.*)?$` $storeSection -}}
-{{- if not $usesPostgreSQL -}}
-{{- fail "server.replicaCount greater than 1 requires [store] type = \"postgresql\" in configToml; SQLite supports one active server replica" -}}
+{{- $runtimeSection := regexFind `(?ms)^[[:space:]]*\[runtime\][[:space:]]*(?:#.*)?$.*?(?:^[[:space:]]*\[[^]]+\][[:space:]]*(?:#.*)?$|\z)` $configToml -}}
+{{- $usesKubernetes := regexMatch `(?m)^[[:space:]]*type[[:space:]]*=[[:space:]]*["']kubernetes["'][[:space:]]*(?:#.*)?$` $runtimeSection -}}
+{{- if or (not $usesPostgreSQL) (not $usesKubernetes) -}}
+{{- fail "server.replicaCount greater than 1 requires [store] type = \"postgresql\" and [runtime] type = \"kubernetes\" in configToml; SQLite and Docker snapshot execution support one active server replica" -}}
 {{- end -}}
 {{- end -}}
 {{- end }}

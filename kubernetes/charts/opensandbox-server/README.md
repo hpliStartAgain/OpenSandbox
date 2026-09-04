@@ -58,10 +58,9 @@ helm install opensandbox-server "${CHART_URL}" \
 See the [Kubernetes deployment guide](../../../docs/kubernetes/deployment.md) for production configuration, verification, and upgrades.
 
 The chart defaults to one Server replica. Setting `server.replicaCount` above
-one requires `[store] type = "postgresql"` in `configToml`; rendering fails
-closed for the default SQLite store. Multi-replica snapshot execution is
-supported for the Kubernetes runtime only. Docker snapshots remain
-single-active.
+one requires `[store] type = "postgresql"` and `[runtime] type = "kubernetes"`
+in `configToml`; rendering fails closed for the default SQLite store and the
+Docker runtime. Docker snapshots remain single-active.
 
 ## Install from local source
 
@@ -160,7 +159,7 @@ The following table lists the configurable parameters of the chart and their def
 | server.podLabels | object | `{}` | Extra labels for the server pod. |
 | server.podSecurityContext | object | `{}` | Pod-level security context for the server pod. |
 | server.priorityClassName | string | `""` | Priority class name for the server pod. |
-| server.replicaCount | int | `1` | Number of server replicas. Values greater than 1 require PostgreSQL in configToml. |
+| server.replicaCount | int | `1` | Number of server replicas. Values greater than 1 require PostgreSQL and the Kubernetes runtime in configToml. |
 | server.resources | object | `{"limits":{"cpu":"2","memory":"8Gi"},"requests":{"cpu":"1","memory":"4Gi"}}` | Resource requests and limits |
 | server.service.nodePort | string | `""` | Node port to bind when type is not ClusterIP. Empty lets Kubernetes allocate one from the cluster node-port range. |
 | server.service.type | string | `"ClusterIP"` | Service type for the server. Set to NodePort or LoadBalancer to reach the server from outside the cluster. |

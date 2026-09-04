@@ -109,9 +109,9 @@ configToml: |
 ::: info
 Multiple active Server replicas are supported for Kubernetes public snapshots
 when every replica uses the same PostgreSQL database. The chart rejects
-`server.replicaCount > 1` unless `configToml` selects PostgreSQL. It does not add
-session affinity because any healthy replica can read or restore a terminal
-snapshot.
+`server.replicaCount > 1` unless `configToml` selects both PostgreSQL and the
+Kubernetes runtime. It does not add session affinity because any healthy replica
+can read or restore a terminal snapshot.
 :::
 
 PostgreSQL operation leases select one worker for each `Creating` or `Deleting`

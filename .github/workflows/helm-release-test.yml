@@ -70,10 +70,18 @@ jobs:
             echo "::error::SQLite multi-replica render unexpectedly succeeded"
             exit 1
           fi
-          grep -F 'requires [store] type = "postgresql"' "$error_log"
+          grep -F 'requires [store] type = "postgresql" and [runtime] type = "kubernetes"' "$error_log"
+          if helm template opensandbox-server "$chart_path" \
+            --set server.replicaCount=2 \
+            --set-string $'configToml=[runtime]\ntype = "docker"\n\n[store]\ntype = "postgresql"\n' \
+            >/dev/null 2>"$error_log"; then
+            echo "::error::Docker multi-replica render unexpectedly succeeded"
+            exit 1
+          fi
+          grep -F 'requires [store] type = "postgresql" and [runtime] type = "kubernetes"' "$error_log"
           helm template opensandbox-server "$chart_path" \
             --set server.replicaCount=2 \
-            --set-string $'configToml=[store]\ntype = "postgresql"\n' \
+            --set-string $'configToml=[runtime]\ntype = "kubernetes"\n\n[store]\ntype = "postgresql"\n' \
             >/dev/null
 
       - name: Install Kind
