@@ -1339,3 +1339,64 @@ def test_sqlite_startup_continues_creating_backlog_after_slots_free(tmp_path) ->
     finally:
         runtime.release.set()
         service.close()
+
+
+@pytest.mark.parametrize("state", [SnapshotState.CREATING, SnapshotState.DELETING])
+def test_sqlite_startup_retries_after_previous_owner_lease_expires(
+    tmp_path,
+    state: SnapshotState,
+) -> None:
+    db_path = tmp_path / "snapshots.db"
+    first_repo = SQLiteSnapshotRepository(db_path)
+    record = _snapshot_record(
+        f"snap-stale-startup-{state.value.lower()}",
+        state,
+        image=(
+            f"opensandbox-snapshots:snap-stale-startup-{state.value.lower()}"
+            if state == SnapshotState.DELETING
+            else None
+        ),
+    )
+    first_repo.create(record)
+    old_claim = first_repo.claim_operation(
+        record.id,
+        state,
+        "stopped-server",
+        timedelta(seconds=0.1),
+    )
+    assert old_claim is not None
+    first_repo.close()
+
+    second_repo = SQLiteSnapshotRepository(db_path)
+    runtime = ReadyCreateRuntime() if state == SnapshotState.CREATING else StubSnapshotRuntime()
+    service = PersistedSnapshotService(
+        second_repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=ImmediateExecutor(),
+        operation_owner="replacement-server",
+        operation_lease_seconds=0.2,
+        lease_renew_interval_seconds=0.05,
+        recovery_interval_seconds=0.01,
+    )
+
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            stored = second_repo.get(record.id)
+            if state == SnapshotState.CREATING:
+                if stored is not None and stored.status.state == SnapshotState.READY:
+                    break
+            elif stored is None:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail(f"SQLite did not take over stale {state.value} startup lease")
+
+        if state == SnapshotState.CREATING:
+            assert isinstance(runtime, ReadyCreateRuntime)
+            assert runtime.recover_calls == [record.id]
+        else:
+            assert runtime.delete_calls == [(record.id, record.restore_config.image)]
+    finally:
+        service.close()

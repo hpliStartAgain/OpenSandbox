@@ -461,6 +461,7 @@ class PersistedSnapshotService(SnapshotService):
         if record.status.state == SnapshotState.DELETING:
             claimed = self._claim_operation(record)
             if claimed is None:
+                self._ensure_recovery_thread()
                 return False
             return self._delete_snapshot_worker(claimed, propagate=False)
 
@@ -557,6 +558,7 @@ class PersistedSnapshotService(SnapshotService):
             claimed = self._claim_operation(record)
             if claimed is None:
                 self._worker_slots.release()
+                self._ensure_recovery_thread()
                 return False
             self._submit_claimed_create_worker(claimed, recovery=recovery)
         except BaseException as exc:
