@@ -122,7 +122,7 @@ in the fleet profile.
 | R1 | Omitting the new option preserves the current intercept-all behavior | Must Have |
 | R2 | In credential-bound mode, TLS is decrypted only for SNI hosts covered by the active acknowledged binding host set | Must Have |
 | R3 | A binding host match at TLS time never bypasses the existing full HTTP request binding match | Must Have |
-| R4 | In credential-bound mode, an unknown fleet identity always denies; for a known identity, ECH/no-SNI/static-ignore traffic passes early, while other SNI-bearing traffic requires an installed acknowledged snapshot and denies during bootstrapping | Must Have |
+| R4 | In credential-bound mode, an unknown fleet identity always denies; for a known identity, ECH/no-SNI/static-ignore traffic passes early, while other SNI-bearing traffic requires an installed acknowledged snapshot and denies only while authoritative state is unknown; first creation installs an empty snapshot before readiness | Must Have |
 | R5 | Vault and effective-policy mutations are serialized per sandbox/subject and acknowledged only after the proxy installs the new decision revision | Must Have |
 | R6 | Adding a bound host closes matching pre-existing pass-through connections before the mutation is acknowledged | Must Have |
 | R7 | Removing the final binding for a host fences new requests from the retired revision before acknowledgement; previously admitted requests may drain for a bounded interval while new connections use pass-through | Must Have |
@@ -524,19 +524,35 @@ Credential-bound mode uses these states:
 | `active` | Decide decrypt/pass-through from the acknowledged non-empty binding set |
 | `active-empty` | Authoritative empty binding set; select pass-through after live-connection registry admission |
 
-This distinguishes "the authoritative binding set is empty" from "no vault
-revision has been installed" and "the proxy cannot obtain the binding set." A
-caller that intentionally wants no bindings may create an empty vault. Deleting
-the vault installs an acknowledged empty tombstone for the current runtime
-generation before returning `204`; it does not turn a missing or failed lookup
-into implicit dynamic pass-through. The legacy `all` mode keeps its current
-no-vault behavior because this state machine gates only the opt-in mode.
+On first creation of a new sandbox or subject, the trusted control plane knows
+that no vault has yet been configured. It automatically installs and
+acknowledges an explicit empty decision snapshot before reporting readiness or
+releasing the workload. HTTPS then passes through without requiring the caller
+to create a vault. Failed initialization keeps readiness false.
 
-On sidecar restart or fleet subject generation change, the state returns to
-`bootstrapping`. Fleet replay or the trusted caller must install either a vault
-revision or an explicit empty revision. This aligns selective decisions with
-the existing memory-only vault model without pretending that lost state is an
-authoritative empty configuration.
+This empty decision snapshot is internal metadata with no credentials. It does
+not set the public vault store's `exists` flag or consume public revision 1.
+`GET /credential-vault` still returns not found until the caller's first POST;
+that POST creates revision 1 and transitions the decision snapshot to active
+(or active-empty for an intentionally empty vault). Startup installation and
+POST use the same mutation barrier: a delayed startup operation must never
+overwrite a caller-installed revision.
+
+Deleting a vault commits an acknowledged empty tombstone before returning
+`204`. Public GET then returns not found, and a later POST can create a new
+vault. The internal decision epoch and runtime generation prevent confusion
+between separate public vault lifetimes.
+
+`bootstrapping` denotes unknown state during initialization or recovery, not
+absence of caller action. On mitmdump restart, the surviving Go control plane
+reinstalls its authoritative snapshot. After Go/sidecar replacement, pause/resume,
+or fleet replay, missing local vault data alone is not proof of emptiness.
+The trusted recovery owner must restore the intended revision or explicitly
+confirm empty state for the new generation before readiness returns. A replay
+timeout or missing record must not silently install an empty snapshot.
+Deployments must retain that recovery intent outside the process; this OSEP
+adds no credential persistence. First creation and recovery are distinct
+lifecycle events, even when recovery uses a newly allocated Pod.
 
 ### Connection Transition Semantics
 
@@ -776,6 +792,8 @@ it does not change traffic.
 - Unknown request fields are rejected by capable servers; omitted mode retains
   `all`. Test the previously tolerated-extra-field compatibility change.
 - Credential-bound active-empty and unbound SNI select pass-through.
+- First-create auto-empty leaves the public vault absent and first POST creates
+  revision 1. Serialize startup/POST races so startup cannot overwrite a vault.
 - ECH is detected before outer-SNI matching and selects opaque pass-through.
 - Bound SNI selects decryption, then still requires a full HTTP binding match.
 - HTTP-only bindings do not add hosts to `tlsBindingHostSelectors`.
@@ -803,6 +821,11 @@ it does not change traffic.
 - Telemetry uses only the documented bounded attributes.
 
 ### Integration Tests
+
+- A newly ready sandbox that never creates a vault can immediately use HTTPS
+  pass-through. A failed auto-empty install prevents readiness.
+- First Vault POST succeeds after startup; recovery without confirmed intent
+  remains not-ready and cannot replace a lost bound revision with empty state.
 
 - An unbound HTTPS server with a certificate trusted by the sandbox succeeds
   without trusting the OpenSandbox CA and observes end-to-end TLS.
@@ -931,8 +954,9 @@ paths.
 4. Enable `credential-bound` only when explicitly requested and only on
    runtimes that implement the complete contract; reject unsupported
    extra-port or pool/fleet combinations instead of degrading silently.
-5. Document that callers must install an initial vault revision, including an
-   explicit empty revision, before TLS egress is released in this mode.
+5. The runtime automatically installs an internal empty decision snapshot before
+   first-create readiness. The caller's first public Vault POST remains valid.
+   Recovery requires replay or explicit trusted confirmation of empty intent.
 6. Document that every `PATCH /credential-vault` request in this mode must
    include the existing `expectedRevision`; callers can obtain it from `GET
    /credential-vault`. SDK documentation must explicitly distinguish this
