@@ -124,7 +124,7 @@ in the fleet profile.
 | R3 | A binding host match at TLS time never bypasses the existing full HTTP request binding match | Must Have |
 | R4 | In credential-bound mode, an unknown fleet identity always denies; for a known identity, ECH/no-SNI/static-ignore traffic passes early, while other SNI-bearing traffic requires an installed acknowledged snapshot and denies only while authoritative state is unknown; first creation installs an empty snapshot before readiness | Must Have |
 | R5 | Vault and effective-policy mutations are serialized per sandbox/subject and acknowledged only after the proxy installs the new decision revision | Must Have |
-| R6 | Adding a bound host closes matching pre-existing pass-through connections before the mutation is acknowledged | Must Have |
+| R6 | Host-add acknowledgement makes the new revision effective for subsequent TLS decisions; existing opaque connections remain uncredentialed until clients reconnect | Must Have |
 | R7 | Removing the final binding for a host fences new requests from the retired revision before acknowledgement; previously admitted requests may drain for a bounded interval while new connections use pass-through | Must Have |
 | R8 | The request-admission linearization point and prior-revision completion semantics are explicit for HTTP/1.1 and HTTP/2 | Must Have |
 | R9 | Sidecar and fleet profiles expose the same user-visible behavior | Must Have |
@@ -205,7 +205,7 @@ method, path, and any future binding selectors before injecting a credential.
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Binding added while an opaque TLS connection is already open | Requests continue without injection | Track and close matching pass-through connections before acknowledging the host-set addition |
+| Binding added while an opaque TLS connection is already open | Reused connections receive no injected credential | Apply the binding to new TLS decisions and document client reconnect requirements; do not promise immediate injection on existing opaque sessions |
 | Binding removed while a decrypted HTTP/2 connection remains open | Unrelated future streams remain visible to the proxy | Atomically retire the binding revision, prevent new streams, send GOAWAY/close, and bound drain time |
 | Missing snapshot is mistaken for authoritative empty | Traffic passes through when the proxy cannot determine whether credentials are required | Represent active-empty separately from bootstrapping; deny without an installed snapshot, retain an installed snapshot on pre-commit update failure, and reconcile post-commit readback loss |
 | Concurrent policy and vault mutations validate against different states | A binding becomes active against stale policy or vice versa | Use one per-sandbox/subject mutation barrier and validate the complete post-mutation policy/vault pair |
@@ -215,7 +215,7 @@ method, path, and any future binding selectors before injecting a credential.
 | Per-ClientHello decision adds latency | Higher TLS connection setup cost | Match against the installed immutable snapshot in-process; do not perform a control-socket fetch per connection |
 | Hostname metric labels expose destinations or create high cardinality | Privacy and telemetry cost | Use bounded `mode`, `decision`, `reason`, and `transition` attributes; keep hostname out of metrics |
 | HTTP/2 origin coalescing carries a bound authority over an unbound SNI connection | The request remains opaque and receives no credential | Define the feature as SNI-connection scoped, reject cross-authority requests on decrypted connections, and document that credentialed clients must connect with the bound host as SNI |
-| Live connection tracking exhausts memory | Revision fencing becomes unreliable | Enforce global and per-subject live-connection caps; deny new tracked TLS connections on exhaustion |
+| Decrypted-connection registry exhausts its budget | New bound TLS cannot be safely tracked | Deny only new decrypt decisions, preserve opaque pass-through, and alert operators with budget/occupancy telemetry |
 | An older server ignores the requested mode | Unrelated TLS may be decrypted before the SDK detects the mismatch | Verify the runtime-confirmed response field, report failure, and require coordinated version upgrades; detection cannot undo startup traffic |
 | A wildcard binding overlaps only one exact hostname matched by static pass-through | Probe-based validation misses the overlap, so credential traffic passes through without injection | Reject legacy regex configuration in the new mode and compare exact/wildcard selector languages directly |
 
@@ -412,15 +412,13 @@ order:
 6. Match normalized SNI against `tlsBindingHostSelectors`, the union of host
    selectors from bindings whose scheme includes HTTPS and whose effective
    canonical port is 443.
-7. Before applying either dynamic decision, register the live connection under
-   `(controlPlaneGeneration, subjectGeneration, normalizedSNI)`. If the global
-   or per-subject registry cap is exhausted, deny with
-   `reason=registry_exhausted`; do not pass through an untracked visible-SNI
-   connection.
-8. Apply the registered decision:
-   - selector match: decrypt and record `reason=binding_host`;
-   - no match, including active-empty: pass through and record
-     `reason=no_binding_host`.
+7. If the selector does not match, including active-empty, pass through with
+   `reason=no_binding_host`. Do not add the opaque connection to an OSEP
+   decision registry; mitmproxy still owns its normal transport lifecycle.
+8. For a matching selector, atomically register the connection and its selected
+   decision epoch before decryption. Revalidate the epoch if a mutation raced
+   with admission. Deny with `reason=registry_exhausted` if the decrypted-
+   connection budget is full; never downgrade a bound connection to opaque TLS.
 
 Exact and leftmost-label wildcard semantics, lowercase normalization, trailing
 dot handling, and IDNA normalization must be shared with Credential Vault
@@ -486,10 +484,10 @@ identity.
 1. **Prepare** validates the complete policy/vault pair, constructs an inert
    snapshot, reserves required connection-registry capacity, and installs any
    reversible deny fence. It does not expose the candidate as active.
-2. **Commit** atomically swaps the active request/TLS decision snapshot. For an
-   added-host transition, matching opaque connections must be confirmed closed
-   before commit returns. For a removed host, the new-request fence becomes
-   active in the same commit.
+2. **Commit** atomically swaps the active request/TLS decision snapshot.
+   Subsequent TLS decision admissions use the new epoch. For a removed host,
+   the new-request fence on tracked decrypted connections becomes active in
+   the same commit. Host additions do not enumerate or close opaque sockets.
 3. **Acknowledge/readback**: a successful commit response containing the exact
    tuple and digest is the proxy's acknowledgement. The egress API may then
    report the new vault revision. Readback returns the same active tuple and
@@ -522,7 +520,7 @@ Credential-bound mode uses these states:
 |---|---|
 | `bootstrapping` | For a known identity, preserve early ECH/no-SNI/static-ignore pass-through; deny other SNI-bearing TLS until the control plane installs an active or explicit empty revision |
 | `active` | Decide decrypt/pass-through from the acknowledged non-empty binding set |
-| `active-empty` | Authoritative empty binding set; select pass-through after live-connection registry admission |
+| `active-empty` | Authoritative empty binding set; select pass-through without decision-registry admission |
 
 On first creation of a new sandbox or subject, the trusted control plane knows
 that no vault has yet been configured. It automatically installs and
@@ -556,23 +554,23 @@ lifecycle events, even when recovery uses a newly allocated Pod.
 
 ### Connection Transition Semantics
 
-Let `covers_old(sni)` and `covers_new(sni)` be the semantic HTTPS/443 host-
-coverage predicates for consecutive revisions. Transitions are evaluated for
-the observed normalized SNI of each live connection, not by subtracting raw
-selector strings. For example, replacing `*.example.com` with
-`api.example.com` does not treat a live `api.example.com` connection as newly
-added or removed, while `docs.example.com` becomes removed.
+Let `covers_old(sni)` and `covers_new(sni)` be semantic HTTPS/443
+coverage predicates, rather than raw selector-set subtraction. Replacing
+`*.example.com` with `api.example.com` keeps that exact host covered while
+uncovering `docs.example.com`.
 
-**Newly covered connections (`!covers_old(sni) && covers_new(sni)`)**
+**Newly covered hosts**
 
-- Install a fence that rejects new pass-through connections for the added host.
-- Close existing opaque pass-through TLS connections whose observed SNI matches
-  the added host. They cannot be converted into MITM connections in place.
-- Atomically activate the new decision snapshot.
-- Acknowledge the mutation only after matching live opaque sockets are
-  confirmed closed and the proxy returns the exact successful commit
-  acknowledgement, or matching readback resolves an ambiguous commit. Clients
-  reconnect through the decrypt path.
+- Atomically install the new decision epoch before acknowledging the mutation.
+- TLS decision admissions after cutover use the new coverage. A handshake
+  admitted before cutover may finish opaque, even if it completes after ACK.
+- Existing opaque connections remain opaque and uncredentialed. Clients must
+  reconnect or recycle their connection pools to receive injection. There is
+  no bounded wait until such a connection becomes credentialed.
+- This has the same injection-availability limitation as HTTP/2 coalescing over
+  an unbound-SNI connection. Neither case exposes a vault credential.
+- Request-level binding selection on already decrypted connections still uses
+  the current acknowledged revision.
 
 **Newly uncovered connections (`covers_old(sni) && !covers_new(sni)`)**
 
@@ -643,12 +641,12 @@ old generation cannot affect the replacement subject.
 
 | Condition | Result in credential-bound mode |
 |---|---|
-| Authoritative active-empty snapshot | Select pass-through after live-connection registry admission |
-| SNI does not match a bound host | Select pass-through after live-connection registry admission |
+| Authoritative active-empty snapshot | Pass through without decision-registry admission |
+| SNI does not match a bound host | Pass through without decision-registry admission |
 | Validated static pass-through selector match | Pass through; semantic overlap with a binding is rejected before activation |
 | ECH hides the actual SNI | Pass through as opaque TLS; no credential injection |
 | No SNI | Preserve current secure no-SNI pass-through behavior; no credential injection |
-| Live connection registry cap reached | Deny; do not create an untracked visible-SNI pass-through or decrypted connection |
+| Decrypted-connection registry budget reached | Immediately close the newly accepted bound TCP connection before TLS termination; no hang or opaque fallback. Unbound pass-through remains available |
 | Prepare/install failure before commit | Reject the candidate; keep the prior installed snapshot. If no snapshot is installed, deny |
 | Commit readback timeout or lost acknowledgement | Enter `CREDENTIAL_REVISION_INDETERMINATE`; reject vault reads/writes until active-tuple readback reconciles the outcome |
 | Unknown fleet source identity | Deny and emit a bounded dispatch-miss signal |
@@ -671,15 +669,32 @@ dispatch key into a fenced subject identity; it is not the durable identity.
 The same SNI may decrypt for subject A and pass through for subject B when only
 subject A has a matching binding. Subject registration starts deny-first,
 subject unload removes its snapshot and closes its tracked connections, and a
-new runtime generation never inherits the old subject's cache.
+new runtime generation never inherits the old subject's cache. Teardown must
+also terminate opaque transports using mitmproxy's existing connection ownership
+or network attachment teardown before source identity is reused. Removing the
+extra host-add registry does not authorize cross-generation transport reuse.
 
-The registry contains live connections only and removes entries on close. The
-initial implementation caps the process at 65,536 tracked TLS connections and
-each fleet subject at 1,024; operator configuration may lower these limits but
-cannot disable them. When either cap is reached, new credential-bound TLS
-connections that require tracking are denied with `reason=registry_exhausted`.
-Live entries are never evicted to make room, because eviction would make a
-future host-set transition unenforceable.
+The decision registry contains only live decrypted connections, including those
+draining after binding removal. Opaque traffic retains normal mitmproxy
+transport state but no extra SNI index, revision membership, or host-add scan.
+Remove entries on close; never evict a live decrypted entry to admit another.
+
+Replace the fixed 65,536/1,024 ceilings with operator-configured finite process
+and per-subject budgets. Both may be raised or lowered within the provisioned
+memory budget. Before selecting release defaults, benchmarks must measure
+incremental bytes per entry, peak handshake/drain overhead, expected bound
+connections per subject, and process memory headroom. The global budget must
+cover the intended concurrency: 4,096 subjects at 32 bound connections require
+at least 131,072 entries plus measured headroom. Any oversubscription must be
+explicit; a per-subject limit is not a reserved allocation.
+
+On exhaustion, immediately close a new bound connection before TLS termination;
+the client observes connection termination, not an indefinite timeout. Existing
+tracked connections and new opaque connections continue. Emit
+`registry_exhausted`, occupancy, and configured-budget metrics using bounded
+labels. Sustained exhaustion is a paging-worthy bound-HTTPS availability signal;
+operators increase provisioned budget or reduce workload concurrency. Limits
+and defaults are deployment controls, not a new sandbox-user API.
 
 ### SNI, ECH, and Destination Identity
 
@@ -739,7 +754,8 @@ Add bounded-cardinality metrics to the `opensandbox/egress` meter:
 | Metric | Attributes | Purpose |
 |---|---|---|
 | `egress.mitm.tls.connections_total` | `mode`, `decision`, `reason` | Count `decrypt`, `passthrough`, and `deny` decisions |
-| `egress.mitm.tls.active_connections` | `mode`, `decision` | Observe current decrypted and opaque connections |
+| `egress.mitm.tls.active_connections` | `mode`, `decision` | Aggregate transport counters; do not build an opaque SNI registry for this metric |
+| `egress.mitm.registry.entries` / `egress.mitm.registry.capacity` | `scope` (process or subject aggregate) | Observe decrypted-entry occupancy and configured limits without per-subject UID labels |
 | `egress.credential_vault.transitions_total` | `transition`, `result` | Count host-set add/remove, credential-only, empty, replay, and failed transitions |
 | `egress.credential_vault.transition.duration` | `transition`, `result` | Measure snapshot install and connection-fence latency |
 
@@ -804,8 +820,8 @@ it does not change traffic.
 - Credential-bound startup rejects any non-empty legacy regex `ignore_hosts`
   list and accepts the equivalent analyzable pass-through selector list.
 - Missing/bootstrapping state is distinct from an acknowledged empty revision,
-  timeout, 5xx, malformed JSON, dispatch miss, and generation mismatch; only
-  the acknowledged empty revision selects dynamic pass-through.
+  timeout, 5xx, malformed JSON, dispatch miss, and generation mismatch. Dynamic
+  pass-through requires an installed snapshot with no matching TLS selector.
 - Cache invalidation makes an acknowledged revision visible immediately.
 - Prepare, commit, abort, and readback are idempotent; lost acknowledgement is
   resolved by active-revision readback.
@@ -816,8 +832,8 @@ it does not change traffic.
   stale mutations.
 - Old fleet generations cannot install snapshots or close new-generation
   connections.
-- Registry exhaustion denies new tracked connections without evicting live
-  entries.
+- Registry exhaustion immediately terminates new bound connections without
+  evicting live entries or denying new unbound TLS.
 - Telemetry uses only the documented bounded attributes.
 
 ### Integration Tests
@@ -831,8 +847,9 @@ it does not change traffic.
   without trusting the OpenSandbox CA and observes end-to-end TLS.
 - A bound HTTPS server requires the OpenSandbox CA and receives the expected
   injected credential only on matching requests.
-- Adding the first binding for a host closes an existing pass-through
-  connection; a reconnect is decrypted and credentialed.
+- Adding the first binding leaves an existing opaque connection uncredentialed;
+  after ACK a fresh TLS decision decrypts and injects on matching requests.
+  Test handshake-admission races across the cutover.
 - Removing the final binding prevents new injection, drains HTTP/1.1 and HTTP/2
   connections, and makes the next connection pass through.
 - Credential-only replacement keeps the TLS connection but switches new
@@ -872,13 +889,20 @@ it does not change traffic.
   per-source cache growth.
 - Measure binding-revision transition latency with active HTTP/1.1 and HTTP/2
   connections.
+- Run sustained connect/close churn and burst storms for mostly unbound,
+  mostly bound, and mixed traffic, including concurrent host-add/remove.
+  Measure CPU, RSS, allocations, p95/p99 admission latency, registry cleanup,
+  and rejection rates against `all`; verify unbound traffic creates no extra
+  decision-registry entries and returns to baseline after churn.
+- Publish per-entry memory measurements and validate global/per-subject budget
+  arithmetic at the advertised fleet scale; test raised budgets and exhaustion.
 
 ## Drawbacks
 
 - The proxy must maintain connection state and revision fences, which is more
   complex than time-based snapshot polling.
-- A runtime binding addition may interrupt an existing otherwise healthy TLS
-  connection so the client reconnects through MITM.
+- A runtime binding addition does not upgrade existing opaque connections;
+  pooled clients must reconnect to receive credentials.
 - Host-level decryption remains broader than path- or method-level credential
   scope.
 - Visible SNI is required; ECH and no-SNI traffic cannot use Credential Vault.
@@ -922,12 +946,28 @@ This would silently remove L7 visibility from operator addons and change
 certificate behavior for existing sandboxes. The proposal uses an opt-in and
 requires separate evidence before any future default change.
 
-### Allow Eventual Consistency for Runtime Mutations
+### Track Every Opaque Connection and Close on Host Add
 
-Keeping the 0.5-second cache and documenting a delay is simpler, but it breaks
-OSEP-0012's acknowledgement and revocation contract and leaves already-open
-pass-through connections able to bypass newly added bindings. Explicit
-revision and connection semantics are required.
+This provides stronger host-add injection availability but requires registry
+churn for all visible-SNI TLS and turns a global cap into a broad HTTPS outage.
+The selected bound-only design accepts existing opaque sessions just as it
+accepts coalescing: no credential is injected until the client reconnects.
+Revision acknowledgement remains immediate for new decisions and for request
+evaluation on decrypted connections.
+
+### Bound Opaque Connection Age
+
+A 60–120 second maximum age could bound stale opaque sessions, but still needs
+timers and per-connection lifecycle work, interrupts legitimate long-lived
+traffic, and cannot make an opaque connection credentialed in place. Defer this
+option until a concrete workload needs bounded reconnection latency.
+
+### Time-Based Vault Polling Alone
+
+Retaining the 0.5-second snapshot cache would also delay new TLS decisions and
+request-level revocation on decrypted connections. That is distinct from
+accepting existing opaque sessions. Keep explicit revision acknowledgement and
+the decrypted-request fence.
 
 ## Infrastructure Needed
 
