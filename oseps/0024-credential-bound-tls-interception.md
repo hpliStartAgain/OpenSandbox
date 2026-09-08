@@ -3,7 +3,7 @@ title: Credential-Bound TLS Interception
 authors:
   - "@hpliStartAgain"
 creation-date: 2026-09-04
-last-updated: 2026-09-04
+last-updated: 2026-09-08
 status: draft
 ---
 
@@ -24,7 +24,7 @@ Tracking issue: [#1713](https://github.com/opensandbox-group/OpenSandbox/issues/
   - [Current Behavior](#current-behavior)
   - [Relationship to Existing Work](#relationship-to-existing-work)
   - [Public Configuration](#public-configuration)
-  - [Capability Negotiation](#capability-negotiation)
+  - [Effective Mode Verification](#effective-mode-verification)
   - [Static Pass-Through Overlap](#static-pass-through-overlap)
   - [TLS Decision Contract](#tls-decision-contract)
   - [Authoritative Decision Snapshot](#authoritative-decision-snapshot)
@@ -136,7 +136,7 @@ in the fleet profile.
 | R15 | Interception mode is immutable for a sandbox/subject lifetime | Must Have |
 | R16 | TLS host selectors include only bindings eligible for HTTPS on canonical port 443 | Must Have |
 | R17 | Every Credential Vault PATCH in credential-bound mode requires `expectedRevision` | Must Have |
-| R18 | The non-default mode uses a capability-gated create route that does not exist on older servers, so unsupported backends cannot silently create an `all`-mode sandbox | Must Have |
+| R18 | Clients verify the runtime-confirmed effective mode after create and fail explicitly on missing or mismatched values | Must Have |
 | R19 | Credential-bound mode rejects legacy arbitrary-regex `ignore_hosts`; operators must use analyzable exact/wildcard pass-through selectors | Must Have |
 
 ## Proposal
@@ -216,7 +216,7 @@ method, path, and any future binding selectors before injecting a credential.
 | Hostname metric labels expose destinations or create high cardinality | Privacy and telemetry cost | Use bounded `mode`, `decision`, `reason`, and `transition` attributes; keep hostname out of metrics |
 | HTTP/2 origin coalescing carries a bound authority over an unbound SNI connection | The request remains opaque and receives no credential | Define the feature as SNI-connection scoped, reject cross-authority requests on decrypted connections, and document that credentialed clients must connect with the bound host as SNI |
 | Live connection tracking exhausts memory | Revision fencing becomes unreliable | Enforce global and per-subject live-connection caps; deny new tracked TLS connections on exhaustion |
-| A new client sends `interceptionMode` to an older server that ignores unknown nested fields | The request silently runs in `all` mode and decrypts unrelated TLS | Never send the new mode to the legacy create route; use a capability-gated route that older servers cannot match |
+| An older server ignores the requested mode | Unrelated TLS may be decrypted before the SDK detects the mismatch | Verify the runtime-confirmed response field, report failure, and require coordinated version upgrades; detection cannot undo startup traffic |
 | A wildcard binding overlaps only one exact hostname matched by static pass-through | Probe-based validation misses the overlap, so credential traffic passes through without injection | Reject legacy regex configuration in the new mode and compare exact/wildcard selector languages directly |
 
 ## Design Details
@@ -290,10 +290,9 @@ CredentialProxyConfig:
 Handwritten SDK models and generated clients expose the same enum using their
 language naming conventions. SDKs omit `interceptionMode` when the caller does
 not explicitly select it, including when the effective value is `all`. Existing
-servers may ignore an unknown nested field in `credentialProxy`, so a minimum
-version string alone is not a safe negotiation mechanism. Callers opting in
-must complete the capability handshake below before sending the create request.
-Old clients continue sending only `enabled` and retain intercept-all behavior.
+servers may ignore unknown nested fields. Clients use the existing
+`POST /v1/sandboxes` route and verify the returned effective mode as described
+below. Old clients continue sending only `enabled`.
 
 The server delivers the chosen create-time mode to the egress runtime as
 operator-owned configuration. Sandbox request `env` cannot override it. Fleet
@@ -302,72 +301,42 @@ process-global environment variable. A runtime that cannot provide the full
 sidecar/fleet, HTTP/1.1, and HTTP/2 contract rejects `credential-bound` at
 admission instead of advertising partial support.
 
-### Capability Negotiation
+### Effective Mode Verification
 
-Add a read-only server capability endpoint:
+Keep the existing create route. Add `credentialProxy.interceptionMode` to
+create and sandbox-get responses as a runtime-confirmed effective value, not a
+copy of the request. The server obtains it from the egress runtime after mode
+initialization and readiness; unsupported or unconfirmed runtime configuration
+must fail creation rather than echo the requested value.
 
-```http
-GET /v1/capabilities
-```
+When requesting `credential-bound`, SDKs must verify the create response
+contains exactly that effective value before returning a usable sandbox handle.
+Missing, unknown, or mismatched values raise `INTERCEPTION_MODE_MISMATCH`.
+Never default a missing response field to the requested mode or silently retry
+with `all`. Apply the same verification when connecting to an existing sandbox
+with an explicit expected mode. Raw API callers have the same responsibility.
 
-```json
-{
-  "capabilities": {
-    "credential-proxy-interception-mode": {
-      "revision": "v1",
-      "values": ["all", "credential-bound"],
-      "createPath": "/v1/sandboxes:credential-bound-v1"
-    }
-  }
-}
-```
+The mismatch error includes the sandbox ID when available so callers can clean
+up the already-created resource. Cleanup is an explicit caller/SDK option;
+failure to delete must retain the ID and report the cleanup failure.
 
-The capability key and revision are protocol identifiers, not display strings.
-A server advertises `credential-proxy-interception-mode/v1` only when its
-server, egress image, runtime provider, sidecar/fleet path, HTTP/1.1 handling,
-and HTTP/2 handling implement the complete contract in this OSEP.
+This is post-creation detection. An older server may start the entrypoint and
+decrypt HTTPS before the SDK receives the response. Reporting an error or
+deleting the sandbox cannot undo that traffic. Document minimum compatible
+server, egress, and SDK versions and require coordinated upgrades of every
+backend serving this mode. Deployments requiring a guarantee before any
+workload traffic must use a verified compatible deployment and keep application
+work gated externally; response verification alone does not provide that
+guarantee.
 
-The advertised path is a fixed protocol constant, not an arbitrary server-
-selected URL. It accepts the same create body as `POST /v1/sandboxes`, requires
-`credentialProxy.enabled=true` and
-`credentialProxy.interceptionMode=credential-bound`, and rejects any other
-mode. Its implementation may delegate internally to the normal create service,
-but it is a distinct HTTP route. Older servers do not define the route, so a
-request routed to an old backend returns 404/405 and cannot create a sandbox.
-There is no fallback from this route to `POST /v1/sandboxes`.
+Implement strict unknown-field rejection on capable servers using
+`extra = "forbid"` for `CredentialProxyConfig`. Although the OpenAPI schema
+already declares `additionalProperties: false`, existing runtime validation
+ignores extras. Enforcing rejection is an observable compatibility tightening:
+previously tolerated unknown fields now fail validation. Document it explicitly.
 
-A gateway or load-balanced deployment advertises the capability only when it
-can route `/v1/sandboxes:credential-bound-v1` exclusively to capable backends.
-During mixed-version rollout or rollback it either keeps that routing guarantee
-or returns 404/503 from the dedicated route; it must never rewrite the request
-to the legacy collection route.
-
-Before sending `interceptionMode: credential-bound`, every SDK and raw API
-caller must query the same API origin and require:
-
-- HTTP 200 from `/v1/capabilities`;
-- capability key `credential-proxy-interception-mode`;
-- exact revision `v1`; and
-- value `credential-bound`; and
-- exact create path `/v1/sandboxes:credential-bound-v1`.
-
-A 404, unavailable endpoint, malformed response, missing key, different
-revision, or missing value fails locally with a capability-not-supported error.
-The client submits the request only to the dedicated path and must not retry it
-against `POST /v1/sandboxes`. Capability results are scoped to the exact API
-origin and may be cached for at most 60 seconds. A stale cache can produce a
-404/503 after rollback, but cannot produce a silently downgraded sandbox because
-the old backend has no matching create route.
-
-Capable servers reject `interceptionMode=credential-bound` on the legacy
-`POST /v1/sandboxes` route with an actionable `USE_CAPABILITY_CREATE_ROUTE`
-error. This prevents capable callers from accidentally bypassing the route
-contract; the dedicated route remains the old-server safety boundary.
-
-Capable servers also set `extra = "forbid"` on `CredentialProxyConfig` and
-reject unknown nested fields. This catches typos and future fields when a
-caller reaches a capable server, but it is defense in depth rather than the
-old-server negotiation mechanism.
+Generic capability negotiation and dedicated per-feature create routes are
+deferred. They require broader motivation and a separate API design.
 
 ### Static Pass-Through Overlap
 
@@ -800,17 +769,12 @@ it does not change traffic.
 - Exact, wildcard, trailing-dot, case, and IDNA SNI matching share Credential
   Vault normalization.
 - `all` mode preserves current decisions.
-- An older server without `/v1/capabilities` causes the client to fail before
-  create; it never receives `interceptionMode`.
-- Capability responses with a missing key, wrong revision, or missing
-  `credential-bound` value or exact create path prevent create.
-- After a capability response is cached, routing the dedicated create request
-  to an older backend returns 404/405 and creates no sandbox; the client never
-  retries the legacy route.
-- A capable legacy create route rejects `interceptionMode=credential-bound`
-  with `USE_CAPABILITY_CREATE_ROUTE`.
-- A capable server rejects unknown `CredentialProxyConfig` fields instead of
-  dropping them.
+- A legacy create response with no effective mode causes an explicit SDK error
+  containing the created sandbox ID; mismatched/unknown modes also fail.
+- The server echoes only the mode confirmed by the runtime, never the request.
+- Cleanup success and failure preserve the mismatch result and resource identity.
+- Unknown request fields are rejected by capable servers; omitted mode retains
+  `all`. Test the previously tolerated-extra-field compatibility change.
 - Credential-bound active-empty and unbound SNI select pass-through.
 - ECH is detected before outer-SNI matching and selects opaque pass-through.
 - Bound SNI selects decryption, then still requires a full HTTP binding match.
@@ -865,10 +829,9 @@ it does not change traffic.
 
 - Docker and Kubernetes sandboxes call one credential-bound model API and one
   unrelated pinned-CA public HTTPS endpoint in the same sandbox.
-- SDKs negotiate `credential-proxy-interception-mode/v1` and use only
-  `/v1/sandboxes:credential-bound-v1`; a legacy backend creates zero sandboxes
-  for the new mode even after a stale capability cache or mixed-version route
-  change.
+- Exercise new and legacy server responses through the existing create route.
+  Verify mismatch detection and cleanup, and demonstrate that entrypoint traffic
+  may precede detection so no pre-creation safety guarantee is claimed.
 - The model API is decrypted and credentialed; the unrelated endpoint is
   pass-through and does not require the OpenSandbox CA.
 - In fleet mode, the same destination decrypts for a subject with a binding and
@@ -961,15 +924,10 @@ paths.
    public lifecycle field.
 2. Ship dry-run telemetry and acknowledgement prerequisites without changing
    traffic.
-3. After sidecar, fleet, HTTP/1.1, and HTTP/2 parity passes, add the enum to the
-   lifecycle spec, the `/v1/capabilities` contract, and all SDKs. SDKs omit the
-   field unless the caller explicitly selects `credential-bound`, and refuse to
-   send it until the same API origin advertises
-   `credential-proxy-interception-mode/v1` with the fixed
-   `/v1/sandboxes:credential-bound-v1` path. They never retry that path against
-   legacy `POST /v1/sandboxes`. Release documentation still records minimum
-   compatible server, egress, and SDK versions for operators, but version
-   documentation does not replace the route-bound handshake.
+3. After sidecar, fleet, HTTP/1.1, and HTTP/2 parity passes, align the lifecycle
+   request/response schema, server runtime confirmation, and all SDKs on the
+   existing create route. Document minimum versions, coordinated upgrades,
+   effective-mode verification, and its post-creation detection limitation.
 4. Enable `credential-bound` only when explicitly requested and only on
    runtimes that implement the complete contract; reject unsupported
    extra-port or pool/fleet combinations instead of degrading silently.
@@ -977,11 +935,14 @@ paths.
    explicit empty revision, before TLS egress is released in this mode.
 6. Document that every `PATCH /credential-vault` request in this mode must
    include the existing `expectedRevision`; callers can obtain it from `GET
-   /credential-vault`.
+   /credential-vault`. SDK documentation must explicitly distinguish this
+   requirement from optional preconditions in `all` mode.
 7. Keep current regex `ignore_hosts`, CA setup, and `all` behavior unchanged for
    existing deployments. Before enabling `credential-bound`, migrate intended
    static bypass entries to the exact/wildcard
    `OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS` list; the new mode rejects a
    non-empty legacy regex list.
-8. Do not change the default in this OSEP. A future default change requires
+8. Release notes must call out strict unknown-field rejection as a runtime
+   compatibility tightening, even though the OpenAPI schema was already closed.
+9. Do not change the default in this OSEP. A future default change requires
    usage data, addon compatibility evidence, and a separate migration plan.
