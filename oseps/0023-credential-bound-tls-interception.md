@@ -7,7 +7,7 @@ last-updated: 2026-09-08
 status: draft
 ---
 
-# OSEP-0024: Credential-Bound TLS Interception
+# OSEP-0023: Credential-Bound TLS Interception
 
 Tracking issue: [#1713](https://github.com/opensandbox-group/OpenSandbox/issues/1713)
 
