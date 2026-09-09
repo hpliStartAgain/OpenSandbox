@@ -93,6 +93,9 @@ compatible with Istio or preserve Credential Vault injection.
 | R8 | The same listener, route, or cluster configuration has a single owner. |
 | R9 | Supported runtime, address-family, and protocol limits are explicit and tested. |
 | R10 | Optional-backend failure does not silently switch to another backend. |
+| R11 | Runtime effective-policy changes include Envoy in the commit gate; no mutation succeeds while a required enforcement layer remains stale. |
+| R12 | Capture-loop exemptions identify trusted proxy traffic through a mechanism the application cannot forge; numeric UID equality alone is insufficient. |
+| R13 | Milestone 1 rejects nonempty extra-interception-port configuration with Envoy at admission and startup instead of silently limiting capture to 80/443. |
 
 ## Proposal
 
@@ -140,7 +143,8 @@ ownership, and startup/termination sequencing all need implementation and tests.
 
 | Risk | Mitigation / gate |
 |---|---|
-| Capture loops or bypass | One capture owner; explicit UID/mark exemptions; preserve and test DNS/nft policy. |
+| Capture loops or bypass | One capture owner; application-unforgeable mark/cgroup-based exemptions; preserve and test DNS/nft policy. |
+| Runtime policy accepted with stale L7 rules | Serialize effective-policy changes and require DNS/network/Envoy commit confirmation before success. |
 | Proxy crashes after rules are installed | Gate traffic and readiness during recovery; do not fall back to direct access. |
 | Loss of Vault behavior | Reject unsupported Envoy/Vault combinations before readiness and at runtime mutation boundaries. |
 | Broader policy than requested | Reject unsupported policy forms; test authority, SNI, and original-destination handling. |
@@ -158,10 +162,62 @@ admin/debug interfaces from sandbox application code.
 
 Start from a pinned Envoy build and a minimal local bootstrap. Validate supported
 filters and configuration before activating capture. A malformed startup config
-must prevent readiness. If configuration reload is implemented, a failed update
-must retain a safe previous state or deny traffic; it must not advertise the
-failed configuration as active. Multi-resource xDS ACKs are not assumed to be
-an atomic policy transaction.
+must prevent readiness. Runtime policy synchronization is mandatory for a usable
+milestone-1 backend, even if arbitrary operator bootstrap reload is not offered.
+A failed update must retain a safe previous state or deny traffic; it must not
+advertise the failed configuration as active. Multi-resource xDS ACKs are not
+assumed to be an atomic policy transaction.
+
+### Runtime policy mutation commit gate
+
+All effective-policy changes, including `POST`, `PUT`, `PATCH`, and `DELETE`
+on `/policy` and supported always-rule reloads, must use one serialized update
+path for the sandbox. Preserve existing rule precedence. Compute the proposed
+effective policy and the required DNS, network, and Envoy changes before making
+the candidate authoritative.
+
+The implementation must fence affected traffic during a non-atomic transition,
+install the candidate in every required enforcement layer, and confirm Envoy
+has applied its policy before committing the logical revision or returning
+success. This requirement applies in both `dns` and `dns+nft` modes; DNS cache
+expiry or nft connection/lease windows cannot substitute for Envoy confirmation.
+`GET /policy` must not report an uncommitted candidate as the active policy.
+
+For allow-to-deny changes, the success boundary must prevent new forbidden HTTP
+requests, including requests on existing keep-alive/HTTP2 connections, from
+using the retired policy. Newly forbidden opaque TLS/TCP flows must be closed
+before reporting the change applied; previously admitted HTTP requests need an
+explicit bounded drain rule rather than an indefinite old-policy exception.
+DNS/nft and Envoy update order alone does not provide these guarantees.
+
+If any required application, ACK, or verification fails, return a failed
+mutation and restore the last committed policy coherently. If coherent recovery
+cannot be established, keep affected traffic denied and readiness false until
+state is reconciled. Never acknowledge a DNS-only update while Envoy is stale.
+An early development slice without this coordination must reject runtime
+mutations before changing any layer and must not be advertised as the usable
+milestone-1 backend.
+
+### Application-unforgeable capture exemptions
+
+A sandbox application can run with the same numeric UID as Envoy. Because the
+network namespace is shared, a UID-only `OUTPUT` exemption would also exempt
+that application. It is therefore not an acceptable L7 isolation boundary.
+
+Use a trusted socket/packet-mark or process-cgroup-based mechanism whose origin
+the application cannot forge. Its implementation must prevent application code
+from setting the reserved mark, joining the proxy's exempt cgroup, or changing
+the capture rules. Depending on the kernel, [socket mark setting](https://man7.org/linux/man-pages/man7/socket.7.html)
+may be available via
+`CAP_NET_ADMIN` or `CAP_NET_RAW`; privileges, writable cgroup interfaces, and
+other mark-setting paths must be accounted for, not just the default UID.
+Mark/cgroup identifiers by themselves are not proof of trust.
+
+Validate the required kernel/runtime support and application privilege boundary
+before readiness; reject an unsupported profile rather than fall back to UID
+trust. Restrict exemptions to trusted proxy-originated traffic and retain final
+DNS/network policy enforcement. Test an application using Envoy's exact UID,
+attempts to forge the exemption, and normal proxy egress without capture loops.
 
 Capture initially covers canonical HTTP/HTTPS ports 80/443. Define the IPv4 and
 IPv6 handling explicitly; an IPv4-only implementation must reject unsupported
@@ -181,6 +237,15 @@ Existing mitmproxy scripts are not automatically translated into Envoy filters.
 Operator configurations that require them must remain on mitmproxy or receive
 an explicit incompatibility error when selecting Envoy.
 
+Milestone 1 also rejects a nonempty
+`OPENSANDBOX_EGRESS_MITMPROXY_EXTRA_PORTS` setting when Envoy is selected,
+including a request to capture port 8443. Validate this at server admission and
+again at backend startup for configurations supplied outside that path. An
+unset or empty setting leaves canonical 80/443 capture unchanged. Do not accept
+the setting and silently ignore its requested ports; extra-port support needs
+a separately implemented and tested capability. Existing mitmproxy extra-port
+behavior remains unchanged.
+
 Do not conflate selecting an L7 backend with selecting the interception modes
 in [OSEP-0023](0023-credential-bound-tls-interception.md). That proposal's
 credential-bound behavior is a later compatibility requirement for a
@@ -192,7 +257,8 @@ Vault-capable Envoy backend, not a behavior implemented by opaque forwarding.
    boundaries, and the smallest implementation slice. No runtime changes.
 2. **Milestone 1: usable optional Envoy L7 backend.** Implement selection and
    validation, lifecycle/configuration, single capture ownership, basic HTTP
-   policy, HTTPS passthrough, readiness, and fail-closed recovery. These can be
+   policy, HTTPS passthrough, coordinated runtime policy updates, unforgeable
+   capture exemptions, readiness, and fail-closed recovery. These can be
    split into dependent implementation PRs, but the backend is not advertised
    as usable until the complete gate passes. Coordinate overlapping work with
    #1221's author rather than silently taking over that branch.
@@ -239,15 +305,30 @@ proposal-only PR.
 - Default-omitted behavior and existing mitmproxy/DNS/nft tests remain unchanged.
 - Selection validation and explicit rejection of Vault/addon incompatibilities,
   including runtime mutation attempts.
+- Envoy plus nonempty extra ports (including 8443) fails at admission and direct
+  startup; unset/empty values preserve canonical capture, and mitmproxy behavior
+  is unchanged.
 - Fixed HTTP targets with positive/negative host policy and original-destination
   checks; no policy-bypassing rewrites.
 - Opaque HTTPS responses with normal client certificate verification; SNI-required
   policy rejects missing or mismatched information without treating it as HTTP
   credential authorization.
-- Capture ordering, UID/mark exemptions, DNS resolution, private/network-denied
-  destinations, address-family restrictions, and no forwarding loops.
+- Capture ordering and unforgeable mark/cgroup exemptions: an application using
+  Envoy's UID still traverses L7 checks and cannot forge the reserved mark, join
+  the exempt cgroup, or edit redirects. Unsupported privilege/runtime profiles
+  fail explicitly, and legitimate proxy traffic does not loop.
+- DNS resolution, private/network-denied destinations, and address-family
+  restrictions remain enforced.
+- Each `/policy` mutation method and supported always-rule reload participates
+  in the shared commit path. Test allow-to-deny with warm DNS caches and live
+  connections in both `dns` and `dns+nft` modes, including new HTTP requests on
+  old connections and opaque TLS flow closure before success.
+- Inject delayed/missing Envoy ACK, partial network updates, concurrent policy
+  mutations, and failed rollback. Verify failed mutations do not publish the
+  candidate, restore coherent committed state or stay deny/unready, and never
+  leave DNS/network and Envoy accepting different effective policy revisions.
 - Startup config rejection, proxy crash/restart, shutdown, and recovery without
-  an unintended direct-egress window. Reload/NACK cases where reload is offered.
+  an unintended direct-egress window, including runtime policy NACK handling.
 - Fresh creation, Pool template creation, and replacement; snapshot/restore must
   reinitialize ephemeral proxy/capture state safely.
 - Explicit runtime compatibility results. Do not infer gVisor, Kata, or fleet
