@@ -3,7 +3,7 @@ title: Credential-Bound TLS Interception
 authors:
   - "@hpliStartAgain"
 creation-date: 2026-09-04
-last-updated: 2026-09-08
+last-updated: 2026-09-09
 status: draft
 ---
 
@@ -720,6 +720,13 @@ not consistent with the verified connection destination/SNI, even when the
 certificate covers both names. Clients that require injection must open the
 connection with the credential-bound host as SNI.
 
+User-facing guides and SDK examples must make the connection-pool behavior
+explicit: install bindings before starting credential-dependent requests, and
+reconnect or recycle the relevant connection pool after adding a binding for a
+previously unbound host. A new HTTP/2 stream on an existing opaque TLS
+connection is not a new TLS connection and cannot receive injection. Binding
+acknowledgement does not imply that existing pooled connections are credentialed.
+
 IP-literal credential binding remains invalid. DNS and nftables policy remain
 the network-reachability authority, including for pass-through traffic.
 
@@ -728,6 +735,25 @@ the network-reachability authority, including for pass-through traffic.
 This mode reduces the plaintext visible to the trusted egress proxy and its
 operator-controlled addons. It does not make the egress sidecar untrusted, hide
 destinations from network policy, or provide end-to-end TLS for bound hosts.
+
+For unbound HTTPS, HTTP inspection addons cannot read headers, URL paths, or
+bodies, perform content-based data loss prevention (DLP), or generate
+request/response-level application audit records. DNS and network-policy
+enforcement remain in place, but network metadata and TLS-decision telemetry
+do not replace application-level inspection or auditing. Documentation must
+distinguish this intentional loss of visibility from an addon malfunction.
+
+Deployments that require such inspection should select `interceptionMode: all`
+and configure the trusted platform admission layer to reject incompatible mode
+requests where inspection is mandatory. The caller-selected enum alone is not
+an enforcement mechanism for an operator's mandatory inspection policy. The
+implementation documentation must identify how each supported deployment
+enforces that restriction before recommending it for this purpose.
+
+`all` remains subject to its interception scope and protocol support; it does
+not guarantee universal coverage of no-SNI, ECH, QUIC, or explicitly bypassed
+traffic. Operators must evaluate these exceptions against their inspection
+requirements. This OSEP does not add a DLP engine or fill those coverage gaps.
 
 Security invariants:
 
@@ -850,6 +876,14 @@ it does not change traffic.
 - Adding the first binding leaves an existing opaque connection uncredentialed;
   after ACK a fresh TLS decision decrypts and injects on matching requests.
   Test handshake-admission races across the cutover.
+- Reuse an opaque HTTP/2 connection after host-add ACK: new streams remain
+  uncredentialed, while reconnecting with bound SNI enables injection. Exercise
+  the connection-pool recycling procedure documented in the SDK examples.
+- With an inspection test addon, verify unbound HTTPS exposes no HTTP headers,
+  paths, bodies, or request/response audit events in credential-bound mode.
+  Compare with `all` for supported, non-bypassed TLS and verify network-policy
+  denial still applies in both modes. Test the documented platform restriction
+  against incompatible caller-selected modes where inspection is mandatory.
 - Removing the final binding prevents new injection, drains HTTP/1.1 and HTTP/2
   connections, and makes the next connection pass through.
 - Credential-only replacement keeps the TLS connection but switches new
@@ -945,6 +979,14 @@ cannot undo TLS decryption that already occurred.
 This would silently remove L7 visibility from operator addons and change
 certificate behavior for existing sandboxes. The proposal uses an opt-in and
 requires separate evidence before any future default change.
+
+Credential-bound interception may be a suitable future default for deployments
+whose primary purpose is credential injection. Any default change requires
+implementation and performance results, addon compatibility evidence, explicit
+operator communication, and a migration plan that prevents silent loss of
+required inspection coverage. Preserve an explicit `all` option even if the
+default changes. This OSEP keeps the current default and leaves that decision
+to a future proposal.
 
 ### Track Every Opaque Connection and Close on Host Add
 
