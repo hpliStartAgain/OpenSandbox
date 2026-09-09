@@ -15,6 +15,7 @@
 import pytest
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
+from typing import cast
 from unittest.mock import MagicMock, patch
 from fastapi import HTTPException
 
@@ -362,6 +363,7 @@ class TestKubernetesSandboxServiceCreate:
             image="opensandbox/egress:v1.1.7",
             disable_ipv6=False,
             requests={"cpu": "25m"},
+            otlp_endpoint="http://otel-collector.observability:4318",
         )
         k8s_service.workload_provider.create_workload.return_value = {
             "name": "test-id", "uid": "uid-1"
@@ -387,6 +389,9 @@ class TestKubernetesSandboxServiceCreate:
         assert egress_settings.disable_ipv6 is False
         assert egress_settings.resource_requests == {"cpu": "25m"}
         assert egress_settings.resource_limits is None
+        assert (
+            egress_settings.otlp_endpoint == "http://otel-collector.observability:4318"
+        )
         assert egress_settings.env == {"OPENSANDBOX_EGRESS_LOG_LEVEL": "debug"}
         assert kwargs["env"] == {"SANDBOX_ENV": "value"}
         assert "network_policy" not in kwargs
@@ -935,6 +940,47 @@ class TestWaitForSandboxReady:
         result = await k8s_service._wait_for_sandbox_ready("test-sandbox-id", timeout_seconds=10)
         
         assert result == mock_workload
+
+    @pytest.mark.asyncio
+    async def test_wait_fails_immediately_for_terminal_pod(self, k8s_service, mock_workload):
+        clock = SimpleNamespace(now=0.0)
+
+        async def advance_clock(seconds: float) -> None:
+            clock.now += seconds
+
+        k8s_service.workload_provider.get_workload.return_value = mock_workload
+        k8s_service.workload_provider.get_status.return_value = {
+            "state": "Failed",
+            "reason": "FAILED",
+            "message": (
+                "1/1 observed pods failed; primary reason=InitContainerFailed; "
+                "sample pod=sandbox-0"
+            ),
+            "last_transition_at": datetime.now(timezone.utc),
+        }
+
+        with (
+            patch(
+                "opensandbox_server.services.k8s.kubernetes_service.time.time",
+                side_effect=lambda: clock.now,
+            ),
+            patch(
+                "opensandbox_server.services.k8s.kubernetes_service.asyncio.sleep",
+                new=advance_clock,
+            ),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await k8s_service._wait_for_sandbox_ready(
+                "test-sandbox-id",
+                timeout_seconds=600,
+                poll_interval_seconds=1,
+            )
+
+        assert exc_info.value.status_code == 500
+        detail = cast(dict[str, str], exc_info.value.detail)
+        assert detail["code"] == SandboxErrorCodes.K8S_POD_FAILED
+        assert "InitContainerFailed" in detail["message"]
+        assert k8s_service.workload_provider.get_status.call_count == 1
     
     @pytest.mark.asyncio
     async def test_wait_timeout_raises_exception(self, k8s_service, mock_workload):
@@ -1134,6 +1180,84 @@ class TestWaitForSandboxReady:
         )
 
         assert result == mock_workload
+
+    @pytest.mark.asyncio
+    async def test_wait_fails_fast_when_quota_admission_rejects_pod(self, k8s_service, mock_workload):
+        """ResourceQuota admission rejection surfaces as 403 QUOTA_EXCEEDED instead of blind-waiting to timeout."""
+        k8s_service.workload_provider.get_workload.return_value = mock_workload
+        k8s_service.workload_provider.get_status.return_value = {
+            "state": "Pending",
+            "reason": "ReconcilerError",
+            "message": (
+                'Error seen: pods "test-sandbox-id" is forbidden: exceeded quota: '
+                "sandbox-quota, requested: requests.cpu=1, used: requests.cpu=0, "
+                "limited: requests.cpu=10m"
+            ),
+            "last_transition_at": datetime.now(timezone.utc),
+        }
+
+        with pytest.raises(HTTPException) as exc_info:
+            await k8s_service._wait_for_sandbox_ready(
+                "test-sandbox-id",
+                timeout_seconds=10,
+                poll_interval_seconds=0.1,
+            )
+
+        assert exc_info.value.status_code == 403
+        assert exc_info.value.detail["code"] == SandboxErrorCodes.K8S_QUOTA_EXCEEDED
+        assert "exceeded quota" in exc_info.value.detail["message"]
+
+    @pytest.mark.asyncio
+    async def test_wait_keeps_polling_for_non_quota_reconciler_error(self, k8s_service, mock_workload):
+        """ReconcilerError without quota text (transient controller error) must keep polling."""
+        status_sequence = [
+            {
+                "state": "Pending",
+                "reason": "ReconcilerError",
+                "message": "Error seen: unable to create pod: transient API server hiccup",
+                "last_transition_at": datetime.now(timezone.utc),
+            },
+            {
+                "state": "Running",
+                "reason": "",
+                "message": "Running",
+                "last_transition_at": datetime.now(timezone.utc),
+            },
+        ]
+        k8s_service.workload_provider.get_workload.return_value = mock_workload
+        k8s_service.workload_provider.get_status.side_effect = status_sequence
+
+        result = await k8s_service._wait_for_sandbox_ready(
+            "test-sandbox-id",
+            timeout_seconds=10,
+            poll_interval_seconds=0.1,
+        )
+
+        assert result == mock_workload
+
+    @pytest.mark.asyncio
+    async def test_create_sandbox_quota_403_fails_fast_with_quota_error(
+        self, k8s_service, create_sandbox_request
+    ):
+        """Sync count-quota 403 on CR create maps to 403 QUOTA_EXCEEDED (not 500), rollback preserved."""
+        from kubernetes.client import ApiException
+
+        api_exc = ApiException(status=403, reason="Forbidden")
+        api_exc.body = (
+            '{"kind":"Status","status":"Failure","message":'
+            '"sandboxes.agents.x-k8s.io \\"test-sandbox\\" is forbidden: '
+            'exceeded quota: sandbox-quota, requested: count/sandboxes.agents.x-k8s.io=1, '
+            'used: 10, limited: 10"}'
+        )
+        k8s_service.workload_provider.create_workload.side_effect = api_exc
+
+        with pytest.raises(HTTPException) as exc_info:
+            await k8s_service.create_sandbox(create_sandbox_request)
+
+        assert exc_info.value.status_code == 403
+        assert exc_info.value.detail["code"] == SandboxErrorCodes.K8S_QUOTA_EXCEEDED
+        assert "exceeded quota" in exc_info.value.detail["message"]
+        k8s_service.workload_provider.delete_workload.assert_called_once()
 
 class TestKubernetesSandboxServiceRenew:
     def test_renew_expiration_rejects_manual_cleanup_sandbox(self, k8s_service):

@@ -17,7 +17,6 @@ package runtime
 import (
 	"fmt"
 	"io"
-	"os"
 	"time"
 )
 
@@ -94,7 +93,7 @@ func (c *Controller) SeekBackgroundCommandOutput(session string, cursor int64) (
 		return nil, -1, fmt.Errorf("cursor cannot be negative")
 	}
 
-	file, err := os.Open(kernel.stdoutPath)
+	file, err := openCommandOutputForRead(kernel.stdoutPath)
 	if err != nil {
 		return nil, -1, fmt.Errorf("error open combined output file for command %s: %w", session, err)
 	}

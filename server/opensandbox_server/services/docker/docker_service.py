@@ -71,8 +71,11 @@ from opensandbox_server.services.docker.networking import (
 from opensandbox_server.services.docker.container_ops import DockerContainerOpsMixin
 from opensandbox_server.services.docker.metadata import DockerMetadataStore
 from opensandbox_server.services.docker.port_allocator import (
+    MAX_PORT_PUBLISH_ATTEMPTS,
     allocate_port_bindings,
+    is_port_publish_error,
     normalize_port_bindings,
+    release_port_bindings,
 )
 from opensandbox_server.services.windows_common import (
     inject_windows_resource_limits_env,
@@ -663,6 +666,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         )
         self._ensure_secure_access_support(request)
         self._ensure_network_policy_support(request)
+        resource_limits = self._prepare_resource_limits(request)
         self._validate_network_exists()
 
         try:
@@ -684,7 +688,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         def _run() -> None:
             try:
                 result = self._provision_sandbox(
-                    sandbox_id, request, created_at, expires_at,
+                    sandbox_id, request, created_at, expires_at, resource_limits,
                     pvc_inspect_cache, auto_created_volumes,
                     sandbox_env=sandbox_env, egress_env=egress_env,
                 )
@@ -707,12 +711,24 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 },
             ) from e
 
+    def _prepare_resource_limits(
+        self, request: CreateSandboxRequest
+    ) -> tuple[Optional[int], Optional[int], Optional[int]]:
+        """Validate platform resource limits and return outer Docker limits."""
+        if is_windows_platform(request.platform):
+            validate_windows_resource_limits(
+                (request.resource_limits.root if request.resource_limits else None) or {}
+            )
+            return None, None, None
+        return self._resolve_resource_limits(request)
+
     def _provision_sandbox(
         self,
         sandbox_id: str,
         request: CreateSandboxRequest,
         created_at: datetime,
         expires_at: Optional[datetime],
+        resource_limits: tuple[Optional[int], Optional[int], Optional[int]],
         pvc_inspect_cache: Optional[dict[str, dict]] = None,
         auto_created_volumes: Optional[list[str]] = None,
         sandbox_env: Optional[Dict[str, Optional[str]]] = None,
@@ -727,7 +743,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 auto_created_volumes, separators=(",", ":"),
             )
         image_uri, auth_config = self._resolve_image_auth(request, sandbox_id)
-        mem_limit, nano_cpus, gpu_count = self._resolve_resource_limits(request)
+        mem_limit, nano_cpus, gpu_count = resource_limits
         egress_token: Optional[str] = None
         requested_windows_profile = is_windows_platform(request.platform)
 
@@ -751,7 +767,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             egress_env = {}
 
         if requested_windows_profile:
-            validate_windows_resource_limits((request.resource_limits.root if request.resource_limits else None) or {})
             validate_windows_runtime_prerequisites()
 
         # Prepare OSSFS mounts first so binds can reference mounted host paths.
@@ -763,6 +778,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             )
 
         sidecar_container = None
+        reserved_port_bindings: dict[str, tuple[str, int]] = {}
         runtime_volume_name: Optional[str] = None
         try:
             # For dockur/windows profile, resourceLimits are translated to
@@ -814,6 +830,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 egress_token = generate_egress_token()
                 labels[SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY] = egress_token
                 sidecar_port_bindings = allocate_port_bindings([*exposed_ports, "18080"], min_port=self.app_config.docker.port_range_min, max_port=self.app_config.docker.port_range_max)
+                reserved_port_bindings = sidecar_port_bindings
                 host_execd_port = sidecar_port_bindings["44772"][1]
                 host_http_port = sidecar_port_bindings["8080"][1]
                 egress_api_binding = sidecar_port_bindings.get("18080")
@@ -857,6 +874,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 )
                 if self.network_mode != HOST_NETWORK_MODE:
                     port_bindings = allocate_port_bindings(exposed_ports, min_port=self.app_config.docker.port_range_min, max_port=self.app_config.docker.port_range_max)
+                    reserved_port_bindings = port_bindings
                     host_execd_port = port_bindings["44772"][1]
                     host_http_port = port_bindings["8080"][1]
                     host_config_kwargs["port_bindings"] = normalize_port_bindings(port_bindings)
@@ -913,16 +931,61 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     sandbox_id,
                 )
 
-            created_container = self._create_and_start_container(
-                sandbox_id,
-                image_uri,
-                request.entrypoint,
-                labels,
-                environment,
-                host_config_kwargs,
-                container_exposed_ports,
-                request.platform,
-            )
+            if self.network_mode != HOST_NETWORK_MODE and request.network_policy is None:
+                for attempt in range(MAX_PORT_PUBLISH_ATTEMPTS):
+                    try:
+                        created_container = self._create_and_start_container(
+                            sandbox_id,
+                            image_uri,
+                            request.entrypoint,
+                            labels,
+                            environment,
+                            host_config_kwargs,
+                            container_exposed_ports,
+                            request.platform,
+                        )
+                        break
+                    except Exception as exc:
+                        if (
+                            attempt + 1 < MAX_PORT_PUBLISH_ATTEMPTS
+                            and is_port_publish_error(exc)
+                        ):
+                            logger.warning(
+                                "sandbox %s: container start failed due to host port conflict: %s. "
+                                "Retrying with fresh ports (attempt %d/%d)...",
+                                sandbox_id,
+                                exc,
+                                attempt + 1,
+                                MAX_PORT_PUBLISH_ATTEMPTS,
+                            )
+                            if reserved_port_bindings:
+                                release_port_bindings(reserved_port_bindings)
+                                reserved_port_bindings = {}
+
+                            port_bindings = allocate_port_bindings(
+                                exposed_ports,
+                                min_port=self.app_config.docker.port_range_min,
+                                max_port=self.app_config.docker.port_range_max,
+                            )
+                            reserved_port_bindings = port_bindings
+                            host_execd_port = port_bindings["44772"][1]
+                            host_http_port = port_bindings["8080"][1]
+                            host_config_kwargs["port_bindings"] = normalize_port_bindings(port_bindings)
+                            labels[SANDBOX_EMBEDDING_PROXY_PORT_LABEL] = str(host_execd_port)
+                            labels[SANDBOX_HTTP_PORT_LABEL] = str(host_http_port)
+                            continue
+                        raise
+            else:
+                created_container = self._create_and_start_container(
+                    sandbox_id,
+                    image_uri,
+                    request.entrypoint,
+                    labels,
+                    environment,
+                    host_config_kwargs,
+                    container_exposed_ports,
+                    request.platform,
+                )
         except Exception:
             if sidecar_container is not None:
                 try:
@@ -936,6 +999,9 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             self._release_ossfs_mounts(ossfs_mount_keys)
             self._cleanup_managed_volumes(sandbox_id, auto_created_volumes or [])
             raise
+        finally:
+            if reserved_port_bindings:
+                release_port_bindings(reserved_port_bindings)
 
         status_info = SandboxStatus(
             state="Running",

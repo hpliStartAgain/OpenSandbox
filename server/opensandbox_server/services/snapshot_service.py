@@ -44,7 +44,9 @@ from opensandbox_server.services.constants import SnapshotErrorCodes
 from opensandbox_server.services.snapshot_runtime import (
     NoopSnapshotRuntime,
     SnapshotRuntime,
+    SnapshotRuntimePreflightError,
     SnapshotRuntimeStatus,
+    SnapshotRuntimeUnsupportedError,
 )
 from opensandbox_server.services.snapshot_runtime_factory import create_snapshot_runtime
 from opensandbox_server.services.snapshot_models import (
@@ -117,6 +119,14 @@ class PersistedSnapshotService(SnapshotService):
 
     def create_snapshot(self, sandbox_id: str, request: CreateSnapshotRequest) -> Snapshot:
         sandbox = self._sandbox_service.get_sandbox(sandbox_id)
+        if sandbox_id.startswith("flt-"):
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail={
+                    "code": "SNAPSHOT::NOT_IMPLEMENTED",
+                    "message": "Fleets does not support sandbox snapshots.",
+                },
+            )
         self._ensure_source_sandbox_running(sandbox)
 
         if not self._snapshot_runtime.supports_create_snapshot():
@@ -128,11 +138,34 @@ class PersistedSnapshotService(SnapshotService):
                 },
             )
 
+        namespace = self._get_tenant_namespace()
+        try:
+            self._snapshot_runtime.preflight_create_snapshot(
+                sandbox_id,
+                namespace=namespace,
+            )
+        except SnapshotRuntimeUnsupportedError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": SnapshotErrorCodes.UNSUPPORTED_RUNTIME,
+                    "message": str(exc),
+                },
+            ) from exc
+        except SnapshotRuntimePreflightError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": SnapshotErrorCodes.RUNTIME_PREFLIGHT_FAILED,
+                    "message": str(exc),
+                },
+            ) from exc
+
         now = datetime.now(timezone.utc)
         record = SnapshotRecord(
             id=str(uuid4()),
             source_sandbox_id=sandbox_id,
-            namespace=self._get_tenant_namespace(),
+            namespace=namespace,
             name=request.name,
             restore_config=self._default_restore_config(),
             status=SnapshotStatusRecord(
