@@ -179,6 +179,33 @@ class UpstreamProxyConfigTest(unittest.TestCase):
             addon.http_connect_upstream(flow)
             self.assertNotIn("Proxy-Authorization", flow.request.headers)
 
+    def test_eager_strategy_fails_load(self) -> None:
+        with _env(**{UPSTREAM_ENV: "http://proxy.example.com:3128"}):
+            addon = _load_addon()
+            addon.ctx.options.connection_strategy = "eager"
+            with self.assertRaises(ValueError):
+                addon.load(types.SimpleNamespace())
+
+    def test_passthrough_lists_fail_load(self) -> None:
+        for opt in ("ignore_hosts", "tcp_hosts", "udp_hosts"):
+            with _env(**{UPSTREAM_ENV: "http://proxy.example.com:3128"}):
+                addon = _load_addon()
+                setattr(addon.ctx.options, opt, [".*"])
+                with self.assertRaises(ValueError, msg=opt):
+                    addon.load(types.SimpleNamespace())
+
+    def test_tls_clienthello_sets_via(self) -> None:
+        # Anchors via on the server placeholder at ClientHello time, before
+        # requestheaders — keeps TLS-intercepted flows chained even if a server
+        # connection were ever established early.
+        with _env(**{UPSTREAM_ENV: "https://proxy.example.com:8443"}):
+            addon = _load_addon()
+            addon.load(types.SimpleNamespace())
+            server = _Server(("93.184.216.34", 443))
+            data = types.SimpleNamespace(context=types.SimpleNamespace(server=server))
+            addon.tls_clienthello(data)
+            self.assertEqual(("https", ("proxy.example.com", 8443)), server.via)
+
 
 class UpstreamProxyFailClosedTest(unittest.TestCase):
     """server_connect must refuse any direct dial while chaining is on."""

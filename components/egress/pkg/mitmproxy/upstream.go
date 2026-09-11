@@ -37,21 +37,30 @@ type UpstreamProxySpec struct {
 // Loaded after system.py and before user addons when chaining is enabled.
 const upstreamProxyScriptPath = "/var/egress/mitmscripts/upstream_proxy.py"
 
+// UpstreamProxyFromEnv parses OPENSANDBOX_EGRESS_UPSTREAM_PROXY. It returns
+// (nil, nil) when the env is unset and an error when the configuration is
+// inconsistent (bad URL, or _AUTH without _PROXY).
+func UpstreamProxyFromEnv() (*UpstreamProxySpec, error) {
+	raw := strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxy))
+	if raw == "" {
+		if strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxyAuth)) != "" {
+			return nil, fmt.Errorf("%s is set but %s is empty", constants.EnvUpstreamProxyAuth, constants.EnvUpstreamProxy)
+		}
+		return nil, nil
+	}
+	spec, err := parseUpstreamProxy(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", constants.EnvUpstreamProxy, err)
+	}
+	return &spec, nil
+}
+
 // validateUpstreamProxyEnv fails fast on inconsistent chained-proxy env
 // configuration, before mitmdump is spawned: the addon cannot fix a bad spec
 // at runtime, and a silent fallback to direct egress would be a policy hole.
 func validateUpstreamProxyEnv() error {
-	raw := strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxy))
-	if raw == "" {
-		if strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxyAuth)) != "" {
-			return fmt.Errorf("%s is set but %s is empty", constants.EnvUpstreamProxyAuth, constants.EnvUpstreamProxy)
-		}
-		return nil
-	}
-	if _, err := parseUpstreamProxy(raw); err != nil {
-		return fmt.Errorf("%s: %w", constants.EnvUpstreamProxy, err)
-	}
-	return nil
+	_, err := UpstreamProxyFromEnv()
+	return err
 }
 
 // parseUpstreamProxy parses "scheme://host[:port]" into a spec. The port

@@ -131,11 +131,22 @@ def load(loader) -> None:
     )
 
 
-def _set_via(flow: http.HTTPFlow) -> None:
-    conn = getattr(flow, "server_conn", None)
+def _set_via_on_conn(conn) -> None:
     if conn is None or getattr(conn, "connected", False):
         return
     conn.via = _via
+
+
+def _set_via(flow: http.HTTPFlow) -> None:
+    _set_via_on_conn(getattr(flow, "server_conn", None))
+
+
+def tls_clienthello(data) -> None:
+    # Anchor via on the (not yet connected) server placeholder while the client
+    # TLS hello is parsed — the earliest point a server connection object
+    # exists for an intercepted TLS flow.
+    if _via is not None:
+        _set_via_on_conn(getattr(data.context, "server", None))
 
 
 def requestheaders(flow: http.HTTPFlow) -> None:
