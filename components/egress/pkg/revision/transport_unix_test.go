@@ -122,6 +122,22 @@ func TestUnixTransportRoundTripContract(t *testing.T) {
 	require.Equal(t, identity, ack)
 }
 
+func TestUnixTransportEncodesZeroLengthPayloadAsBase64String(t *testing.T) {
+	var encoded json.RawMessage
+	path := startUnixHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]json.RawMessage
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		encoded = request["payload"]
+		identity := testIdentity()
+		writeTestAck(t, w, &identity)
+	}))
+	transport, err := NewUnixTransport(path, testSessionToken, 1)
+	require.NoError(t, err)
+	_, err = transport.Prepare(context.Background(), testIdentity(), nil)
+	require.NoError(t, err)
+	require.JSONEq(t, `""`, string(encoded))
+}
+
 func TestUnixTransportDoesNotFollowRedirects(t *testing.T) {
 	requests := 0
 	path := startUnixHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

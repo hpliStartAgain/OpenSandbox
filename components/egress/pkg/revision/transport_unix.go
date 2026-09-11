@@ -189,6 +189,9 @@ func (t *UnixTransport) Prepare(ctx context.Context, revision Identity, payload 
 	if len(payload) > t.limit {
 		return Identity{}, ErrInvalidTransport
 	}
+	if len(payload) == 0 {
+		payload = []byte{}
+	}
 	return t.command(ctx, http.MethodPost, "/v1/revisions/prepare", ipcEnvelope{Revision: revision, Payload: payload})
 }
 
