@@ -805,10 +805,15 @@ while an operation is unresolved. A failed prepare remains inert, so the prior
 revision is still readable while abort acknowledgement is retried; reads are
 blocked only after commit may have reached the receiver. Reconciliation uses
 metadata-only readback or exact commit/abort retries. Its transport is injected;
-no authenticated IPC or public Vault mutation path uses it yet. Local close cancels pending transport and
-fences completion, but the future adapter must also fence the remote session and
-tear down receiver/connections. Startup/recovery and atomic public-store
-finalization under the shared mutation barrier remain integration work.
+an unused Go adapter now implements its strict JSON contract over a
+caller-provisioned private Unix socket, presents a high-entropy per-session
+bearer token for receiver-side authentication, and rejects malformed, oversized,
+or credential-bearing error responses. The Python
+receiver endpoint, live token handoff, and public Vault mutation path are not
+wired yet. Local close cancels pending transport and fences completion, but the
+future adapter must also fence the remote session and tear down
+receiver/connections. Startup/recovery and atomic public-store finalization under
+the shared mutation barrier remain integration work.
 
 The proxy-side transaction receiver is an in-memory foundation: it validates
 generation/epoch/digest identities, stages immutable bytes, and implements

@@ -42,12 +42,12 @@ var (
 // Identity matches the Python receiver's generation/epoch/digest identity.
 // It contains no snapshot payload. Wire encoding belongs to the IPC adapter.
 type Identity struct {
-	ControlGeneration string
-	SubjectGeneration string
-	DecisionEpoch     int64
-	VaultRevision     int64
-	PolicyEpoch       int64
-	Digest            string
+	ControlGeneration string `json:"controlGeneration"`
+	SubjectGeneration string `json:"subjectGeneration"`
+	DecisionEpoch     int64  `json:"decisionEpoch"`
+	VaultRevision     int64  `json:"vaultRevision"`
+	PolicyEpoch       int64  `json:"policyEpoch"`
+	Digest            string `json:"digest"`
 }
 
 // Transport binds one authenticated receiver/session to this coordinator.
