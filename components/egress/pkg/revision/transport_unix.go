@@ -238,6 +238,9 @@ func (t *UnixTransport) do(ctx context.Context, method, path string, value any) 
 	if ctx == nil {
 		return nil, ErrInvalidTransport
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var body io.Reader
 	if value != nil {
 		encoded, err := json.Marshal(value)

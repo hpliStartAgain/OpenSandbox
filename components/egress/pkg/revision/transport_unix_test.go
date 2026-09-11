@@ -37,6 +37,15 @@ type testEnvelope struct {
 	Payload  []byte   `json:"payload"`
 }
 
+type marshalProbe struct {
+	called *bool
+}
+
+func (p marshalProbe) MarshalJSON() ([]byte, error) {
+	*p.called = true
+	return nil, errors.New("marshal should not run")
+}
+
 func testIdentity() Identity {
 	return Identity{
 		ControlGeneration: "control-a",
@@ -228,4 +237,15 @@ func TestUnixTransportValidatesConfigurationAndRequests(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, one, two)
 	require.Len(t, one, 43)
+}
+
+func TestUnixTransportChecksCancellationBeforeEncoding(t *testing.T) {
+	transport, err := NewUnixTransport("/tmp/not-used.sock", testSessionToken, 1)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	_, err = transport.do(ctx, http.MethodPost, "/not-used", marshalProbe{called: &called})
+	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, called)
 }
