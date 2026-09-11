@@ -204,6 +204,14 @@ Semantics and limits:
 - **Config validation**: a malformed proxy URL, credentials in the URL, or
   `..._AUTH` without `..._PROXY` fail egress startup; the addon likewise raises
   on load, so mitmdump will not start with an inconsistent config.
+- **Policy interaction (`dns+nft`)**: the proxy endpoint is treated as
+  infrastructure, not sandbox egress. The egress nft chain adds a dedicated
+  accept scoped to `(mitmproxy UID, proxy IP, proxy port)`; the proxy IP is
+  deliberately *not* added to the sandbox allow sets, which are IP-only and
+  would otherwise let sandbox code dial the proxy port directly (e.g. `CONNECT`
+  on 3128) to reach denied destinations. For a hostname endpoint the DNS
+  answer is exempted from sandbox policy evaluation and feeds only the
+  uid-scoped set, so the proxy name stays resolvable under a deny-all policy.
 - **Auth secrecy**: the auth value is sent only on the upstream `CONNECT` and
   is never logged. Prefer injecting it via the container env or a Secret over
   baking it into an image.

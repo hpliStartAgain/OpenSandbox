@@ -151,6 +151,66 @@ class _ConnectProxy:
             self._sock.close()
 
 
+class _TlsTargetServer:
+    """TLS-wrapped one-shot HTTP server on a self-signed cert (openssl CLI)."""
+
+    def __init__(self, cert: Path, key: Path) -> None:
+        import ssl
+
+        self.port = 0
+        self._stop = threading.Event()
+        self._sock: socket.socket | None = None
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(certfile=cert, keyfile=key)
+
+    def start(self) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(16)
+        self.port = self._sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        assert self._sock is not None
+        self._sock.settimeout(0.5)
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn: socket.socket) -> None:
+        try:
+            conn.settimeout(10)
+            tls = self._ctx.wrap_socket(conn, server_side=True)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+            body = b"upstream-proxy-tls-e2e-ok"
+            tls.sendall(
+                b"HTTP/1.1 200 OK\r\ncontent-length: "
+                + str(len(body)).encode()
+                + b"\r\nconnection: close\r\n\r\n"
+                + body
+            )
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._sock is not None:
+            self._sock.close()
+
+
 class _TargetServer:
     def __init__(self) -> None:
         self.hits = 0
@@ -208,7 +268,9 @@ class _TargetServer:
             self._sock.close()
 
 
-def _start_mitmdump(port: int, env_extra: dict[str, str]) -> tuple[subprocess.Popen, list[str]]:
+def _start_mitmdump(
+    port: int, env_extra: dict[str, str], *extra_args: str
+) -> tuple[subprocess.Popen, list[str]]:
     script = Path(__file__).parents[1] / "mitmscripts" / "upstream_proxy.py"
     proc = subprocess.Popen(
         [
@@ -223,6 +285,7 @@ def _start_mitmdump(port: int, env_extra: dict[str, str]) -> tuple[subprocess.Po
             "connection_strategy=lazy",
             "--set",
             "termlog_verbosity=info",
+            *extra_args,
         ],
         env={**os.environ, **env_extra},
         stdout=subprocess.PIPE,
@@ -319,6 +382,81 @@ class UpstreamProxyRuntimeTest(unittest.TestCase):
             self.assertEqual(before, len(self._proxy.requests))
         finally:
             _stop(proc)
+
+    def test_inner_tls_flow_traverses_chain(self) -> None:
+        # TLS intercepted inside a client CONNECT tunnel: the inner flow must
+        # still go through the single upstream CONNECT, not a second dial.
+        import ssl
+        import tempfile
+
+        openssl = shutil.which("openssl")
+        if openssl is None:
+            self.skipTest("openssl is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            cert, key = Path(tmp) / "c.pem", Path(tmp) / "k.pem"
+            gen = subprocess.run(
+                [
+                    openssl, "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", str(key), "-out", str(cert),
+                    "-days", "1", "-nodes", "-subj", "/CN=localhost",
+                    "-addext", "subjectAltName=IP:127.0.0.1",
+                ],
+                capture_output=True,
+            )
+            if gen.returncode != 0:
+                self.skipTest(f"openssl cert generation failed: {gen.stderr!r}")
+            target = _TlsTargetServer(cert, key)
+            target.start()
+            try:
+                port = _free_port()
+                proc, log = _start_mitmdump(
+                    port,
+                    {
+                        "OPENSANDBOX_EGRESS_UPSTREAM_PROXY": f"http://127.0.0.1:{self._proxy.port}",
+                    },
+                    # the TLS target is self-signed; we are testing chaining,
+                    # not upstream verification
+                    "--set", "ssl_insecure=true",
+                )
+                try:
+                    before = len(self._proxy.requests)
+                    sock = socket.create_connection(("127.0.0.1", port), timeout=30)
+                    try:
+                        sock.sendall(
+                            f"CONNECT 127.0.0.1:{target.port} HTTP/1.1\r\n"
+                            f"Host: 127.0.0.1:{target.port}\r\n\r\n".encode()
+                        )
+                        buf = b""
+                        while b"\r\n\r\n" not in buf:
+                            buf += sock.recv(4096)
+                        self.assertIn(b" 200 ", buf.split(b"\r\n", 1)[0], log)
+                        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                        ctx.check_hostname = False
+                        ctx.verify_mode = ssl.CERT_NONE
+                        tls = ctx.wrap_socket(sock, server_hostname="example.test")
+                        tls.sendall(
+                            b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
+                        )
+                        buf = b""
+                        while b"upstream-proxy-tls-e2e-ok" not in buf:
+                            chunk = tls.recv(65536)
+                            if not chunk:
+                                break
+                            buf += chunk
+                        self.assertIn(b"200 OK", buf, log)
+                        self.assertIn(b"upstream-proxy-tls-e2e-ok", buf)
+                    finally:
+                        sock.close()
+                    new = self._proxy.requests[before:]
+                    self.assertEqual(
+                        [f"127.0.0.1:{target.port}"],
+                        [r["authority"] for r in new],
+                        log,
+                    )
+                finally:
+                    _stop(proc)
+            finally:
+                target.stop()
 
     def test_client_connect_flow_is_chained(self) -> None:
         # A client CONNECT (HTTPS-style) must also traverse the upstream proxy.
