@@ -15,10 +15,77 @@
 package mitmproxy
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"io"
+	"math/big"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/stretchr/testify/require"
 )
+
+func TestFileIdentityPreflight(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	cert, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{SerialNumber: big.NewInt(1)}, &x509.Certificate{SerialNumber: big.NewInt(1)}, &key.PublicKey, key)
+	require.NoError(t, err)
+	ca := filepath.Join(t.TempDir(), "ca.pem")
+	require.NoError(t, os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert}), 0600))
+	invalidCA := filepath.Join(t.TempDir(), "invalid.pem")
+	require.NoError(t, os.WriteFile(invalidCA, []byte("not a PEM certificate"), 0600))
+	t.Setenv(constants.EnvUpstreamProxy, "https://gateway.example:443")
+	t.Setenv(constants.EnvUpstreamProxyCAFile, ca)
+	t.Setenv(constants.EnvUpstreamProxyIdentityFile, filepath.Join(t.TempDir(), "not-issued-yet.jwt"))
+	t.Setenv(constants.EnvUpstreamProxyAuth, "")
+	t.Setenv(constants.EnvMitmproxySslInsecure, "")
+	t.Setenv(constants.EnvMitmproxyScript, "")
+	_, err = UpstreamProxyFromEnv()
+	require.NoError(t, err, "missing identity must not block startup")
+	for _, tc := range []struct{ key, value string }{
+		{constants.EnvUpstreamProxy, "http://gateway.example"},
+		{constants.EnvUpstreamProxy, "https://127.0.0.1"},
+		{constants.EnvUpstreamProxyAuth, "sensitive-inline-value"},
+		{constants.EnvMitmproxySslInsecure, "true"},
+		{constants.EnvMitmproxyScript, "/untrusted.py"},
+		{constants.EnvUpstreamProxyCAFile, "missing-ca"},
+		{constants.EnvUpstreamProxyCAFile, invalidCA},
+		{constants.EnvUpstreamProxyIdentityFile, ""},
+	} {
+		t.Run(tc.key+tc.value, func(t *testing.T) {
+			t.Setenv(tc.key, tc.value)
+			_, err := UpstreamProxyFromEnv()
+			require.Error(t, err)
+			require.NotContains(t, err.Error(), "sensitive-inline-value")
+		})
+	}
+}
+
+func TestFileIdentityReadinessRequiresAddonAcknowledgement(t *testing.T) {
+	t.Setenv(constants.EnvUpstreamProxyIdentityFile, "/private/identity.jwt")
+	require.Contains(t, buildMitmdumpEnv(nil, "/home/mitmproxy"), "PYTHONUNBUFFERED=1")
+	ready, exited := make(chan struct{}, 1), make(chan error, 1)
+	require.Error(t, waitUpstreamProxyReady(ready, exited, time.Millisecond))
+	exited <- errors.New("process exited")
+	require.Error(t, waitUpstreamProxyReady(ready, exited, time.Second))
+	for _, incomplete := range []string{
+		"upstream proxy: ready\n",
+		"credential proxy: system addon ready\n",
+		"upstream proxy: ready\ncredential proxy: system addon ready\n",
+	} {
+		forwardMitmdumpOutput(io.NopCloser(strings.NewReader(incomplete)), ready)
+		require.Error(t, waitUpstreamProxyReady(ready, exited, time.Millisecond))
+	}
+	forwardMitmdumpOutput(io.NopCloser(strings.NewReader("[12:00:00.000] credential proxy: system addon ready\n[12:00:00.001] upstream proxy: ready\n")), ready)
+	require.NoError(t, waitUpstreamProxyReady(ready, exited, time.Second))
+}
 
 func TestParseUpstreamProxyValid(t *testing.T) {
 	tests := []struct {

@@ -23,6 +23,8 @@ from opensandbox_server.api.schema import CreateSandboxRequest
 from opensandbox_server.config import AppConfig
 from opensandbox_server.services.constants import (
     OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE,
+    OPENSANDBOX_EGRESS_DNS_UPSTREAM,
+    OPENSANDBOX_EGRESS_PUBLIC_POLICY,
     OPENSANDBOX_LIFECYCLE,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
     SANDBOX_SECURE_ACCESS_TOKEN_METADATA_KEY,
@@ -31,7 +33,7 @@ from opensandbox_server.services.constants import (
     SANDBOX_SNAPSHOT_ID_LABEL,
 )
 from opensandbox_server.services.helpers import split_egress_env
-from opensandbox_server.services.k8s.workload_provider import EgressWorkloadSettings
+from opensandbox_server.services.k8s.workload_provider import EgressWorkloadSettings, UpstreamProxySettings
 from opensandbox_server.services.validators import calculate_expiration_or_raise
 
 logger = logging.getLogger(__name__)
@@ -114,6 +116,20 @@ def _build_create_workload_context(
         egress_env = {}
 
     egress_settings = None
+    upstream = app_config.egress.upstream_proxy if app_config.egress else None
+    if upstream and upstream.enabled:
+        if request.network_policy is None:
+            raise ValueError("networkPolicy is required when administrator upstream_proxy is enabled")
+        forbidden = {
+            "OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT",
+            "OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE",
+            "OPENSANDBOX_EGRESS_MITMPROXY_EXTRA_PORTS",
+            "OPENSANDBOX_EGRESS_POLICY_FILE",
+            OPENSANDBOX_EGRESS_DNS_UPSTREAM,
+            OPENSANDBOX_EGRESS_PUBLIC_POLICY,
+        }
+        if forbidden.intersection(request.env or {}):
+            raise ValueError("request env cannot override administrator upstream_proxy transport settings")
     if request.network_policy:
         egress_config = app_config.egress
         if not egress_config or not egress_config.image:
@@ -129,6 +145,21 @@ def _build_create_workload_context(
             resource_requests=egress_config.requests,
             resource_limits=egress_config.limits,
             otlp_endpoint=egress_config.otlp_endpoint,
+            upstream_proxy=(
+                UpstreamProxySettings(
+                    url=upstream.url,
+                    ca_secret_name=upstream.ca_bundle.secret_name,
+                    ca_key=upstream.ca_bundle.key,
+                    identity_secret_name=f"{upstream.identity.secret_prefix}{sandbox_id}",
+                    identity_key=upstream.identity.key,
+                )
+                if upstream and upstream.enabled and upstream.url and upstream.ca_bundle else None
+            ),
+            public_policy=(
+                upstream.public_policy_json()
+                if upstream and upstream.enabled
+                else ""
+            ),
         )
 
     return _CreateWorkloadContext(

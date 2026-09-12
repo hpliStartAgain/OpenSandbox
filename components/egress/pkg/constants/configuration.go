@@ -101,7 +101,9 @@ const (
 	// EnvUpstreamProxyAuth: complete Proxy-Authorization header value sent on
 	// the upstream CONNECT (e.g. "Basic base64(user:pass)"). Requires
 	// EnvUpstreamProxy. Never logged.
-	EnvUpstreamProxyAuth = "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH"
+	EnvUpstreamProxyAuth         = "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH"
+	EnvUpstreamProxyIdentityFile = "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_IDENTITY_FILE"
+	EnvUpstreamProxyCAFile       = "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_CA_FILE"
 
 	// Comma-separated upstream resolvers: literal IP only (optional :port) — no hostnames (see dnsproxy REDIRECT note).
 	EnvDNSUpstream                 = "OPENSANDBOX_EGRESS_DNS_UPSTREAM"

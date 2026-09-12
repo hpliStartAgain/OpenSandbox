@@ -160,6 +160,11 @@ def _set_fast_sandbox_mode_from_env() -> None:
 _set_fast_sandbox_mode_from_env()
 
 
+def running() -> None:
+    if os.environ.get("OPENSANDBOX_EGRESS_UPSTREAM_PROXY_IDENTITY_FILE", "").strip():
+        ctx.log.info("credential proxy: system addon ready")
+
+
 class UnixSocketHTTPConnection(http_client.HTTPConnection):
     def __init__(self, socket_path: str, timeout: float) -> None:
         super().__init__("credential-proxy", timeout=timeout)

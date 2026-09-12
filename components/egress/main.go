@@ -16,9 +16,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,12 +37,27 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/mitmproxy"
 	"github.com/alibaba/opensandbox/egress/pkg/nftables"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
+	"github.com/alibaba/opensandbox/egress/pkg/publicegress"
 	"github.com/alibaba/opensandbox/egress/pkg/startup"
 	"github.com/alibaba/opensandbox/egress/pkg/telemetry"
 	slogger "github.com/alibaba/opensandbox/internal/logger"
 	"github.com/alibaba/opensandbox/internal/safego"
 	"github.com/alibaba/opensandbox/internal/version"
 )
+
+func validatePublicEgressStartup() error {
+	if strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxyIdentityFile)) == "" {
+		return fmt.Errorf("public egress requires file identity")
+	}
+	if strings.TrimSpace(os.Getenv(constants.EnvEgressToken)) == "" {
+		return fmt.Errorf("public egress requires a control API token")
+	}
+	port := strings.TrimSpace(os.Getenv(constants.EnvMitmproxyPort))
+	if port != "" && port != strconv.Itoa(publicegress.MITMPort) {
+		return fmt.Errorf("public egress requires the reserved MITM backend port %d", publicegress.MITMPort)
+	}
+	return nil
+}
 
 func main() {
 	version.EchoVersion("OpenSandbox Egress")
@@ -55,6 +72,9 @@ func main() {
 	// store and the proxy route. Sidecar stays the default; the two profiles
 	// are mutually exclusive deployment forms.
 	if strings.TrimSpace(os.Getenv(constants.EnvEgressProfile)) == constants.ProfileFastSandbox {
+		if strings.TrimSpace(os.Getenv(publicegress.EnvPolicy)) != "" {
+			log.Fatalf("public egress root boundary is not supported by fast-sandbox")
+		}
 		runFastSandboxProfile(ctx)
 		return
 	}
@@ -63,6 +83,28 @@ func main() {
 	// egress generation so the agent's bootstrap wait-loop blocks for this
 	// generation's export. See PurgeStaleExportedCA / upstream issue #1370.
 	mitmproxy.PurgeStaleExportedCA()
+
+	strictPolicy, err := publicegress.Parse(os.Getenv(publicegress.EnvPolicy))
+	if err != nil {
+		log.Fatalf("public egress policy: %v", err)
+	}
+	var publicGuard *publicegress.Guard
+	if strictPolicy != nil {
+		spec, err := mitmproxy.UpstreamProxyFromEnv()
+		if err != nil || spec == nil || spec.Scheme != "https" || !constants.IsTruthy(os.Getenv(constants.EnvMitmproxyTransparent)) || parseMode() != constants.PolicyDnsNft {
+			log.Fatalf("public egress requires transparent HTTPS upstream, file identity and dns+nft enforcement")
+		}
+		if err := validatePublicEgressStartup(); err != nil {
+			log.Fatalf("%v", err)
+		}
+		installCtx, installCancel := context.WithTimeout(ctx, 15*time.Second)
+		publicGuard, err = publicegress.Install(installCtx, strictPolicy, uint16(spec.Port))
+		installCancel()
+		if err != nil {
+			log.Fatalf("public egress root boundary: %v", err)
+		}
+		log.Infof("public egress: cgroup-v2 root boundary installed; no UID fallback")
+	}
 
 	otelShutdown, err := telemetry.Init(ctx)
 	if err != nil {
@@ -124,6 +166,23 @@ func main() {
 				}
 				addCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
+				if publicGuard != nil {
+					var addresses []string
+					ttl := time.Hour
+					for _, ip := range ips {
+						if ip.Addr.Is4() {
+							addresses = append(addresses, ip.Addr.String())
+							if ip.TTL < ttl {
+								ttl = ip.TTL
+							}
+						}
+					}
+					if len(addresses) > 0 {
+						if err := publicGuard.SetGatewayIPs(addCtx, addresses, ttl); err != nil {
+							log.Warnf("public egress: gateway DNS update failed: %v", err)
+						}
+					}
+				}
 				if err := nftMgr.AddUpstreamProxyIPs(addCtx, ips); err != nil {
 					log.Warnf("upstream proxy: nft update for %q failed: %v", domain, err)
 				}
@@ -157,14 +216,19 @@ func main() {
 	if len(exemptDst) > 0 {
 		log.Infof("nameserver exempt list: %v (proxy upstream in this list will not set SO_MARK)", exemptDst)
 	}
-	if err := iptables.SetupRedirect(15353, exemptDst); err != nil {
-		log.Fatalf("failed to install iptables redirect: %v", err)
+	if strictPolicy == nil {
+		if err := iptables.SetupRedirect(15353, exemptDst); err != nil {
+			log.Fatalf("failed to install iptables redirect: %v", err)
+		}
+		log.Infof("iptables redirect configured (OUTPUT 53 -> 15353) with SO_MARK bypass for proxy upstream traffic")
 	}
-	log.Infof("iptables redirect configured (OUTPUT 53 -> 15353) with SO_MARK bypass for proxy upstream traffic")
 
 	setupNft(ctx, nftMgr, initialRules, proxy, allowIPs, alwaysDeny, alwaysAllow)
 
 	httpAddr := envOrDefault(constants.EnvEgressHTTPAddr, constants.DefaultEgressServerAddr)
+	if strictPolicy != nil {
+		httpAddr = "0.0.0.0:380"
+	}
 	mitmGate := mitmproxy.NewHealthGate()
 	policySrv, err := startPolicyServer(proxy, nftMgr, mode, httpAddr, os.Getenv(constants.EnvEgressToken), allowIPs, os.Getenv(constants.EnvEgressPolicyFile), alwaysDeny, alwaysAllow, mitmGate)
 	if err != nil {

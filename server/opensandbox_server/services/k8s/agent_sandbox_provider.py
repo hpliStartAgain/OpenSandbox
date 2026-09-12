@@ -30,7 +30,7 @@ from opensandbox_server.api.schema import Endpoint, ImageSpec, PlatformSpec, Vol
 from opensandbox_server.services.k8s.agent_sandbox_template import AgentSandboxTemplateManager
 from opensandbox_server.services.validators import ensure_egress_runtime_compatible
 from opensandbox_server.services.k8s.client import K8sClient
-from opensandbox_server.services.k8s.egress_helper import apply_egress_to_spec
+from opensandbox_server.services.k8s.egress_helper import apply_egress_to_spec, build_root_compatible_security_context, validate_upstream_proxy_pod
 from opensandbox_server.services.k8s.image_pull_secret_helper import (
     build_image_pull_secret,
     build_image_pull_secret_name,
@@ -159,6 +159,18 @@ class AgentSandboxProvider(WorkloadProvider):
             extensions=extensions,
             sandbox_id=sandbox_id,
         )
+        # Capture the generated execd init before the administrator template is
+        # merged.  The upstream profile permits this one trusted init (including
+        # its narrowly privileged IPv6 setup) but rejects all template-added or
+        # substituted init containers in the final validator.
+        generated_execd_init = next(
+            (
+                container
+                for container in pod_spec.get("initContainers", [])
+                if container.get("name") == "execd-installer"
+            ),
+            None,
+        )
 
         if volumes:
             apply_volumes_to_pod_spec(pod_spec, volumes)
@@ -196,6 +208,16 @@ class AgentSandboxProvider(WorkloadProvider):
         else:
             sandbox["spec"]["shutdownTime"] = expires_at.isoformat()
         merged_pod_spec = sandbox.get("spec", {}).get("podTemplate", {}).get("spec", {})
+        validate_upstream_proxy_pod(
+            merged_pod_spec,
+            egress_settings,
+            expected_execd_init=generated_execd_init
+            if egress_settings and egress_settings.upstream_proxy
+            else None,
+            expected_sandbox_id=sandbox_id
+            if egress_settings and egress_settings.upstream_proxy
+            else None,
+        )
         if image_spec.auth:
             # Inject after the template merge: assigning before it would let
             # the runtime override replace template-provided imagePullSecrets.
@@ -295,18 +317,22 @@ class AgentSandboxProvider(WorkloadProvider):
         """Build pod spec dict for the Sandbox CRD."""
         has_egress = egress_settings is not None
         disable_ipv6_for_egress = (
-            egress_settings.disable_ipv6 if egress_settings is not None else False
+            egress_settings.disable_ipv6 and egress_settings.upstream_proxy is None
+            if egress_settings is not None else False
         )
         init_container = _build_execd_init_container(
             execd_image,
             self.execd_init_resources,
             disable_ipv6_for_egress=disable_ipv6_for_egress,
         )
+        init_container_dict = _container_to_dict(init_container)
+        if egress_settings and egress_settings.upstream_proxy:
+            init_container_dict["securityContext"] = build_root_compatible_security_context()
         main_env = dict(env)
         main_env["OPENSANDBOX_ID"] = sandbox_id
         if self.execd_run_as_init:
             main_env["EXECD_INIT"] = "1"
-        if egress_settings is not None and egress_settings.credential_proxy_enabled:
+        if egress_settings is not None and (egress_settings.credential_proxy_enabled or egress_settings.upstream_proxy):
             main_env[OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT] = "true"
 
         main_container = _build_main_container(
@@ -333,7 +359,7 @@ class AgentSandboxProvider(WorkloadProvider):
             })
         pod_spec: Dict[str, Any] = {
             "automountServiceAccountToken": False,
-            "initContainers": [_container_to_dict(init_container)],
+            "initContainers": [init_container_dict],
             "containers": containers,
             "volumes": volumes,
         }
@@ -345,6 +371,7 @@ class AgentSandboxProvider(WorkloadProvider):
             containers=containers,
             egress_settings=egress_settings,
             sandbox_id=sandbox_id,
+            pod_spec=pod_spec,
         )
 
         return pod_spec

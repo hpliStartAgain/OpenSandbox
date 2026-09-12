@@ -25,6 +25,17 @@ from opensandbox_server.api.schema import Endpoint, ImageSpec, NetworkPolicy, Pl
 
 
 @dataclass(frozen=True)
+class UpstreamProxySettings:
+    """Resolved administrator-owned proxy settings, never request environment."""
+
+    url: str
+    ca_secret_name: str
+    ca_key: str
+    identity_secret_name: str
+    identity_key: str
+
+
+@dataclass(frozen=True)
 class EgressWorkloadSettings:
     """All server- and request-derived settings needed to build an egress sidecar."""
 
@@ -38,6 +49,11 @@ class EgressWorkloadSettings:
     resource_requests: Optional[Dict[str, str]]
     resource_limits: Optional[Dict[str, str]]
     otlp_endpoint: Optional[str] = None
+    upstream_proxy: Optional[UpstreamProxySettings] = None
+    # Canonical administrator-owned public-egress policy.  Existing callers
+    # that only use ordinary egress may omit it; upstream-proxy rendering
+    # rejects an empty value rather than guessing a site policy.
+    public_policy: str = ""
 
 
 class WorkloadProvider(ABC):

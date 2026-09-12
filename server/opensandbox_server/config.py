@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -31,7 +32,15 @@ from typing import Any, ClassVar, Dict, Literal, Optional
 from urllib.parse import urlparse
 
 from kubernetes.utils.quantity import parse_quantity
-from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SecretStr,
+    StrictInt,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 try:  # Python 3.11+
     import tomllib  # type: ignore[attr-defined]
@@ -831,6 +840,262 @@ class StorageConfig(BaseModel):
     )
 
 DEFAULT_EGRESS_DISABLE_IPV6 = True
+_PUBLIC_EGRESS_RESERVED_PORTS = frozenset({53, 353, 380, 381, 15353, 18080, 18081})
+_EGRESS_IMAGE_DIGEST_RE = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
+_PUBLIC_EGRESS_METADATA_IPS = frozenset(
+    {
+        # Common cloud metadata endpoints. Link-local is rejected separately,
+        # but keep the explicit entries to cover metadata services on routable
+        # private addresses as well.
+        "100.100.100.200",  # Alibaba Cloud
+        "100.100.100.201",  # Alibaba Cloud metadata DNS
+        "168.63.129.16",  # Azure platform virtual IP
+        "169.254.169.254",  # EC2/Azure/GCP-compatible metadata
+        "169.254.170.2",  # ECS task metadata
+        "169.254.170.23",  # ECS task metadata
+    }
+)
+
+
+def _normalize_public_ipv4(value: str, *, field_name: str) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError(f"{field_name} must be an IPv4 literal")
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        raise ValueError(f"{field_name} must be an IPv4 literal") from None
+    if (
+        address.version != 4
+        or address.is_unspecified
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        # Keep this aligned with the egress addon's unicast check.  In
+        # particular, documentation ranges such as 192.0.2.0/24 are valid
+        # operator fixtures and are not a metadata or namespace escape.
+        or address.packed[0] == 0
+        or address.packed[0] >= 224
+        or value in _PUBLIC_EGRESS_METADATA_IPS
+    ):
+        raise ValueError(f"{field_name} must be a non-special unicast IPv4 address")
+    return str(address)
+
+
+def _normalize_public_fqdn(value: str) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError("internal target host must be a canonical DNS hostname")
+    normalized = value.lower()
+    if normalized.endswith("."):
+        normalized = normalized[:-1]
+    try:
+        ipaddress.ip_address(normalized)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("internal target host must be a DNS hostname, not an IP address")
+    labels = normalized.split(".")
+    if (
+        len(labels) < 2
+        or len(normalized) > 253
+        or any(
+            not label
+            or len(label) > 63
+            or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+            for label in labels
+        )
+        or "*" in normalized
+    ):
+        raise ValueError("internal target host must be a canonical DNS hostname")
+    return normalized
+
+
+class EgressInternalTarget(BaseModel):
+    """Explicit administrator-owned internal destination exception."""
+
+    model_config = {"extra": "forbid", "frozen": True}
+    host: str = Field(min_length=1, max_length=253)
+    ips: list[str] = Field(min_length=1, max_length=32)
+    ports: list[StrictInt] = Field(min_length=1, max_length=32)
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        return _normalize_public_fqdn(value)
+
+    @field_validator("ips")
+    @classmethod
+    def validate_ips(cls, values: list[str]) -> list[str]:
+        normalized = [
+            _normalize_public_ipv4(value, field_name="internal target IP") for value in values
+        ]
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("internal target IPs must be unique")
+        return normalized
+
+    @field_validator("ports")
+    @classmethod
+    def validate_ports(cls, values: list[int]) -> list[int]:
+        if any(port < 1 or port > 65535 for port in values):
+            raise ValueError("internal target ports must be between 1 and 65535")
+        if _PUBLIC_EGRESS_RESERVED_PORTS.intersection(values):
+            raise ValueError(
+                "internal target ports conflict with reserved egress control ports"
+            )
+        if len(set(values)) != len(values):
+            raise ValueError("internal target ports must be unique")
+        return values
+
+
+class EgressProxyCABundle(BaseModel):
+    """Administrator-owned Secret containing the gateway's PEM trust bundle."""
+
+    model_config = {"extra": "forbid", "frozen": True}
+    secret_name: str = Field(
+        min_length=1, max_length=253,
+        pattern=r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*$",
+    )
+    key: str = Field(
+        default="ca.crt", min_length=1, max_length=253, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+    )
+
+
+class EgressProxyIdentity(BaseModel):
+    """Issuer-owned per-sandbox Secret; no token or signing key is server config."""
+
+    model_config = {"extra": "forbid", "frozen": True}
+    secret_prefix: str = Field(
+        default="egress-identity-",
+        min_length=1,
+        max_length=63,
+        pattern=r"^[a-z0-9][-a-z0-9]*-$",
+    )
+    key: str = Field(
+        default="identity.jwt",
+        min_length=1,
+        max_length=253,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$",
+    )
+
+
+class EgressUpstreamProxyConfig(BaseModel):
+    """Opt-in HTTPS CONNECT transport, configured only by the server operator."""
+
+    model_config = {"extra": "forbid", "frozen": True}
+    enabled: bool = False
+    url: Optional[str] = None
+    ca_bundle: Optional[EgressProxyCABundle] = None
+    identity: EgressProxyIdentity = Field(default_factory=EgressProxyIdentity)
+    # No resolver fallback is safe for this profile: the operator must pin the
+    # DNS servers used by both gateway and target resolution.
+    dns_servers: list[str] = Field(default_factory=list, min_length=0, max_length=8)
+    internal_targets: list[EgressInternalTarget] = Field(
+        default_factory=list, min_length=0, max_length=128
+    )
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        error = "upstream_proxy.url must be an HTTPS DNS endpoint without userinfo, path, query or fragment"
+        if any(char.isspace() or ord(char) < 32 for char in value):
+            raise ValueError(error)
+        try:
+            parsed = urlparse(value)
+            host = parsed.hostname or ""
+            port = parsed.port if parsed.port is not None else 443
+        except ValueError:
+            raise ValueError(error) from None
+        if (
+            parsed.scheme != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in ("", "/")
+            or "?" in value
+            or "#" in value
+            or not 1 <= port <= 65535
+            or parsed.netloc.endswith(":")
+            or not re.fullmatch(r"[a-zA-Z0-9](?:[-a-zA-Z0-9.]*[a-zA-Z0-9])?", host)
+            or len(host) > 253
+            or any(
+                not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
+                for label in host.split(".")
+            )
+            or host.rsplit(".", 1)[-1].isdigit()
+        ):
+            raise ValueError(error)
+        return f"https://{host.lower()}:{port}"
+
+    @field_validator("dns_servers")
+    @classmethod
+    def validate_dns_servers(cls, values: list[str]) -> list[str]:
+        normalized = [
+            _normalize_public_ipv4(value, field_name="upstream_proxy.dns_servers entry")
+            for value in values
+        ]
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("upstream_proxy.dns_servers entries must be unique")
+        return normalized
+
+    @field_validator("internal_targets")
+    @classmethod
+    def validate_internal_targets(
+        cls, values: list[EgressInternalTarget]
+    ) -> list[EgressInternalTarget]:
+        hosts = [target.host for target in values]
+        if len(set(hosts)) != len(hosts):
+            raise ValueError("upstream_proxy.internal_targets hosts must be unique")
+        return values
+
+    @model_validator(mode="after")
+    def require_enabled_settings(self) -> "EgressUpstreamProxyConfig":
+        if self.enabled and (not self.url or self.ca_bundle is None):
+            raise ValueError("enabled upstream_proxy requires url and ca_bundle")
+        if self.enabled and not self.dns_servers:
+            raise ValueError("enabled upstream_proxy requires dns_servers")
+        if self.enabled:
+            # These listeners are reserved by the kernel/addon contract.  Keep
+            # this check enabled-only so legacy, disabled URL configuration is
+            # still accepted unchanged.
+            gateway = urlparse(self.url)
+            gateway_host = (gateway.hostname or "").lower().rstrip(".")
+            gateway_port = gateway.port if gateway.port is not None else 443
+            if gateway_port in _PUBLIC_EGRESS_RESERVED_PORTS:
+                raise ValueError(
+                    "enabled upstream_proxy.url must not use a reserved egress port"
+                )
+            if any(target.host == gateway_host for target in self.internal_targets):
+                raise ValueError(
+                    "upstream_proxy.internal_targets must not match the gateway hostname"
+                )
+            # Fail at configuration load rather than creating a Pod whose
+            # addon-side strict parser would reject an oversized policy.
+            self.public_policy_json()
+        return self
+
+    def public_policy_json(self) -> str:
+        """Serialize the canonical server-owned public egress policy."""
+        if not self.enabled or not self.dns_servers:
+            raise ValueError("enabled upstream_proxy requires dns_servers")
+        payload = json.dumps(
+            {
+                "version": 1,
+                "dns_servers": self.dns_servers,
+                "internal_targets": [
+                    {
+                        "host": target.host,
+                        "ips": target.ips,
+                        "ports": target.ports,
+                    }
+                    for target in self.internal_targets
+                ],
+            },
+            separators=(",", ":"),
+        )
+        if len(payload) > 32768:
+            raise ValueError("upstream_proxy public egress policy exceeds 32 KiB")
+        return payload
+
 
 class EgressConfig(BaseModel):
     """Egress sidecar configuration."""
@@ -840,6 +1105,7 @@ class EgressConfig(BaseModel):
         description="Container image for the egress sidecar (used when network policy is requested).",
         min_length=1,
     )
+    upstream_proxy: EgressUpstreamProxyConfig = Field(default_factory=EgressUpstreamProxyConfig)
     mode: Literal[
         EGRESS_MODE_DNS,
         EGRESS_MODE_DNS_NFT,
@@ -927,6 +1193,17 @@ class EgressConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_requests_do_not_exceed_limits(self) -> EgressConfig:
+        if self.upstream_proxy.enabled:
+            if not self.image or self.mode != EGRESS_MODE_DNS_NFT or not self.disable_ipv6:
+                raise ValueError("upstream_proxy requires egress.image, mode='dns+nft' and disable_ipv6=true")
+            if (
+                any(char.isspace() or ord(char) < 32 for char in self.image)
+                or not _EGRESS_IMAGE_DIGEST_RE.fullmatch(self.image)
+            ):
+                raise ValueError(
+                    "upstream_proxy requires egress.image pinned by "
+                    "@sha256:<64 lowercase hex digest>"
+                )
         requests = self.requests or {}
         limits = self.limits or {}
         for resource_name in requests.keys() & limits.keys():
@@ -1314,6 +1591,13 @@ class AppConfig(BaseModel):
                 )
         else:
             raise ValueError(f"Unsupported runtime type '{self.runtime.type}'.")
+        if self.egress and self.egress.upstream_proxy.enabled:
+            if self.runtime.type != "kubernetes" or (
+                self.kubernetes and self.kubernetes.workload_provider not in (None, "batchsandbox", "agent-sandbox")
+            ):
+                raise ValueError("upstream_proxy supports only Kubernetes batchsandbox/agent-sandbox providers")
+            if self.secure_runtime and self.secure_runtime.type:
+                raise ValueError("upstream_proxy currently supports only the default runc runtime")
         return self
 
 

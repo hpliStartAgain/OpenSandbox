@@ -185,6 +185,8 @@ mitmproxy can truncate the tail of large streamed bodies (e.g. LLM SSE events > 
 
 ### Credential Vault
 
+For the experimental server-managed HTTPS CONNECT transport and private identity mounts, see [Administrator-managed upstream proxy](/guides/upstream-proxy).
+
 The credential vault provides automatic credential injection for outbound requests to allowed hosts. Credentials are stored in-memory and injected into matching requests by the transparent mitmproxy layer. Injection happens when request headers are read, so it applies to request bodies of any size, including large bodies that mitmproxy streams upstream.
 
 Prerequisites: transparent mitmproxy enabled (`OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true`), egress API auth token set (`OPENSANDBOX_EGRESS_TOKEN`).

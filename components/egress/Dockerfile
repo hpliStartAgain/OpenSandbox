@@ -140,6 +140,13 @@ COPY components/egress/mitmscripts /var/egress/mitmscripts
 # scripts unreadable to it.
 RUN chmod -R a+rX /var/egress/mitmscripts
 
+# Record the bytes actually present in the image, not just its source commit.
+# This is provenance for release/readback; the registry digest remains the
+# deployment identity. No runtime JWT or private CA is part of this manifest.
+COPY components/egress/scripts/public_egress_manifest.py /opt/opensandbox-egress/public_egress_manifest.py
+RUN python3 /opt/opensandbox-egress/public_egress_manifest.py \
+    --output /opt/opensandbox-egress/public-egress-manifest.json
+
 # Supervisor wraps the egress binary: restarts on crash with backoff and
 # forwards SIGTERM gracefully. The cleanup hook runs only as pre-start; the
 # next egress process re-installs all redirect rules itself after startup,

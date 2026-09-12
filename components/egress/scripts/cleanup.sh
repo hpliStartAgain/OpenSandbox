@@ -33,6 +33,9 @@
 #   * The `inet opensandbox` nft table is NOT touched here. The egress
 #     nftables manager already prepends `delete table inet opensandbox` to
 #     its ruleset script, so ApplyStatic is idempotent.
+#   * The root profile's `inet opensandbox_public_egress` table and
+#     `mangle/OSB_PUBLIC_CGROUP` classifier MUST survive cleanup/shutdown.
+#     They enforce fail-closed interception throughout the restart window.
 #
 # Hard contract: this script MUST NOT exit non-zero. A misbehaving cleanup
 # hook is worse than a stray mitmdump; supervisor would treat the hook

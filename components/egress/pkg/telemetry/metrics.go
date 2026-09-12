@@ -39,6 +39,7 @@ var (
 	nftUpdates        metric.Int64Counter
 	nftUpdateFailed   metric.Int64Counter
 	tlsShadowRequests metric.Int64Counter
+	publicEvents      metric.Int64Counter
 
 	lastNftRuleCount atomic.Int64
 )
@@ -160,6 +161,13 @@ func registerEgressMetrics() error {
 	policyDenied, err = meter.Int64Counter(
 		"egress.policy.denied_total",
 		metric.WithDescription("DNS policy denials"),
+	)
+	if err != nil {
+		return err
+	}
+	publicEvents, err = meter.Int64Counter(
+		"egress.public.events_total",
+		metric.WithDescription("Bounded local public-egress routing and failure events; routing is not gateway Grant approval and events are not unique requests."),
 	)
 	if err != nil {
 		return err

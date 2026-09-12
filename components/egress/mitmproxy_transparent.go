@@ -27,6 +27,7 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/iptables"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
 	"github.com/alibaba/opensandbox/egress/pkg/mitmproxy"
+	"github.com/alibaba/opensandbox/egress/pkg/publicegress"
 	"github.com/alibaba/opensandbox/internal/safego"
 )
 
@@ -93,6 +94,9 @@ func startMitmproxyTransparentIfEnabled() (*mitmTransparent, error) {
 	}
 
 	mpPort := constants.EnvIntOrDefault(constants.EnvMitmproxyPort, constants.DefaultMitmproxyPort)
+	if strings.TrimSpace(os.Getenv(publicegress.EnvPolicy)) != "" {
+		mpPort = publicegress.MITMPort
+	}
 	mpUID, _, mpHome, err := mitmproxy.LookupUser(mitmproxy.RunAsUser)
 	if err != nil {
 		return nil, fmt.Errorf("lookup user %q: %w (ensure this user exists in the image)", mitmproxy.RunAsUser, err)
@@ -122,8 +126,10 @@ func startMitmproxyTransparentIfEnabled() (*mitmTransparent, error) {
 	if err := mitmproxy.WaitListenPort(waitAddr, 15*time.Second); err != nil {
 		return nil, fmt.Errorf("wait listen %s: %w", waitAddr, err)
 	}
-	if err := iptables.SetupTransparentHTTP(mpPort, mpUID, dports); err != nil {
-		return nil, fmt.Errorf("iptables transparent: %w", err)
+	if strings.TrimSpace(os.Getenv(publicegress.EnvPolicy)) == "" {
+		if err := iptables.SetupTransparentHTTP(mpPort, mpUID, dports); err != nil {
+			return nil, fmt.Errorf("iptables transparent: %w", err)
+		}
 	}
 	log.Infof("mitmproxy: transparent intercept active (OUTPUT tcp %s -> %d; trust mitm CA in clients)", dports, mpPort)
 

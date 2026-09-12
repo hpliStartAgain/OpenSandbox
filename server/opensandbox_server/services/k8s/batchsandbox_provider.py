@@ -36,7 +36,7 @@ from opensandbox_server.services.k8s.image_pull_secret_helper import (
 )
 from opensandbox_server.services.k8s.batchsandbox_template import BatchSandboxTemplateManager
 from opensandbox_server.services.k8s.client import K8sClient
-from opensandbox_server.services.k8s.egress_helper import apply_egress_to_spec
+from opensandbox_server.services.k8s.egress_helper import apply_egress_to_spec, build_root_compatible_security_context, validate_upstream_proxy_pod
 from opensandbox_server.services.validators import ensure_egress_runtime_compatible
 from opensandbox_server.services.k8s.provider_common import (
     DEFAULT_ENTRYPOINT,
@@ -189,7 +189,8 @@ class BatchSandboxProvider(WorkloadProvider):
 
         has_egress = egress_settings is not None
         disable_ipv6_for_egress = (
-            egress_settings.disable_ipv6 if egress_settings is not None else False
+            egress_settings.disable_ipv6 and egress_settings.upstream_proxy is None
+            if egress_settings is not None else False
         )
         init_container = _build_execd_init_container(
             execd_image,
@@ -201,7 +202,7 @@ class BatchSandboxProvider(WorkloadProvider):
         main_env["OPENSANDBOX_ID"] = sandbox_id
         if self.execd_run_as_init:
             main_env["EXECD_INIT"] = "1"
-        if egress_settings is not None and egress_settings.credential_proxy_enabled:
+        if egress_settings is not None and (egress_settings.credential_proxy_enabled or egress_settings.upstream_proxy):
             main_env[OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT] = "true"
 
         main_container = _build_main_container(
@@ -227,9 +228,14 @@ class BatchSandboxProvider(WorkloadProvider):
                 "name": "isolation-upper",
                 "emptyDir": {}
             })
+        init_container_dict = _container_to_dict(init_container)
+        if egress_settings and egress_settings.upstream_proxy:
+            # The earlier strict sidecar already blocks IPv6 in nft. No
+            # privileged sysctl installer may touch the app-writable volume.
+            init_container_dict["securityContext"] = build_root_compatible_security_context()
         pod_spec = {
             "automountServiceAccountToken": False,
-            "initContainers": [_container_to_dict(init_container)],
+            "initContainers": [init_container_dict],
             "containers": containers,
             "volumes": pod_volumes,
         }
@@ -268,6 +274,7 @@ class BatchSandboxProvider(WorkloadProvider):
             containers=containers,
             egress_settings=egress_settings,
             sandbox_id=sandbox_id,
+            pod_spec=pod_spec,
         )
 
         if volumes:
@@ -306,6 +313,14 @@ class BatchSandboxProvider(WorkloadProvider):
             batchsandbox, extra_volumes, extra_mounts, extra_security_context
         )
         merged_pod_spec = batchsandbox.get("spec", {}).get("template", {}).get("spec", {})
+        validate_upstream_proxy_pod(
+            merged_pod_spec,
+            egress_settings,
+            expected_execd_init=init_container_dict if egress_settings and egress_settings.upstream_proxy else None,
+            expected_sandbox_id=sandbox_id
+            if egress_settings and egress_settings.upstream_proxy
+            else None,
+        )
         ensure_egress_runtime_compatible(
             egress_settings.network_policy if egress_settings is not None else None,
             effective_runtime_class=merged_pod_spec.get("runtimeClassName"),

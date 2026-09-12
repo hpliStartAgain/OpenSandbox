@@ -429,6 +429,12 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         """Reject request fields that pooled pods cannot honor."""
         if not has_pool_ref:
             return
+        if self.app_config.egress and self.app_config.egress.upstream_proxy.enabled:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": SandboxErrorCodes.INVALID_PARAMETER,
+                        "message": "extensions.poolRef is unsupported with administrator upstream_proxy"},
+            )
         if request.network_policy is not None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

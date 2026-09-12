@@ -141,6 +141,7 @@ func (p *Proxy) probeOneUpstream(addr string, timeout time.Duration) bool {
 	m.RecursionDesired = true
 
 	c := &dns.Client{
+		Net:     p.upstreamNetwork,
 		Timeout: timeout,
 		Dialer:  p.dialerForUpstream(addr),
 	}

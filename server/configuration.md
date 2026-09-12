@@ -254,6 +254,13 @@ limits = { cpu = "250m", memory = "256Mi" }
 
 Requests and limits can be omitted independently. Invalid or negative Kubernetes resource quantities cause configuration loading to fail. When both settings are omitted, the egress container does not declare resources and namespace `LimitRange` defaults may apply.
 
+### Administrator-managed upstream proxy
+
+Administrator-managed HTTPS CONNECT transport is configured under
+`[egress.upstream_proxy]` (default disabled). See the
+[upstream proxy guide](../docs/guides/upstream-proxy.md) for the exact TOML,
+private CA/identity Secret contract, runtime restrictions and rollout limits.
+
 ### Egress sidecar metrics
 
 When `otlp_endpoint` is configured, the server injects it into every egress sidecar as `OTEL_EXPORTER_OTLP_ENDPOINT` (both Docker and Kubernetes). Notes:

@@ -25,9 +25,11 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
+	"github.com/alibaba/opensandbox/egress/pkg/publicegress"
 	"github.com/alibaba/opensandbox/egress/pkg/telemetry"
 	"github.com/alibaba/opensandbox/internal/safego"
 )
@@ -42,6 +44,7 @@ const listenHostLoopback = "127.0.0.1"
 // systemScriptPath: bundled system addon shipped via the egress Dockerfile
 // (COPY components/egress/mitmscripts /var/egress/mitmscripts). Always loaded.
 const systemScriptPath = "/var/egress/mitmscripts/system.py"
+const publicPolicyScriptPath = "/var/egress/mitmscripts/public_policy.py"
 
 // Config carries only per-launch dynamic values, applied via `--set`. Static
 // options (mode, listen_host, connection_strategy, stream_large_bodies,
@@ -101,6 +104,9 @@ func Launch(cfg Config) (*Running, error) {
 	if cfg.ListenPort <= 0 {
 		return nil, fmt.Errorf("mitmproxy: invalid listen port")
 	}
+	if strings.TrimSpace(os.Getenv(publicegress.EnvPolicy)) != "" && (len(cfg.ScriptPaths) > 0 || cfg.ListenPort != publicegress.MITMPort || (cfg.ListenHost != "" && cfg.ListenHost != "127.0.0.1")) {
+		return nil, fmt.Errorf("public egress forbids extra addons or listener overrides")
+	}
 	uname := cfg.UserName
 	if strings.TrimSpace(uname) == "" {
 		uname = RunAsUser
@@ -119,6 +125,11 @@ func Launch(cfg Config) (*Running, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Credential: &syscall.Credential{Uid: uid, Gid: gid},
 	}
+	if strings.TrimSpace(os.Getenv(publicegress.EnvPolicy)) != "" {
+		// Only the trusted egress child may bind the reserved backend. The
+		// application bounding set excludes NET_BIND_SERVICE, including root.
+		cmd.SysProcAttr.AmbientCaps = []uintptr{10} // CAP_NET_BIND_SERVICE
+	}
 	// HOME determines mitm's confdir (~/.mitmproxy) which holds both the CA
 	// and the baked-in config.yaml.
 	cmd.Env = buildMitmdumpEnv(os.Environ(), home)
@@ -127,7 +138,8 @@ func Launch(cfg Config) (*Running, error) {
 		_ = mitmIn.Close()
 		return nil, fmt.Errorf("mitmproxy: start mitmdump: %w", err)
 	}
-	safego.Go(func() { forwardMitmdumpOutput(mitmOut) })
+	proxyReady := make(chan struct{}, 1)
+	safego.Go(func() { forwardMitmdumpOutput(mitmOut, proxyReady) })
 	done := make(chan error, 1)
 	onExit := cfg.OnExit
 	safego.Go(func() {
@@ -143,7 +155,26 @@ func Launch(cfg Config) (*Running, error) {
 	})
 
 	log.Infof("[mitmproxy] mitmdump started (pid %d, transparent on %s:%d)", cmd.Process.Pid, listenHostLoopback, cfg.ListenPort)
+	if strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxyIdentityFile)) != "" {
+		if err := waitUpstreamProxyReady(proxyReady, done, 10*time.Second); err != nil {
+			_ = cmd.Process.Kill()
+			return nil, err
+		}
+	}
 	return &Running{Cmd: cmd, done: done}, nil
+}
+
+func waitUpstreamProxyReady(ready <-chan struct{}, exited <-chan error, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ready:
+		return nil
+	case <-exited:
+		return fmt.Errorf("upstream proxy addon exited before static configuration readiness")
+	case <-timer.C:
+		return fmt.Errorf("upstream proxy addon did not acknowledge static configuration readiness")
+	}
 }
 
 func buildMitmdumpArgs(cfg Config) []string {
@@ -162,8 +193,14 @@ func buildMitmdumpArgs(cfg Config) []string {
 	if constants.IsTruthy(os.Getenv(constants.EnvMitmproxySslInsecure)) {
 		args = append(args, "--set", "ssl_insecure=true")
 	}
+	if strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxyIdentityFile)) != "" {
+		args = append(args, "--set", "termlog_verbosity=info")
+	}
 
 	args = append(args, "-s", systemScriptPath)
+	if strings.TrimSpace(os.Getenv(publicegress.EnvPolicy)) != "" {
+		args = append(args, "--set", "mode=transparent", "--set", "listen_host=127.0.0.1", "--set", "connection_strategy=lazy", "--set", "upstream_cert=false", "--set", "rawtcp=false", "--set", "ignore_hosts", "--set", "tcp_hosts", "--set", "udp_hosts", "-s", publicPolicyScriptPath)
+	}
 	if strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxy)) != "" {
 		args = append(args, "-s", upstreamProxyScriptPath)
 	}
@@ -179,6 +216,11 @@ func buildMitmdumpEnv(base []string, home string) []string {
 	env := make([]string, 0, len(base)+1)
 	env = append(env, base...)
 	env = append(env, "HOME="+home)
+	if strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxyIdentityFile)) != "" {
+		// The readiness ACK travels over a pipe, not a terminal. Python's
+		// buffered stdout must not delay it until unrelated traffic fills a buffer.
+		env = append(env, "PYTHONUNBUFFERED=1")
+	}
 	return env
 }
 
@@ -186,11 +228,44 @@ func buildMitmdumpEnv(base []string, home string) []string {
 // stdout/stderr into the egress zap logger at warn level, so they land in the
 // same sink as egress logs (OPENSANDBOX_LOG_OUTPUT) and stand out from
 // mitmproxy's own high-volume flow logs, which are dropped.
-func forwardMitmdumpOutput(r io.ReadCloser) {
+func forwardMitmdumpOutput(r io.ReadCloser, proxyReady ...chan<- struct{}) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	systemReady := false
+	publicReady := strings.TrimSpace(os.Getenv(publicegress.EnvPolicy)) == ""
 	for scanner.Scan() {
 		line := strings.TrimRight(scanner.Text(), " \t\r")
+		message := line
+		if strings.HasPrefix(message, "[") {
+			if end := strings.Index(message, "] "); end != -1 {
+				message = message[end+2:]
+			}
+		}
+		if message == "credential proxy: system addon ready" {
+			systemReady = true
+			log.Infof("[mitmproxy] system addon ready")
+			continue
+		}
+		if message == "public policy: ready" && systemReady {
+			publicReady = true
+			log.Infof("[mitmproxy] public destination policy ready")
+			continue
+		}
+		if message == "upstream proxy: ready" && systemReady && publicReady {
+			for _, ch := range proxyReady {
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+			}
+			log.Infof("[mitmproxy] upstream proxy addon ready; system addon initialized first")
+			continue
+		}
+		if outcome := publicEvent(message); outcome != "" {
+			telemetry.RecordPublicEvent(outcome)
+			log.Infof("[mitmproxy] %s", message)
+			continue
+		}
 		msg, ok := credentialProxyMessage(line)
 		if !ok {
 			continue

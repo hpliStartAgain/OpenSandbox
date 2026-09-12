@@ -35,6 +35,7 @@ import select
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -52,7 +53,11 @@ def _free_port() -> int:
 class _ConnectProxy:
     """Minimal CONNECT proxy: records the CONNECT request, then tunnels bytes."""
 
-    def __init__(self) -> None:
+    def __init__(self, ssl_context=None, target_addresses=None) -> None:
+        self.ssl_context = ssl_context
+        self.target_addresses = target_addresses or {}
+        self.reject_status = None
+        self.reflect_identity_in_rejection = False
         self.port = _free_port()
         self.requests: list[dict[str, str]] = []
         self._lock = threading.Lock()
@@ -83,6 +88,8 @@ class _ConnectProxy:
         target: socket.socket | None = None
         try:
             conn.settimeout(10)
+            if self.ssl_context is not None:
+                conn = self.ssl_context.wrap_socket(conn, server_side=True)
             data = b""
             while b"\r\n\r\n" not in data:
                 chunk = conn.recv(4096)
@@ -112,7 +119,16 @@ class _ConnectProxy:
                         ),
                     }
                 )
-            target = socket.create_connection((host.decode(), int(port)), timeout=10)
+            if self.reject_status is not None:
+                reason = "Fixture Rejection"
+                if self.reflect_identity_in_rejection:
+                    reason += "; " + headers.get("proxy-authorization", "")
+                conn.sendall(
+                    f"HTTP/1.1 {self.reject_status} {reason}\r\nContent-Length: 0\r\n\r\n".encode()
+                )
+                return
+            address = (host.decode(), int(port))
+            target = socket.create_connection(self.target_addresses.get(address, address), timeout=10)
             conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
             if rest:
                 target.sendall(rest)
@@ -187,6 +203,7 @@ class _TlsTargetServer:
         try:
             conn.settimeout(10)
             tls = self._ctx.wrap_socket(conn, server_side=True)
+            conn = tls
             data = b""
             while b"\r\n\r\n" not in data:
                 chunk = tls.recv(4096)
@@ -269,9 +286,11 @@ class _TargetServer:
 
 
 def _start_mitmdump(
-    port: int, env_extra: dict[str, str], *extra_args: str
+    port: int, env_extra: dict[str, str], *extra_args: str, system_script: bool = False
 ) -> tuple[subprocess.Popen, list[str]]:
     script = Path(__file__).parents[1] / "mitmscripts" / "upstream_proxy.py"
+    script_args = ["-s", str(script.with_name("system.py"))] if system_script else []
+    confdir = tempfile.TemporaryDirectory(prefix="egress-mitm-test-")
     proc = subprocess.Popen(
         [
             MITMDUMP,
@@ -279,19 +298,22 @@ def _start_mitmdump(
             "127.0.0.1",
             "--listen-port",
             str(port),
+            *script_args,
             "-s",
             str(script),
             "--set",
             "connection_strategy=lazy",
             "--set",
             "termlog_verbosity=info",
+            "--set", "confdir=" + confdir.name,
             *extra_args,
         ],
-        env={**os.environ, **env_extra},
+        env={**os.environ, "PYTHONUNBUFFERED": "1", **env_extra},
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
+    proc.test_confdir = confdir
     log: list[str] = []
 
     def drain() -> None:
@@ -303,12 +325,16 @@ def _start_mitmdump(
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
         if proc.poll() is not None:
+            confdir.cleanup()
             raise RuntimeError(f"mitmdump exited early: {log}")
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.25):
-                return proc, log
+                if not env_extra.get("OPENSANDBOX_EGRESS_UPSTREAM_PROXY_IDENTITY_FILE") or any("upstream proxy: ready" in line for line in log):
+                    return proc, log
         except OSError:
-            time.sleep(0.1)
+            pass
+        time.sleep(0.1)
+    _stop(proc)
     raise RuntimeError(f"mitmdump did not start listening: {log}")
 
 
@@ -319,6 +345,11 @@ def _stop(proc: subprocess.Popen) -> None:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=10)
+    if getattr(proc, "test_confdir", None):
+        proc.test_confdir.cleanup()
+    if proc.stdout is not None:
+        proc.stdout.close()
 
 
 def _proxy_get(port: int, target: str) -> tuple[int, bytes]:
@@ -434,6 +465,7 @@ class UpstreamProxyRuntimeTest(unittest.TestCase):
                         ctx.check_hostname = False
                         ctx.verify_mode = ssl.CERT_NONE
                         tls = ctx.wrap_socket(sock, server_hostname="example.test")
+                        sock = tls
                         tls.sendall(
                             b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
                         )

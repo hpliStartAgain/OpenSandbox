@@ -33,6 +33,7 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/log"
 	"github.com/alibaba/opensandbox/egress/pkg/nftables"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
+	"github.com/alibaba/opensandbox/egress/pkg/publicegress"
 	"github.com/alibaba/opensandbox/egress/pkg/telemetry"
 	slogger "github.com/alibaba/opensandbox/internal/logger"
 	"github.com/alibaba/opensandbox/internal/safego"
@@ -48,6 +49,7 @@ type Proxy struct {
 	alwaysAllow             []policy.EgressRule
 	listenAddr              string
 	upstreams               []string // ordered resolver chain from discovery (immutable after New)
+	upstreamNetwork         string   // strict public egress uses TCP, never spoofable UDP
 	upstreamMu              sync.RWMutex
 	activeUpstreams         []string // healthy subset; same order as upstreams; used for forwarding
 	upstreamProbeName       string   // wire name for probe (FQDN or "." for root)
@@ -89,14 +91,32 @@ func New(p *policy.NetworkPolicy, listenAddr string, alwaysDeny, alwaysAllow []p
 	if p == nil {
 		p = policy.DefaultDenyPolicy()
 	}
-	upstreams, err := DiscoverUpstreams()
+	strict, err := publicegress.Parse(os.Getenv(publicegress.EnvPolicy))
 	if err != nil {
 		return nil, err
+	}
+	var upstreams []string
+	var upstreamNetwork string
+	if strict != nil {
+		if listenAddr != defaultListenAddr {
+			return nil, fmt.Errorf("public egress forbids DNS listener overrides")
+		}
+		listenAddr = publicegress.DNSListenAddr
+		upstreamNetwork = "tcp"
+		for _, ip := range strict.DNSServers {
+			upstreams = append(upstreams, net.JoinHostPort(ip, "53"))
+		}
+	} else {
+		upstreams, err = DiscoverUpstreams()
+		if err != nil {
+			return nil, err
+		}
 	}
 	probeName, probeQType := upstreamProbeFromEnv()
 	proxy := &Proxy{
 		listenAddr:              listenAddr,
 		upstreams:               upstreams,
+		upstreamNetwork:         upstreamNetwork,
 		activeUpstreams:         append([]string(nil), upstreams...),
 		upstreamProbeName:       probeName,
 		upstreamProbeQType:      probeQType,
@@ -394,6 +414,7 @@ func (p *Proxy) forwardContext(ctx context.Context, r *dns.Msg) (*dns.Msg, strin
 			query.SetEdns0(upstreamUDPSize, false)
 		}
 		c := &dns.Client{
+			Net:     p.upstreamNetwork,
 			Timeout: p.upstreamExchangeTimeout,
 			Dialer:  p.dialerForUpstream(upstream),
 			UDPSize: upstreamUDPSize,

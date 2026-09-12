@@ -76,6 +76,7 @@ class _VaultUnixServer:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._mode = "normal"
+        self._revision = 1
 
     def start(self) -> None:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -103,6 +104,8 @@ class _VaultUnixServer:
                 data += chunk
             with self._lock:
                 mode = self._mode
+                payload = self.payload
+                etag = f'"runtime-v{self._revision}"'.encode("ascii")
             if mode == "stall":
                 time.sleep(0.4)
             if mode == "server-error":
@@ -149,21 +152,21 @@ class _VaultUnixServer:
                     + body
                 )
                 return
-            if b'\r\nif-none-match: "runtime-v1"\r\n' in data.lower():
+            if b'\r\nif-none-match: ' + etag + b'\r\n' in data.lower():
                 conn.sendall(
                     b"HTTP/1.1 304 Not Modified\r\n"
-                    b'etag: "runtime-v1"\r\n'
+                    b'etag: ' + etag + b'\r\n'
                     b"content-length: 0\r\n\r\n"
                 )
                 return
             conn.sendall(
                 b"HTTP/1.1 200 OK\r\n"
-                b'etag: "runtime-v1"\r\n'
+                b'etag: ' + etag + b'\r\n'
                 b"content-type: application/json\r\n"
                 b"content-length: "
-                + str(len(self.payload)).encode("ascii")
+                + str(len(payload)).encode("ascii")
                 + b"\r\n\r\n"
-                + self.payload
+                + payload
             )
         except OSError:
             pass
@@ -173,6 +176,11 @@ class _VaultUnixServer:
     def set_mode(self, mode: str) -> None:
         with self._lock:
             self._mode = mode
+
+    def set_payload(self, payload: bytes) -> None:
+        with self._lock:
+            self.payload = payload
+            self._revision += 1
 
     def stop(self) -> None:
         self._stop.set()
@@ -191,6 +199,7 @@ def _free_port() -> int:
 
 
 @unittest.skipUnless(MITMDUMP, "mitmdump is not installed (pip install mitmproxy==11.0.2)")
+@unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Vault transport requires Unix sockets")
 class MitmproxyRuntimeRegressionTest(unittest.TestCase):
     """A real mitmdump must not crash when the credential proxy rejects a
     request whose body exceeds stream_large_bodies (mitmproxy 11.0.2 bug)."""

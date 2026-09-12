@@ -15,13 +15,16 @@
 package mitmproxy
 
 import (
+	"crypto/x509"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
+	"github.com/alibaba/opensandbox/egress/pkg/publicegress"
 )
 
 // UpstreamProxySpec is the validated chained upstream proxy endpoint parsed
@@ -42,15 +45,34 @@ const upstreamProxyScriptPath = "/var/egress/mitmscripts/upstream_proxy.py"
 // inconsistent (bad URL, or _AUTH without _PROXY).
 func UpstreamProxyFromEnv() (*UpstreamProxySpec, error) {
 	raw := strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxy))
+	identityFile := strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxyIdentityFile))
+	caFile := strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxyCAFile))
 	if raw == "" {
-		if strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxyAuth)) != "" {
-			return nil, fmt.Errorf("%s is set but %s is empty", constants.EnvUpstreamProxyAuth, constants.EnvUpstreamProxy)
+		if strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxyAuth)) != "" || identityFile != "" || caFile != "" {
+			return nil, fmt.Errorf("%s, %s or %s configured but %s is empty", constants.EnvUpstreamProxyAuth, constants.EnvUpstreamProxyIdentityFile, constants.EnvUpstreamProxyCAFile, constants.EnvUpstreamProxy)
 		}
 		return nil, nil
 	}
 	spec, err := parseUpstreamProxy(raw)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", constants.EnvUpstreamProxy, err)
+	}
+	if identityFile != "" || caFile != "" {
+		if identityFile == "" || caFile == "" || spec.Scheme != "https" || net.ParseIP(spec.Host) != nil || strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxyAuth)) != "" {
+			return nil, fmt.Errorf("upstream proxy file identity requires HTTPS with a DNS hostname, a gateway CA, and no inline authorization")
+		}
+		if constants.IsTruthy(os.Getenv(constants.EnvMitmproxySslInsecure)) {
+			return nil, fmt.Errorf("upstream proxy file identity forbids ssl_insecure")
+		}
+		if strings.TrimSpace(os.Getenv(constants.EnvMitmproxyScript)) != "" {
+			return nil, fmt.Errorf("upstream proxy file identity forbids additional mitmproxy scripts")
+		}
+		pem, err := os.ReadFile(caFile)
+		if err != nil || !x509.NewCertPool().AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("upstream proxy gateway CA must be a readable PEM certificate bundle")
+		}
+		// Identity is deliberately not read here: missing approval/issuance must
+		// not prevent local sandbox work or make readiness depend on a grant.
 	}
 	return &spec, nil
 }
@@ -59,8 +81,18 @@ func UpstreamProxyFromEnv() (*UpstreamProxySpec, error) {
 // configuration, before mitmdump is spawned: the addon cannot fix a bad spec
 // at runtime, and a silent fallback to direct egress would be a policy hole.
 func validateUpstreamProxyEnv() error {
-	_, err := UpstreamProxyFromEnv()
-	return err
+	spec, err := UpstreamProxyFromEnv()
+	if err != nil {
+		return err
+	}
+	strict, err := publicegress.Parse(os.Getenv(publicegress.EnvPolicy))
+	if err != nil {
+		return err
+	}
+	if strict != nil && (spec == nil || strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxyIdentityFile)) == "" || spec.Scheme != "https") {
+		return fmt.Errorf("public egress requires HTTPS upstream with file identity")
+	}
+	return nil
 }
 
 // parseUpstreamProxy parses "scheme://host[:port]" into a spec. The port
@@ -77,7 +109,7 @@ func parseUpstreamProxy(raw string) (UpstreamProxySpec, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return UpstreamProxySpec{}, fmt.Errorf("invalid URL: %w", err)
+		return UpstreamProxySpec{}, fmt.Errorf("invalid proxy URL")
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return UpstreamProxySpec{}, fmt.Errorf("unsupported scheme %q, want http or https", u.Scheme)

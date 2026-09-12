@@ -1,0 +1,2 @@
+# The egress image executes this file directly, including Windows build contexts.
+components/egress/scripts/cleanup.sh text eol=lf
