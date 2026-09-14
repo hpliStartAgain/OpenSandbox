@@ -91,6 +91,97 @@ class TestKubernetesSandboxServiceInit:
 
 class TestKubernetesSandboxServiceCreate:
 
+    @pytest.mark.asyncio
+    async def test_upstream_identity_placeholder_precedes_workload_and_gets_owner(
+        self, k8s_service, create_sandbox_request, mock_workload
+    ):
+        events = []
+        create_sandbox_request.network_policy = NetworkPolicy(
+            default_action="deny", egress=[]
+        )
+        k8s_service.app_config.egress = EgressConfig.model_validate(
+            {
+                "image": "egress:test@sha256:" + "1" * 64,
+                "mode": "dns+nft",
+                "upstream_proxy": {
+                    "enabled": True,
+                    "url": "https://gateway.example",
+                    "ca_bundle": {"secret_name": "gateway-ca"},
+                    "dns_servers": ["10.0.0.53"],
+                },
+            }
+        )
+        k8s_service.k8s_client.create_secret.side_effect = (
+            lambda **kwargs: events.append(("secret", kwargs))
+        )
+
+        def create_workload(**kwargs):
+            events.append(("workload", kwargs))
+            return {
+                "name": kwargs["sandbox_id"],
+                "uid": "owner-uid",
+                "apiVersion": "sandbox.opensandbox.io/v1alpha1",
+                "kind": "BatchSandbox",
+            }
+
+        k8s_service.workload_provider.create_workload.side_effect = create_workload
+        k8s_service.k8s_client.patch_secret.side_effect = (
+            lambda **kwargs: events.append(("owner", kwargs))
+        )
+        k8s_service.workload_provider.get_workload.return_value = mock_workload
+        k8s_service.workload_provider.get_status.return_value = {
+            "state": "Running",
+            "reason": "",
+            "message": "Pod is running",
+            "last_transition_at": datetime.now(timezone.utc),
+        }
+
+        response = await k8s_service.create_sandbox(create_sandbox_request)
+
+        assert [event[0] for event in events] == ["secret", "workload", "owner"]
+        secret_body = events[0][1]["body"]
+        assert secret_body["metadata"]["name"] == f"egress-identity-{response.id}"
+        assert secret_body["data"] == {"identity.jwt": ""}
+        owner_patch = events[2][1]["body"]["metadata"]["ownerReferences"][0]
+        assert owner_patch == {
+            "apiVersion": "sandbox.opensandbox.io/v1alpha1",
+            "kind": "BatchSandbox",
+            "name": response.id,
+            "uid": "owner-uid",
+            "blockOwnerDeletion": False,
+            "controller": False,
+        }
+        k8s_service.k8s_client.delete_secret.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_upstream_identity_placeholder_is_deleted_when_workload_create_fails(
+        self, k8s_service, create_sandbox_request
+    ):
+        create_sandbox_request.network_policy = NetworkPolicy(
+            default_action="deny", egress=[]
+        )
+        k8s_service.app_config.egress = EgressConfig.model_validate(
+            {
+                "image": "egress:test@sha256:" + "1" * 64,
+                "mode": "dns+nft",
+                "upstream_proxy": {
+                    "enabled": True,
+                    "url": "https://gateway.example",
+                    "ca_bundle": {"secret_name": "gateway-ca"},
+                    "dns_servers": ["10.0.0.53"],
+                },
+            }
+        )
+        k8s_service.workload_provider.create_workload.side_effect = RuntimeError(
+            "create failed"
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await k8s_service.create_sandbox(create_sandbox_request)
+
+        assert exc_info.value.status_code == 500
+        k8s_service.k8s_client.delete_secret.assert_called_once()
+
     def test_credential_proxy_requires_dns_nft_mode(
         self, k8s_service, create_sandbox_request
     ):

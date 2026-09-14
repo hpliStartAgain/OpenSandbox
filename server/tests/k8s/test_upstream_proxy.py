@@ -219,14 +219,14 @@ def test_request_cannot_override_transport_options(name):
         _context(_config(), networkPolicy={"defaultAction": "deny"}, env={name: "false"})
 
 
-def test_private_mounts_support_rotation_without_blocking_unissued_identity():
+def test_private_mounts_require_server_created_identity_placeholder():
     pod = _pod()
     validate_upstream_proxy_pod(pod, _settings())
     main = pod["containers"][0]
     egress = pod["initContainers"][0]
     assert main["volumeMounts"] == []
     private = {v["name"]: v for v in pod["volumes"]}
-    assert private["egress-identity"]["secret"]["optional"] is True
+    assert private["egress-identity"]["secret"]["optional"] is False
     assert not private["egress-gateway-ca"]["secret"].get("optional", False)
     assert all(
         m["readOnly"] and "subPath" not in m for m in egress["volumeMounts"] if m["name"] in private

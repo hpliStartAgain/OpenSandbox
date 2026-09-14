@@ -461,6 +461,26 @@ class K8sClient:
             body=body,
         )
 
+    def patch_secret(self, namespace: str, name: str, body: Any) -> Any:
+        """Patch a namespaced Secret without replacing its data."""
+        if self._write_limiter:
+            self._write_limiter.acquire()
+        return self.get_core_v1_api().patch_namespaced_secret(
+            name=name,
+            namespace=namespace,
+            body=body,
+        )
+
+    def delete_secret(self, namespace: str, name: str) -> Any:
+        """Delete a namespaced Secret."""
+        if self._write_limiter:
+            self._write_limiter.acquire()
+        return self.get_core_v1_api().delete_namespaced_secret(
+            name=name,
+            namespace=namespace,
+            body=client.V1DeleteOptions(),
+        )
+
 
     def list_pods(
         self,

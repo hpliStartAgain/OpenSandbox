@@ -110,6 +110,8 @@ from opensandbox_server.tenants.provider import TenantProvider
 
 logger = logging.getLogger(__name__)
 
+_IDENTITY_PLACEHOLDER_LABEL = "opensandbox.io/egress-identity-placeholder"
+
 
 def _is_namespace_not_found(exc: Exception) -> bool:
     """True when a K8s ApiException indicates the target namespace does not exist."""
@@ -838,6 +840,109 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     f"controller-driven (TTL) cleanup may not."
                 )
 
+    def _create_upstream_identity_placeholder(
+        self,
+        namespace: str,
+        sandbox_id: str,
+        egress_settings: Any,
+    ) -> Optional[str]:
+        """Create the empty Secret that the trusted issuer updates later.
+
+        Kubelet does not reliably begin projecting a Secret created after an
+        optional Secret volume was set up. Creating an empty key before the
+        workload makes later atomic issuer updates visible without rebuilding
+        the Pod. A pre-existing Secret remains issuer-owned and is not adopted.
+        """
+        upstream = getattr(egress_settings, "upstream_proxy", None)
+        if upstream is None:
+            return None
+        body = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": upstream.identity_secret_name,
+                "labels": {
+                    SANDBOX_ID_LABEL: sandbox_id,
+                    _IDENTITY_PLACEHOLDER_LABEL: "true",
+                },
+            },
+            "type": "Opaque",
+            # Empty base64 is an empty file. The egress addon rejects it until
+            # the trusted issuer writes a signed compact JWT.
+            "data": {upstream.identity_key: ""},
+        }
+        try:
+            self.k8s_client.create_secret(namespace=namespace, body=body)
+        except Exception as exc:
+            try:
+                from kubernetes.client import ApiException
+
+                if isinstance(exc, ApiException) and exc.status == 409:
+                    logger.info(
+                        "sandbox=%s | identity Secret '%s' already exists; "
+                        "leaving ownership with the issuer",
+                        sandbox_id,
+                        upstream.identity_secret_name,
+                    )
+                    return None
+            except Exception:
+                pass
+            raise
+        logger.info(
+            "sandbox=%s | created empty identity Secret placeholder '%s'",
+            sandbox_id,
+            upstream.identity_secret_name,
+        )
+        return upstream.identity_secret_name
+
+    def _attach_identity_placeholder_owner_reference(
+        self,
+        namespace: str,
+        secret_name: str,
+        workload_info: dict,
+    ) -> None:
+        """Make the Server-created placeholder follow the workload CR lifecycle."""
+        owner_uid = workload_info.get("uid")
+        owner_name = workload_info.get("name")
+        owner_api_version = workload_info.get("apiVersion")
+        owner_kind = workload_info.get("kind")
+        if not (owner_uid and owner_name and owner_api_version and owner_kind):
+            raise ValueError(
+                "workload provider must return name/uid/apiVersion/kind "
+                "for identity Secret ownership"
+            )
+        owner_ref = {
+            "apiVersion": owner_api_version,
+            "kind": owner_kind,
+            "name": owner_name,
+            "uid": owner_uid,
+            "blockOwnerDeletion": False,
+            "controller": False,
+        }
+        self.k8s_client.patch_secret(
+            namespace=namespace,
+            name=secret_name,
+            body={"metadata": {"ownerReferences": [owner_ref]}},
+        )
+
+    def _delete_identity_placeholder(self, namespace: str, secret_name: str) -> None:
+        """Best-effort cleanup when no workload owner was established."""
+        try:
+            self.k8s_client.delete_secret(namespace=namespace, name=secret_name)
+        except Exception as exc:
+            try:
+                from kubernetes.client import ApiException
+
+                if isinstance(exc, ApiException) and exc.status == 404:
+                    return
+            except Exception:
+                pass
+            logger.warning(
+                "failed to delete identity Secret placeholder '%s': %s",
+                secret_name,
+                exc,
+            )
+
     async def create_sandbox(self, request: CreateSandboxRequest) -> CreateSandboxResponse:
         """
         Create a new sandbox using Kubernetes Pod.
@@ -889,6 +994,8 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         # deleted (or already gone).
         workload_left_alive = False
         created_managed_pvcs: list[str] = []
+        identity_placeholder_name: Optional[str] = None
+        identity_placeholder_needs_cleanup = False
         try:
             context = _build_create_workload_context(
                 app_config=self.app_config,
@@ -900,6 +1007,14 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             )
             apply_access_renew_extend_seconds_to_mapping(context.annotations, request.extensions)
             apply_extensions_to_mapping(context.annotations, request.extensions)
+
+            identity_placeholder_name = await asyncio.to_thread(
+                self._create_upstream_identity_placeholder,
+                self._resolve_namespace(),
+                sandbox_id,
+                context.egress_settings,
+            )
+            identity_placeholder_needs_cleanup = identity_placeholder_name is not None
 
             ensure_volumes_valid(
                 request.volumes,
@@ -1013,6 +1128,42 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     raise _build_quota_exceeded_error(quota_error_message)
                 raise
 
+            if identity_placeholder_name is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._attach_identity_placeholder_owner_reference,
+                        self._resolve_namespace(),
+                        identity_placeholder_name,
+                        workload_info,
+                    )
+                except Exception as owner_ex:
+                    try:
+                        await asyncio.to_thread(
+                            self.workload_provider.delete_workload,
+                            sandbox_id,
+                            self._resolve_namespace(),
+                        )
+                        workload_left_alive = False
+                    except Exception as rollback_ex:
+                        if _is_not_found_error(rollback_ex):
+                            workload_left_alive = False
+                        else:
+                            # Keep the Secret mounted if rollback could not
+                            # prove that the workload is gone.
+                            identity_placeholder_needs_cleanup = False
+                            logger.error(
+                                "sandbox=%s | ownerReference patch and workload rollback failed; "
+                                "leaving identity Secret '%s' in place. owner_error=%s rollback_error=%s",
+                                sandbox_id,
+                                identity_placeholder_name,
+                                owner_ex,
+                                rollback_ex,
+                            )
+                    raise RuntimeError(
+                        "failed to attach identity Secret ownerReference"
+                    ) from owner_ex
+                identity_placeholder_needs_cleanup = False
+
             logger.info(
                 "Created sandbox: id=%s, workload=%s",
                 sandbox_id,
@@ -1125,6 +1276,20 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 },
             ) from e
         finally:
+            if identity_placeholder_needs_cleanup and identity_placeholder_name:
+                if workload_left_alive:
+                    logger.warning(
+                        "sandbox=%s | leaving identity Secret placeholder '%s': "
+                        "workload rollback did not confirm deletion",
+                        sandbox_id,
+                        identity_placeholder_name,
+                    )
+                else:
+                    await asyncio.to_thread(
+                        self._delete_identity_placeholder,
+                        self._resolve_namespace(),
+                        identity_placeholder_name,
+                    )
             if managed_pvcs_may_exist:
                 if workload_left_alive:
                     # The CR may still be in the cluster, possibly with pods

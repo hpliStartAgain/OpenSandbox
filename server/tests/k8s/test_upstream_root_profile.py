@@ -445,7 +445,7 @@ def test_final_manifest_rejects_sidecar_probe_security_and_init_mutations():
     identity_volume = next(
         volume for volume in pod["volumes"] if volume["name"] == "egress-identity"
     )
-    identity_volume["secret"]["optional"] = False
+    identity_volume["secret"]["optional"] = True
     with pytest.raises(ValueError, match="private volumes"):
         validate_upstream_proxy_pod(pod, settings)
 

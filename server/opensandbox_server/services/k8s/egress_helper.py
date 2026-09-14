@@ -479,11 +479,13 @@ def apply_egress_to_spec(
                 "items": [{"key": upstream.ca_key, "path": "ca.crt"}],
             }},
             {"name": "egress-identity", "secret": {
-                "secretName": upstream.identity_secret_name, "optional": True, "defaultMode": 0o444,
+                "secretName": upstream.identity_secret_name, "optional": False, "defaultMode": 0o444,
                 "items": [{"key": upstream.identity_key, "path": "identity.jwt"}],
             }},
         ]
-        # Directory mounts follow kubelet's atomic Secret projection updates.
+        # The Server creates an empty placeholder before the workload so the
+        # kubelet tracks this Secret from initial volume setup. Directory
+        # mounts then follow atomic Secret projection updates from the issuer.
         # 0444 permits the unprivileged mitmproxy child to read these files;
         # isolation comes from the mount namespace, not Pod-wide fsGroup.
         existing = pod_spec.get("volumes", [])

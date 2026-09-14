@@ -557,6 +557,21 @@ class TestK8sClient:
             namespace="ns", body=body
         )
 
+    def test_patch_and_delete_secret_delegate_to_api(self, k8s_runtime_config):
+        c = self._make_client(k8s_runtime_config)
+        patch_body = {"metadata": {"ownerReferences": [{"uid": "owner-uid"}]}}
+
+        c.patch_secret("ns", "identity", patch_body)
+        c.delete_secret("ns", "identity")
+
+        c._core_v1_api.patch_namespaced_secret.assert_called_once_with(
+            name="identity", namespace="ns", body=patch_body
+        )
+        c._core_v1_api.delete_namespaced_secret.assert_called_once()
+        _, kwargs = c._core_v1_api.delete_namespaced_secret.call_args
+        assert kwargs["name"] == "identity"
+        assert kwargs["namespace"] == "ns"
+
     def test_list_pods_returns_items(self, k8s_runtime_config):
         """list_pods returns the items attribute from the API response."""
         c = self._make_client(k8s_runtime_config)
