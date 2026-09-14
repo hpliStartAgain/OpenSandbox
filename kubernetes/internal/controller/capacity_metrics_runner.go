@@ -16,6 +16,8 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -42,7 +44,7 @@ type capacityMetricsRunner struct {
 }
 
 func SetupCapacityMetricsWithManager(mgr manager.Manager, allocations Allocator) error {
-	return mgr.Add(&capacityMetricsRunner{reader: mgr.GetClient(), allocations: allocations})
+	return mgr.Add(&capacityMetricsRunner{reader: mgr.GetCache(), allocations: allocations})
 }
 
 func (r *capacityMetricsRunner) NeedLeaderElection() bool {
@@ -50,13 +52,19 @@ func (r *capacityMetricsRunner) NeedLeaderElection() bool {
 }
 
 func (r *capacityMetricsRunner) Start(ctx context.Context) error {
-	if !capacityMetricsEnabled() {
+	endpointEnvironment, endpoint, enabled := capacityMetricsEndpoint()
+	if !enabled {
 		return nil
 	}
 	logger := logf.FromContext(ctx).WithName("capacity-metrics")
+	safeEndpoint := sanitizeOTLPEndpoint(endpoint)
+	if err := validateOTLPEndpoint(endpoint); err != nil {
+		logCapacityMetricsDisabled(logger, err, "configuration", endpointEnvironment, safeEndpoint)
+		return nil
+	}
 	exporter, err := otlpmetrichttp.New(ctx)
 	if err != nil {
-		logger.Error(err, "Unable to initialize OTLP metrics exporter")
+		logCapacityMetricsDisabled(logger, err, "exporter", endpointEnvironment, safeEndpoint)
 		return nil
 	}
 	res, err := resource.Merge(
@@ -64,7 +72,8 @@ func (r *capacityMetricsRunner) Start(ctx context.Context) error {
 		resource.NewSchemaless(semconv.ServiceName(controllerServiceName)),
 	)
 	if err != nil {
-		logger.Error(err, "Unable to initialize OTLP resource")
+		logCapacityMetricsDisabled(logger, err, "resource", endpointEnvironment, safeEndpoint)
+		shutdownMetricExporter(logger, exporter)
 		return nil
 	}
 	provider := sdkmetric.NewMeterProvider(
@@ -73,10 +82,11 @@ func (r *capacityMetricsRunner) Start(ctx context.Context) error {
 	)
 	registration, err := registerCapacityMetrics(provider.Meter(capacityMeterName), r.reader, r.allocations)
 	if err != nil {
-		logger.Error(err, "Unable to register capacity metrics")
+		logCapacityMetricsDisabled(logger, err, "registration", endpointEnvironment, safeEndpoint)
 		shutdownMetricProvider(logger, provider)
 		return nil
 	}
+	logger.Info("Capacity metrics enabled", "endpointEnvironment", endpointEnvironment, "endpoint", safeEndpoint)
 
 	<-ctx.Done()
 	if err := registration.Unregister(); err != nil {
@@ -86,9 +96,50 @@ func (r *capacityMetricsRunner) Start(ctx context.Context) error {
 	return nil
 }
 
-func capacityMetricsEnabled() bool {
-	return strings.TrimSpace(os.Getenv(otelMetricsEndpointEnvironment)) != "" ||
-		strings.TrimSpace(os.Getenv(otelEndpointEnvironment)) != ""
+func capacityMetricsEndpoint() (environment, endpoint string, enabled bool) {
+	if endpoint := strings.TrimSpace(os.Getenv(otelMetricsEndpointEnvironment)); endpoint != "" {
+		return otelMetricsEndpointEnvironment, endpoint, true
+	}
+	if endpoint := strings.TrimSpace(os.Getenv(otelEndpointEnvironment)); endpoint != "" {
+		return otelEndpointEnvironment, endpoint, true
+	}
+	return "", "", false
+}
+
+func validateOTLPEndpoint(endpoint string) error {
+	parsed, err := url.ParseRequestURI(strings.TrimSpace(endpoint))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return errors.New("endpoint must be an absolute HTTP(S) URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("endpoint scheme must be http or https")
+	}
+	return nil
+}
+
+func sanitizeOTLPEndpoint(endpoint string) string {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "<invalid>"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func logCapacityMetricsDisabled(logger logr.Logger, err error, stage, endpointEnvironment, endpoint string) {
+	logger.Error(err, "Capacity metrics disabled after OTLP setup failure",
+		"stage", stage, "endpointEnvironment", endpointEnvironment, "endpoint", endpoint)
+}
+
+func shutdownMetricExporter(logger logr.Logger, exporter *otlpmetrichttp.Exporter) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := exporter.Shutdown(ctx); err != nil {
+		logger.Error(err, "Unable to shut down OTLP metrics exporter")
+	}
 }
 
 func shutdownMetricProvider(logger logr.Logger, provider *sdkmetric.MeterProvider) {

@@ -16,6 +16,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -36,6 +38,7 @@ const (
 	poolMemoryRequestsMetricName = "controller.pool.memory.requested"
 	batchSandboxCountMetricName  = "controller.batchsandbox.count"
 	batchSandboxPodsMetricName   = "controller.batchsandbox.pods"
+	capacityCollectDurationName  = "controller.capacity.collect.duration"
 	unknownBatchSandboxPhase     = "Unknown"
 	allocationModePool           = "pool"
 	allocationModeDirect         = "direct"
@@ -78,7 +81,7 @@ func registerCapacityMetrics(meter metric.Meter, reader client.Reader, allocatio
 		metric.WithUnit("{pod}"),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create %s: %w", poolPodsMetricName, err)
 	}
 	poolCPU, err := meter.Float64ObservableGauge(
 		poolCPURequestsMetricName,
@@ -86,7 +89,7 @@ func registerCapacityMetrics(meter metric.Meter, reader client.Reader, allocatio
 		metric.WithUnit("{cpu}"),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create %s: %w", poolCPURequestsMetricName, err)
 	}
 	poolMemory, err := meter.Int64ObservableGauge(
 		poolMemoryRequestsMetricName,
@@ -94,7 +97,7 @@ func registerCapacityMetrics(meter metric.Meter, reader client.Reader, allocatio
 		metric.WithUnit("By"),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create %s: %w", poolMemoryRequestsMetricName, err)
 	}
 	batchSandboxCount, err := meter.Int64ObservableGauge(
 		batchSandboxCountMetricName,
@@ -102,7 +105,7 @@ func registerCapacityMetrics(meter metric.Meter, reader client.Reader, allocatio
 		metric.WithUnit("{batchsandbox}"),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create %s: %w", batchSandboxCountMetricName, err)
 	}
 	batchSandboxPods, err := meter.Int64ObservableGauge(
 		batchSandboxPodsMetricName,
@@ -110,10 +113,23 @@ func registerCapacityMetrics(meter metric.Meter, reader client.Reader, allocatio
 		metric.WithUnit("{pod}"),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create %s: %w", batchSandboxPodsMetricName, err)
+	}
+	collectDuration, err := meter.Float64ObservableGauge(
+		capacityCollectDurationName,
+		metric.WithDescription("Time spent reading cached objects and collecting controller capacity metrics"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create %s: %w", capacityCollectDurationName, err)
 	}
 
-	return meter.RegisterCallback(func(ctx context.Context, observer metric.Observer) error {
+	registration, err := meter.RegisterCallback(func(ctx context.Context, observer metric.Observer) error {
+		started := time.Now()
+		defer func() {
+			observer.ObserveFloat64(collectDuration, time.Since(started).Seconds())
+		}()
+
 		snapshot, err := collectCapacitySnapshot(ctx, reader, allocations)
 		if err != nil {
 			return err
@@ -145,17 +161,21 @@ func registerCapacityMetrics(meter metric.Meter, reader client.Reader, allocatio
 			))
 		}
 		return nil
-	}, poolPods, poolCPU, poolMemory, batchSandboxCount, batchSandboxPods)
+	}, poolPods, poolCPU, poolMemory, batchSandboxCount, batchSandboxPods, collectDuration)
+	if err != nil {
+		return nil, fmt.Errorf("register capacity metrics callback: %w", err)
+	}
+	return registration, nil
 }
 
 func collectCapacitySnapshot(ctx context.Context, reader client.Reader, allocations poolAllocationReader) (capacitySnapshot, error) {
 	pools := &sandboxv1alpha1.PoolList{}
 	if err := reader.List(ctx, pools); err != nil {
-		return capacitySnapshot{}, err
+		return capacitySnapshot{}, fmt.Errorf("list Pools from cache: %w", err)
 	}
 	batchSandboxes := &sandboxv1alpha1.BatchSandboxList{}
 	if err := reader.List(ctx, batchSandboxes); err != nil {
-		return capacitySnapshot{}, err
+		return capacitySnapshot{}, fmt.Errorf("list BatchSandboxes from cache: %w", err)
 	}
 
 	snapshot := capacitySnapshot{
@@ -186,11 +206,11 @@ func collectPoolCapacity(ctx context.Context, reader client.Reader, allocations 
 		Namespace:     pool.Namespace,
 		FieldSelector: fields.SelectorFromSet(fields.Set{fieldindex.IndexNameForOwnerRefUID: string(pool.UID)}),
 	}); err != nil {
-		return poolCapacity{}, err
+		return poolCapacity{}, fmt.Errorf("list Pods for Pool %s/%s from cache: %w", pool.Namespace, pool.Name, err)
 	}
 	allocatedPods, err := allocations.GetPoolAllocation(ctx, pool)
 	if err != nil {
-		return poolCapacity{}, err
+		return poolCapacity{}, fmt.Errorf("read allocations for Pool %s/%s: %w", pool.Namespace, pool.Name, err)
 	}
 
 	capacity := poolCapacity{
