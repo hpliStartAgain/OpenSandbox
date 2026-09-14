@@ -454,12 +454,16 @@ new vault revision only after the proxy acknowledges that exact snapshot and
 any required connection fence has been installed.
 
 The local transaction wire splits this conceptual object at the only
-non-circular boundary. The revision envelope carries `controlPlaneGeneration`,
-`subjectGeneration`, the coordinator-allocated `decisionEpoch`, and the digest
-of the exact payload bytes. The versioned canonical payload carries
-`vaultRevision`, `effectivePolicyEpoch`, `interceptionMode`, `state`,
-`tlsBindingHostSelectors`, `fullRenderedBindings`, and `redactions`. Together
-they form the complete snapshot; the receiver validates their agreement.
+non-circular boundary. Its established revision envelope has six fields:
+`controlGeneration` (the wire name for conceptual
+`controlPlaneGeneration`), `subjectGeneration`, the coordinator-allocated
+`decisionEpoch`, `vaultRevision`, `policyEpoch`, and `digest` of the exact
+payload bytes. The versioned canonical payload carries `vaultRevision`,
+`effectivePolicyEpoch`, `interceptionMode`, `state`,
+`tlsBindingHostSelectors`, `fullRenderedBindings`, and `redactions`. Payload
+`vaultRevision` must equal envelope `vaultRevision`; payload
+`effectivePolicyEpoch` is the semantic alias of and must equal envelope
+`policyEpoch`. Together the envelope and payload form the complete snapshot.
 
 An installed snapshot has no data TTL. It remains authoritative until it is
 explicitly replaced, the subject generation changes, the proxy process loses
