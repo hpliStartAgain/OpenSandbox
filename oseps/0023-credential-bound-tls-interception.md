@@ -808,20 +808,24 @@ metadata-only readback or exact commit/abort retries. Its transport is injected;
 an unused Go adapter now implements its strict JSON contract over a
 caller-provisioned private Unix socket, presents a high-entropy per-session
 bearer token for receiver-side authentication, and rejects malformed, oversized,
-or credential-bearing error responses. The Python
-receiver endpoint, live token handoff, and public Vault mutation path are not
-wired yet. Local close cancels pending transport and fences completion, but the
-future adapter must also fence the remote session and tear down
-receiver/connections. Startup/recovery and atomic public-store finalization under
-the shared mutation barrier remain integration work.
+or credential-bearing error responses. A matching unused Python endpoint now
+authenticates the bearer token before reading bounded request bodies, strictly
+decodes the envelope, and exposes only fixed errors and metadata
+acknowledgements. Neither adapter is loaded by the live process; token handoff,
+socket provisioning, and the public Vault mutation path remain unwired. Local
+close cancels pending transport and fences completion, but the future adapter
+must also fence the remote session and tear down receiver/connections.
+Startup/recovery and atomic public-store finalization under the shared mutation
+barrier remain integration work.
 
 The proxy-side transaction receiver is an in-memory foundation: it validates
 generation/epoch/digest identities, stages immutable bytes, and implements
-commit, abort, and metadata-only readback. It is not connected to the live addon
-or an IPC endpoint yet. The next integration must supply complete snapshot
-validation, authenticated transport, Go-side reconciliation, and connection
-fences before acknowledging public Vault mutations. Existing request processing
-continues to use the conditional ETag lookup until that integration is ready.
+commit, abort, and metadata-only readback. Its authenticated IPC endpoint is
+implemented but not connected to the live addon. The next integration must
+supply complete snapshot validation, process-lifetime token handoff, Go-side
+reconciliation, and connection fences before acknowledging public Vault
+mutations. Existing request processing continues to use the conditional ETag
+lookup until that integration is ready.
 
 Implementation has started with the internal host-selector algebra and shared
 Go/Python conformance vectors. The control plane owns non-transitional UTS #46

@@ -14,12 +14,13 @@
 
 """Generation-fenced in-memory snapshot receiver for OSEP-0023.
 
-This foundation has no IPC endpoint or live TLS hooks. The adapter must supply
-a pure, bounded validator for the complete payload (including agreement with
-the revision metadata). Validation must return None on success and raise on
-failure; any other return value is rejected. Transport authentication and
-request drain are separate integration responsibilities. Digests cover exact serialized bytes, not a
-reserialized JSON object.
+This receiver opens no IPC endpoint itself and has no live TLS hooks. The
+separate revision IPC adapter is not loaded by the live addon yet. Its owner
+must supply a pure, bounded validator for the complete payload (including
+agreement with the revision metadata). Validation must return None on success
+and raise on failure; any other return value is rejected. Request drain remains
+a separate integration responsibility. Digests cover exact serialized bytes,
+not a reserialized JSON object.
 
 No installed revision is unknown state, not authoritative empty Vault state.
 An explicit empty snapshot must pass the same prepare/commit path.
