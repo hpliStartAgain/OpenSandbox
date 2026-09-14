@@ -33,6 +33,7 @@ from opensandbox_server.services.constants import (
     OPEN_SANDBOX_EGRESS_AUTH_HEADER,
     OPENSANDBOX_EGRESS_DNS_UPSTREAM,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
+    OPENSANDBOX_EGRESS_PUBLIC_ISOLATION_MODE,
     OPENSANDBOX_EGRESS_PUBLIC_POLICY,
     OPENSANDBOX_EGRESS_SANDBOX_ID,
     OPENSANDBOX_EGRESS_TOKEN,
@@ -67,6 +68,14 @@ _PUBLIC_EGRESS_RESERVED_PORTS = {53, 353, 380, 381, 15353, 18080, 18081}
 _ROOT_PROFILE_SYSCTLS = (
     {"name": "net.ipv4.ip_unprivileged_port_start", "value": "1024"},
 )
+_CGROUP_V2_ROOT_ISOLATION = "cgroup-v2-root"
+_NONROOT_UID_ISOLATION = "nonroot-uid"
+_NONROOT_COMPAT_UID = 65532
+_PUBLIC_EGRESS_READY_MARKER = "/opt/opensandbox/public-egress-ready"
+_MITMPROXY_CA_FILE = "/opt/opensandbox/mitmproxy-ca-cert.pem"
+_NONROOT_EGRESS_GATE_PATH = "/opt/opensandbox/public-egress-gate"
+_NONROOT_EGRESS_GATE_ARG = "--wait-public-egress"
+_NONROOT_EGRESS_GATE_INSTALLER = "public-egress-gate-installer"
 _PUBLIC_EGRESS_METADATA_IPS = {
     "100.100.100.200",
     "100.100.100.201",
@@ -191,6 +200,21 @@ def build_root_compatible_security_context() -> Dict[str, Any]:
     }
 
 
+def build_nonroot_compatible_security_context() -> Dict[str, Any]:
+    """Return the fixed application boundary for the cgroup-v1 test profile."""
+    return {
+        "runAsUser": _NONROOT_COMPAT_UID,
+        "runAsGroup": _NONROOT_COMPAT_UID,
+        "runAsNonRoot": True,
+        "allowPrivilegeEscalation": False,
+        "privileged": False,
+        "seccompProfile": {"type": "RuntimeDefault"},
+        "capabilities": {
+            "drop": ["ALL"],
+        },
+    }
+
+
 def _build_egress_sidecar_security_context(*, strict: bool = False) -> Dict[str, Any]:
     """Return the fixed sidecar context while retaining NET_ADMIN for nftables."""
     capabilities = list(_EGRESS_SIDECAR_SECURITY_CONTEXT["capabilities"]["add"])
@@ -228,6 +252,47 @@ def _apply_root_compatible_profile(containers: List[Dict[str, Any]]) -> None:
     if len(sandbox_containers) != 1:
         raise ValueError("upstream_proxy requires exactly one sandbox container")
     sandbox_containers[0]["securityContext"] = build_root_compatible_security_context()
+
+
+def _apply_nonroot_compatible_profile(containers: List[Dict[str, Any]]) -> None:
+    """Force a non-root application and gate it on the regular egress sidecar.
+
+    Kubernetes releases without native sidecars start ordinary containers
+    concurrently. The server-owned static gate waits for both the MITM CA and a
+    marker written only after the egress stack is ready. A trusted init
+    container copies the gate from the pinned egress image, so a caller-owned
+    image cannot replace the program that enforces this ordering.
+    """
+    sandbox_containers = [
+        container for container in containers if container.get("name") == "sandbox"
+    ]
+    if len(sandbox_containers) != 1:
+        raise ValueError("upstream_proxy requires exactly one sandbox container")
+    sandbox = sandbox_containers[0]
+    command = sandbox.get("command")
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(value, str) or not value for value in command)
+        or sandbox.get("args")
+    ):
+        raise ValueError(
+            "nonroot-uid upstream_proxy requires the server-generated sandbox command"
+        )
+    sandbox["securityContext"] = build_nonroot_compatible_security_context()
+    sandbox["command"] = [_NONROOT_EGRESS_GATE_PATH]
+    sandbox["args"] = [
+        _NONROOT_EGRESS_GATE_ARG,
+        *command,
+    ]
+
+
+def _uses_native_sidecar(settings: EgressWorkloadSettings) -> bool:
+    upstream = settings.upstream_proxy
+    return bool(
+        upstream is not None
+        and upstream.isolation_mode == _CGROUP_V2_ROOT_ISOLATION
+    )
 
 
 def prep_execd_init_for_egress(exec_install_script: str) -> tuple[str, Dict[str, Any]]:
@@ -277,13 +342,11 @@ def apply_egress_to_spec(
     pod_spec: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Append the egress sidecar to ``containers``. For the administrator-managed
-    upstream profile, render it as a native Kubernetes sidecar init container
-    before the generated execd initializer so the network guard is installed
-    before the business container can start. When ``egress.disable_ipv6`` is
-    enabled, IPv6 is handled by the strict egress guard before the
-    root-compatible execd installer runs. The strict profile emits one fixed
-    Pod sysctl for low-port compatibility.
+    Append the egress sidecar to ``containers``. The default cgroup-v2-root
+    profile renders it as a native Kubernetes sidecar init container. The
+    explicit nonroot-uid compatibility profile uses an ordinary sidecar and a
+    server-owned application gate for clusters without native sidecars. Both
+    profiles emit one fixed Pod sysctl for protected low ports.
 
     ``sandbox_id`` is injected as ``OPENSANDBOX_EGRESS_SANDBOX_ID`` when provided.
     ``egress.otlp_endpoint`` is injected as ``OTEL_EXPORTER_OTLP_ENDPOINT`` when configured.
@@ -300,7 +363,12 @@ def apply_egress_to_spec(
         _validate_upstream_egress_image(egress_settings.image)
         if not egress_settings.auth_token or not egress_settings.auth_token.strip():
             raise ValueError("upstream_proxy requires the generated control API token")
-        _apply_root_compatible_profile(containers)
+        if upstream.isolation_mode == _CGROUP_V2_ROOT_ISOLATION:
+            _apply_root_compatible_profile(containers)
+        elif upstream.isolation_mode == _NONROOT_UID_ISOLATION:
+            _apply_nonroot_compatible_profile(containers)
+        else:
+            raise ValueError("upstream_proxy has an unsupported isolation mode")
         assert pod_spec is not None
         pod_spec["automountServiceAccountToken"] = False
         pod_security_context = pod_spec.get("securityContext")
@@ -345,6 +413,7 @@ def apply_egress_to_spec(
                 "OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_TRUST_DIR",
                 OPENSANDBOX_EGRESS_PUBLIC_POLICY,
                 OPENSANDBOX_EGRESS_DNS_UPSTREAM,
+                OPENSANDBOX_EGRESS_PUBLIC_ISOLATION_MODE,
             }):
                 raise ValueError("request env cannot override administrator upstream_proxy transport settings")
             if (
@@ -361,6 +430,7 @@ def apply_egress_to_spec(
         env.extend([
             {"name": OPENSANDBOX_EGRESS_PUBLIC_POLICY, "value": public_policy},
             {"name": OPENSANDBOX_EGRESS_DNS_UPSTREAM, "value": dns_upstream},
+            {"name": OPENSANDBOX_EGRESS_PUBLIC_ISOLATION_MODE, "value": upstream.isolation_mode},
             {"name": "OPENSANDBOX_EGRESS_UPSTREAM_PROXY", "value": upstream.url},
             {"name": "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_IDENTITY_FILE", "value": "/run/opensandbox/egress-identity/identity.jwt"},
             {"name": "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_CA_FILE", "value": "/run/opensandbox/egress-gateway-ca/ca.crt"},
@@ -425,13 +495,10 @@ def apply_egress_to_spec(
             {"name": "egress-identity", "mountPath": "/run/opensandbox/egress-identity", "readOnly": True},
         ]
     if upstream is not None:
-        # Native sidecars are ordered with init containers.  The readiness
-        # probe remains the authenticated HTTP health endpoint while the
-        # startup probe checks the server-owned readiness contract locally:
-        # the kubelet must not advance through the init sequence until egress
-        # has installed its policy and completed addon initialization.
-        assert pod_spec is not None
-        sidecar["restartPolicy"] = "Always"
+        # Both profiles validate the exact bundled image and live stack. Native
+        # sidecars additionally block the remaining init sequence. The
+        # nonroot compatibility profile gates the application on a ready marker
+        # in the server-owned runtime volume.
         sidecar["startupProbe"] = {
             "exec": {
                 "command": [
@@ -444,11 +511,39 @@ def apply_egress_to_spec(
             "periodSeconds": 2,
             "failureThreshold": 30,
         }
+    if upstream is not None and _uses_native_sidecar(egress_settings):
+        assert pod_spec is not None
+        sidecar["restartPolicy"] = "Always"
         init_containers = pod_spec.setdefault("initContainers", [])
         if not isinstance(init_containers, list):
             raise ValueError("upstream_proxy requires a list of init containers")
         pod_spec["initContainers"] = [sidecar, *init_containers]
     else:
+        if upstream is not None:
+            assert pod_spec is not None
+            init_containers = pod_spec.setdefault("initContainers", [])
+            if not isinstance(init_containers, list):
+                raise ValueError("upstream_proxy requires a list of init containers")
+            init_containers.append(
+                {
+                    "name": _NONROOT_EGRESS_GATE_INSTALLER,
+                    "image": egress_settings.image,
+                    "command": ["/bin/sh", "-ec"],
+                    "args": [
+                        "cp /opt/opensandbox-egress/egress "
+                        f"{_NONROOT_EGRESS_GATE_PATH} && "
+                        f"chmod 0555 {_NONROOT_EGRESS_GATE_PATH} && "
+                        f"chmod 0755 {OPENSANDBOX_RUNTIME_MOUNT_PATH}"
+                    ],
+                    "securityContext": build_root_compatible_security_context(),
+                    "volumeMounts": [
+                        {
+                            "name": OPENSANDBOX_RUNTIME_VOLUME_NAME,
+                            "mountPath": OPENSANDBOX_RUNTIME_MOUNT_PATH,
+                        }
+                    ],
+                }
+            )
         containers.append(sidecar)
 
 
@@ -587,6 +682,67 @@ def _validate_upstream_proxy_pod_safety(pod_spec: Dict[str, Any]) -> None:
             raise ValueError("upstream_proxy forbids an unmasked proc mount")
 
 
+def _validate_nonroot_compat_sandbox(
+    pod_spec: Dict[str, Any], sandbox: Dict[str, Any]
+) -> None:
+    """Protect the compatibility profile's cold-start and UID assumptions."""
+    if sandbox.get("command") != [_NONROOT_EGRESS_GATE_PATH]:
+        raise ValueError("nonroot-uid upstream_proxy sandbox readiness gate was changed")
+    args = sandbox.get("args")
+    if (
+        not isinstance(args, list)
+        or len(args) < 2
+        or args[0] != _NONROOT_EGRESS_GATE_ARG
+        or args[1] != "/opt/opensandbox/bootstrap.sh"
+        or any(not isinstance(value, str) or not value for value in args[1:])
+    ):
+        raise ValueError("nonroot-uid upstream_proxy sandbox readiness gate was changed")
+
+    # A template-provided fsGroup could make the runtime EmptyDir writable by
+    # UID 65532 and let the application forge the ready marker before egress is
+    # initialized. Keep this Pod-level context exact in the compatibility mode.
+    if pod_spec.get("securityContext") != {
+        "sysctls": _build_root_profile_sysctls()
+    }:
+        raise ValueError(
+            "nonroot-uid upstream_proxy Pod securityContext must be server generated"
+        )
+
+    volumes = pod_spec.get("volumes", [])
+    runtime_volumes = [
+        volume
+        for volume in volumes
+        if isinstance(volume, dict)
+        and volume.get("name") == OPENSANDBOX_RUNTIME_VOLUME_NAME
+    ]
+    if runtime_volumes != [
+        {"name": OPENSANDBOX_RUNTIME_VOLUME_NAME, "emptyDir": {}}
+    ]:
+        raise ValueError(
+            "nonroot-uid upstream_proxy runtime volume must be server generated"
+        )
+
+    protected_mounts = []
+    for mount in sandbox.get("volumeMounts", []) or []:
+        mount_path = mount.get("mountPath")
+        if not isinstance(mount_path, str):
+            continue
+        normalized = "/" + posixpath.normpath(mount_path).lstrip("/")
+        if normalized == OPENSANDBOX_RUNTIME_MOUNT_PATH or normalized.startswith(
+            f"{OPENSANDBOX_RUNTIME_MOUNT_PATH}/"
+        ):
+            protected_mounts.append(mount)
+    if protected_mounts != [
+        {
+            "name": OPENSANDBOX_RUNTIME_VOLUME_NAME,
+            "mountPath": OPENSANDBOX_RUNTIME_MOUNT_PATH,
+        }
+    ]:
+        raise ValueError(
+            "nonroot-uid upstream_proxy runtime mount must be server generated"
+        )
+
+
 def validate_upstream_proxy_pod(
     pod_spec: Dict[str, Any],
     settings: Optional[EgressWorkloadSettings],
@@ -604,18 +760,27 @@ def validate_upstream_proxy_pod(
     if settings is None or settings.upstream_proxy is None:
         return
     upstream = settings.upstream_proxy
+    native_sidecar = _uses_native_sidecar(settings)
     _validate_upstream_proxy_pod_safety(pod_spec)
 
     containers = pod_spec.get("containers", [])
-    if len(containers) != 1:
-        raise ValueError("upstream_proxy requires exactly one sandbox container")
+    expected_container_names = ["sandbox"] if native_sidecar else ["sandbox", "egress"]
+    if [container.get("name") for container in containers] != expected_container_names:
+        raise ValueError(
+            "upstream_proxy requires exactly one sandbox container and only the generated egress sidecar"
+        )
     sandbox_containers = [c for c in containers if c.get("name") == "sandbox"]
     if len(sandbox_containers) != 1:
         raise ValueError("upstream_proxy requires exactly one sandbox container")
-    if any(c.get("name") != "sandbox" for c in containers):
-        raise ValueError("upstream_proxy does not permit untrusted sidecar containers")
-    if sandbox_containers[0].get("securityContext") != build_root_compatible_security_context():
+    expected_sandbox_security = (
+        build_root_compatible_security_context()
+        if native_sidecar
+        else build_nonroot_compatible_security_context()
+    )
+    if sandbox_containers[0].get("securityContext") != expected_sandbox_security:
         raise ValueError("upstream_proxy sandbox securityContext was changed by the Pod template")
+    if not native_sidecar:
+        _validate_nonroot_compat_sandbox(pod_spec, sandbox_containers[0])
     main_env = sandbox_containers[0].get("env", [])
     if main_env is None:
         main_env = []
@@ -637,15 +802,30 @@ def validate_upstream_proxy_pod(
     # Build a fresh server-owned sidecar and private volume set.  The
     # placeholder sandbox is needed because the upstream profile is applied by
     # apply_egress_to_spec before it appends the sidecar.
+    expected_sandbox: Dict[str, Any] = {"name": "sandbox"}
+    if not native_sidecar:
+        expected_sandbox["command"] = ["/opt/opensandbox/bootstrap.sh"]
     expected_spec: Dict[str, Any] = {
         "automountServiceAccountToken": False,
-        "containers": [{"name": "sandbox"}],
+        "containers": [expected_sandbox],
         "initContainers": [],
         "volumes": [],
     }
     apply_egress_to_spec(expected_spec["containers"], settings, pod_spec=expected_spec)
+    expected_sidecar_source = (
+        expected_spec["initContainers"] if native_sidecar else expected_spec["containers"]
+    )
     expected_sidecar = next(
-        c for c in expected_spec["initContainers"] if c.get("name") == "egress"
+        c for c in expected_sidecar_source if c.get("name") == "egress"
+    )
+    expected_gate_installer = (
+        None
+        if native_sidecar
+        else next(
+            c
+            for c in expected_spec["initContainers"]
+            if c.get("name") == _NONROOT_EGRESS_GATE_INSTALLER
+        )
     )
 
     init_containers = pod_spec.get("initContainers", [])
@@ -654,17 +834,28 @@ def validate_upstream_proxy_pod(
     # server-owned fields below instead of comparing the whole dictionary here.
     # The generated execd init, however, is captured before template merging and
     # must remain identical, with the same bounded root profile as the app.
-    if not isinstance(init_containers, list) or not init_containers:
+    if not isinstance(init_containers, list):
         raise ValueError("upstream_proxy initContainers must be server generated")
-    if init_containers[0].get("name") != "egress":
-        raise ValueError("upstream_proxy initContainers must start with the generated egress sidecar")
-    if expected_execd_init is None:
-        if len(init_containers) != 1:
-            raise ValueError("upstream_proxy initContainers must be server generated")
-    else:
-        if len(init_containers) != 2 or init_containers[1] != expected_execd_init:
+    if native_sidecar:
+        if not init_containers or init_containers[0].get("name") != "egress":
+            raise ValueError(
+                "upstream_proxy initContainers must start with the generated egress sidecar"
+            )
+        if expected_execd_init is None:
+            if len(init_containers) != 1:
+                raise ValueError("upstream_proxy initContainers must be server generated")
+        elif len(init_containers) != 2 or init_containers[1] != expected_execd_init:
             raise ValueError("upstream_proxy generated init containers were changed by the Pod template")
-        if init_containers[1].get("securityContext") != build_root_compatible_security_context():
+    else:
+        assert expected_gate_installer is not None
+        if expected_execd_init is None:
+            if init_containers != [expected_gate_installer]:
+                raise ValueError("upstream_proxy initContainers must be server generated")
+        elif init_containers != [expected_execd_init, expected_gate_installer]:
+            raise ValueError("upstream_proxy generated init containers were changed by the Pod template")
+    if expected_execd_init is not None:
+        actual_execd_init = init_containers[1] if native_sidecar else init_containers[0]
+        if actual_execd_init.get("securityContext") != build_root_compatible_security_context():
             raise ValueError("upstream_proxy execd installer requires the bounded root profile")
 
     expected_volumes = {v["name"]: v for v in expected_spec["volumes"]}
@@ -673,7 +864,7 @@ def validate_upstream_proxy_pod(
         if [v for v in actual_volumes if v.get("name") == name] != [expected]:
             raise ValueError("upstream_proxy private volumes were changed by the Pod template")
 
-    actual_sidecar = init_containers[0]
+    actual_sidecar = init_containers[0] if native_sidecar else containers[1]
     if set(actual_sidecar) != set(expected_sidecar):
         raise ValueError("upstream_proxy sidecar was changed by the Pod template")
     if actual_sidecar.get("securityContext") != expected_sidecar.get("securityContext"):

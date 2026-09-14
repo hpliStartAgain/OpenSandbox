@@ -104,6 +104,7 @@ const (
 	EnvUpstreamProxyAuth         = "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH"
 	EnvUpstreamProxyIdentityFile = "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_IDENTITY_FILE"
 	EnvUpstreamProxyCAFile       = "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_CA_FILE"
+	EnvPublicIsolationMode       = "OPENSANDBOX_EGRESS_PUBLIC_ISOLATION_MODE"
 
 	// Comma-separated upstream resolvers: literal IP only (optional :port) — no hostnames (see dnsproxy REDIRECT note).
 	EnvDNSUpstream                 = "OPENSANDBOX_EGRESS_DNS_UPSTREAM"

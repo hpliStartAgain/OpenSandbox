@@ -128,7 +128,7 @@ func Launch(cfg Config) (*Running, error) {
 	if strings.TrimSpace(os.Getenv(publicegress.EnvPolicy)) != "" {
 		// Only the trusted egress child may bind the reserved backend. The
 		// application bounding set excludes NET_BIND_SERVICE, including root.
-		cmd.SysProcAttr.AmbientCaps = []uintptr{10} // CAP_NET_BIND_SERVICE
+		setAmbientNetBindService(cmd.SysProcAttr)
 	}
 	// HOME determines mitm's confdir (~/.mitmproxy) which holds both the CA
 	// and the baked-in config.yaml.

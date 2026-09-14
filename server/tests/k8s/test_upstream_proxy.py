@@ -189,6 +189,16 @@ def test_context_resolves_identity_from_server_sandbox_id():
     assert "gateway.example" not in str(context.sandbox_env)
 
 
+def test_context_propagates_explicit_nonroot_uid_isolation():
+    raw = _config().model_dump()
+    raw["egress"]["upstream_proxy"]["isolation_mode"] = "nonroot-uid"
+    context = _context(
+        AppConfig.model_validate(raw),
+        networkPolicy={"defaultAction": "deny"},
+    )
+    assert context.egress_settings.upstream_proxy.isolation_mode == "nonroot-uid"
+
+
 def test_omitting_policy_cannot_bypass_admin_proxy():
     with pytest.raises(ValueError, match="networkPolicy is required"):
         _context(_config())

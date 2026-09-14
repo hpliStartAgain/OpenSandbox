@@ -27,7 +27,8 @@ def manifest(root: Path) -> dict:
         raise ValueError("public-egress bundled addon is missing")
     return {
         "schema_version": 1,
-        "profile": "bprime-root-v1",
+        "profile": "public-egress-v1",
+        "supported_isolation_modes": ["cgroup-v2-root", "nonroot-uid"],
         "python": platform.python_version(),
         "mitmproxy": importlib.metadata.version("mitmproxy"),
         "sha256": {

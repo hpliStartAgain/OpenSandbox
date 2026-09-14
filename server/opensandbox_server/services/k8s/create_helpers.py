@@ -24,6 +24,7 @@ from opensandbox_server.config import AppConfig
 from opensandbox_server.services.constants import (
     OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE,
     OPENSANDBOX_EGRESS_DNS_UPSTREAM,
+    OPENSANDBOX_EGRESS_PUBLIC_ISOLATION_MODE,
     OPENSANDBOX_EGRESS_PUBLIC_POLICY,
     OPENSANDBOX_LIFECYCLE,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
@@ -126,6 +127,7 @@ def _build_create_workload_context(
             "OPENSANDBOX_EGRESS_MITMPROXY_EXTRA_PORTS",
             "OPENSANDBOX_EGRESS_POLICY_FILE",
             OPENSANDBOX_EGRESS_DNS_UPSTREAM,
+            OPENSANDBOX_EGRESS_PUBLIC_ISOLATION_MODE,
             OPENSANDBOX_EGRESS_PUBLIC_POLICY,
         }
         if forbidden.intersection(request.env or {}):
@@ -152,6 +154,7 @@ def _build_create_workload_context(
                     ca_key=upstream.ca_bundle.key,
                     identity_secret_name=f"{upstream.identity.secret_prefix}{sandbox_id}",
                     identity_key=upstream.identity.key,
+                    isolation_mode=upstream.isolation_mode,
                 )
                 if upstream and upstream.enabled and upstream.url and upstream.ca_bundle else None
             ),

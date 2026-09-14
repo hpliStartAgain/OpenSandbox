@@ -985,6 +985,15 @@ class EgressUpstreamProxyConfig(BaseModel):
     url: Optional[str] = None
     ca_bundle: Optional[EgressProxyCABundle] = None
     identity: EgressProxyIdentity = Field(default_factory=EgressProxyIdentity)
+    isolation_mode: Literal["cgroup-v2-root", "nonroot-uid"] = Field(
+        default="cgroup-v2-root",
+        description=(
+            "Workload isolation for public egress. cgroup-v2-root preserves the "
+            "root application contract and requires native sidecars plus cgroup v2. "
+            "nonroot-uid is an explicit compatibility profile for older test clusters; "
+            "it forces the application to UID/GID 65532 with no capabilities."
+        ),
+    )
     # No resolver fallback is safe for this profile: the operator must pin the
     # DNS servers used by both gateway and target resolution.
     dns_servers: list[str] = Field(default_factory=list, min_length=0, max_length=8)

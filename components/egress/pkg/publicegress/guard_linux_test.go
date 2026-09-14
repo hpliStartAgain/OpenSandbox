@@ -40,6 +40,58 @@ func TestGuardRulesNoUIDFallback(t *testing.T) {
 	}
 }
 
+func TestNonRootUIDGuardRulesAreExplicitAndScoped(t *testing.T) {
+	c, _ := Parse(`{"version":1,"dns_servers":["10.0.0.53"],"internal_targets":[]}`)
+	expression, err := trustedUIDExpression([]uint32{10042, 0, 10042})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expression != "meta skuid { 0, 10042 }" {
+		t.Fatalf("expression=%q", expression)
+	}
+	g := &Guard{
+		cfg:               c,
+		trustedSocketExpr: expression,
+		gatewayPort:       8443,
+	}
+	rules := g.rules()
+	for _, want := range []string{
+		`meta skuid { 0, 10042 } return`,
+		`meta skuid { 0, 10042 } ip daddr 10.0.0.53 tcp dport 53 accept`,
+		`meta skuid { 0, 10042 } ip daddr @gateway4 tcp dport 8443`,
+		`tcp dport { 80, 443 } redirect to :381`,
+		`policy drop`,
+	} {
+		if !strings.Contains(rules, want) {
+			t.Errorf("missing %s", want)
+		}
+	}
+	if strings.Contains(rules, `meta mark & 0x40000000 != 0 return`) {
+		t.Fatal("UID compatibility mode unexpectedly trusts the cgroup mark")
+	}
+	for _, invalid := range [][]uint32{{}, {0}, {10042}} {
+		if _, err := trustedUIDExpression(invalid); err == nil {
+			t.Fatalf("accepted trusted UIDs %v", invalid)
+		}
+	}
+}
+
+func TestIsolationModeIsExplicit(t *testing.T) {
+	for raw, want := range map[string]IsolationMode{
+		"":               IsolationCgroupV2Root,
+		"cgroup-v2-root": IsolationCgroupV2Root,
+		"nonroot-uid":    IsolationNonRootUID,
+	} {
+		got, err := ParseIsolationMode(raw)
+		if err != nil || got != want {
+			t.Fatalf("raw=%q got=%q err=%v", raw, got, err)
+		}
+	}
+	if _, err := ParseIsolationMode("auto"); err == nil {
+		t.Fatal("accepted automatic isolation downgrade")
+	}
+}
+
 func TestGatewayUpdates(t *testing.T) {
 	var got string
 	g := &Guard{run: func(_ context.Context, rules string) error { got = rules; return nil }}

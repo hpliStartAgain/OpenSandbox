@@ -15,6 +15,28 @@ import (
 
 const EnvPolicy = "OPENSANDBOX_EGRESS_PUBLIC_POLICY"
 
+type IsolationMode string
+
+const (
+	IsolationCgroupV2Root IsolationMode = "cgroup-v2-root"
+	IsolationNonRootUID   IsolationMode = "nonroot-uid"
+)
+
+// ParseIsolationMode keeps the production root boundary as the default. The
+// UID mode is an explicit compatibility contract and is safe only when the
+// workload renderer forces the application to a distinct non-root UID with no
+// SETUID/SETGID or other capabilities.
+func ParseIsolationMode(raw string) (IsolationMode, error) {
+	switch IsolationMode(strings.TrimSpace(raw)) {
+	case "", IsolationCgroupV2Root:
+		return IsolationCgroupV2Root, nil
+	case IsolationNonRootUID:
+		return IsolationNonRootUID, nil
+	default:
+		return "", fmt.Errorf("unsupported public egress isolation mode")
+	}
+}
+
 // Strict services bind privileged backend ports. The old high-port control
 // and DNS addresses are persistent NAT frontends, never trusted listeners.
 const DNSListenAddr = "127.0.0.1:353"

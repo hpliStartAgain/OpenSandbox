@@ -52,6 +52,7 @@ To bypass decryption for selected domains, edit the baked-in
 | `OPENSANDBOX_EGRESS_MITMPROXY_EXTRA_PORTS` | No | **Experimental.** Extra destination TCP ports to intercept, appended to the always-on `80,443` (comma-separated, e.g. `8080,8443`). Fails closed at startup on invalid input; total ports (including 80/443) must be ≤ 15. Note: the system addon's credential-binding matcher currently only fires on canonical 80/443 — extras are decrypted and logged but not matched against bindings. | Empty |
 | `OPENSANDBOX_EGRESS_UPSTREAM_PROXY` | No | Chained upstream proxy endpoint (`http://host[:port]` or `https://host[:port]`). When set, the bundled `upstream_proxy.py` addon is loaded after the system addon and every mitmproxy-handled connection is forwarded through the proxy via `CONNECT`. Fail closed: pass-through flows that cannot be chained are refused. | Empty (disabled) |
 | `OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH` | No | Complete `Proxy-Authorization` header value sent on the upstream `CONNECT` (e.g. `Basic base64(user:pass)`). Requires `OPENSANDBOX_EGRESS_UPSTREAM_PROXY`; startup fails if set alone. Never logged. | Empty |
+| `OPENSANDBOX_EGRESS_PUBLIC_ISOLATION_MODE` | No | Administrator-owned public-egress isolation: `cgroup-v2-root` or explicit test-only `nonroot-uid`. Never expose as a sandbox request field. | `cgroup-v2-root` |
 
 Notes:
 

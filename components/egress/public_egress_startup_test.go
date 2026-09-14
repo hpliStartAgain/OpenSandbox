@@ -4,7 +4,11 @@
 package main
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 )
@@ -30,5 +34,65 @@ func TestPublicEgressStartupRequiresProtectedPortAndControlIdentity(t *testing.T
 				t.Fatalf("valid=%v, error=%v", tc.valid, err)
 			}
 		})
+	}
+}
+
+func TestPublicEgressStartupRejectsUnknownIsolationMode(t *testing.T) {
+	t.Setenv(constants.EnvMitmproxyPort, "381")
+	t.Setenv(constants.EnvEgressToken, "fixture")
+	t.Setenv(constants.EnvUpstreamProxyIdentityFile, "/fixture/identity.jwt")
+	t.Setenv(constants.EnvPublicIsolationMode, "auto")
+	if err := validatePublicEgressStartup(); err == nil {
+		t.Fatal("accepted automatic isolation downgrade")
+	}
+}
+
+func TestPublicEgressReadyMarkerIsAtomicAndResettable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "public-egress-ready")
+	if err := writePublicEgressReadyMarkerAt(path); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil || string(content) != "ready\n" {
+		t.Fatalf("content=%q err=%v", content, err)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("temporary marker remains: %v", err)
+	}
+	if err := resetPublicEgressReadyMarkerAt(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("ready marker remains: %v", err)
+	}
+}
+
+func TestPublicEgressCompatibilityGateWaitsForProtectedFiles(t *testing.T) {
+	directory := t.TempDir()
+	caPath := filepath.Join(directory, "ca.pem")
+	markerPath := filepath.Join(directory, "ready")
+	if err := os.WriteFile(caPath, []byte("ca"), 0444); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := waitForPublicEgressFiles(
+		ctx, caPath, markerPath, uint32(os.Getuid()), time.Millisecond,
+	); err == nil {
+		t.Fatal("gate passed without the ready marker")
+	}
+	if err := os.WriteFile(markerPath, []byte("ready"), 0444); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForPublicEgressFiles(
+		context.Background(), caPath, markerPath, uint32(os.Getuid()), time.Millisecond,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(markerPath, 0666); err != nil {
+		t.Fatal(err)
+	}
+	if readyFileOwnedBy(markerPath, uint32(os.Getuid())) {
+		t.Fatal("gate trusted a group/world-writable marker")
 	}
 }

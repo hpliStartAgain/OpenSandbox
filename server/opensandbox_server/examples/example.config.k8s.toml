@@ -106,6 +106,8 @@ mode = "dns"
 # rule matches the configured host exactly, while the resolver expands partial
 # service names (e.g. otel-collector.observability) to FQDNs the rule misses.
 # otlp_endpoint = "http://otel-collector.observability.svc.cluster.local:4318"
+# Administrator-managed upstream proxy profiles, including the explicit
+# cgroup-v1 test compatibility mode, are documented in docs/guides/upstream-proxy.md.
 
 # Renew-on-access. Off by default — see server/README.md.
 [renew_intent]

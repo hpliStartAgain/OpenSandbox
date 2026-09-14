@@ -56,10 +56,100 @@ func validatePublicEgressStartup() error {
 	if port != "" && port != strconv.Itoa(publicegress.MITMPort) {
 		return fmt.Errorf("public egress requires the reserved MITM backend port %d", publicegress.MITMPort)
 	}
+	if _, err := publicegress.ParseIsolationMode(
+		os.Getenv(constants.EnvPublicIsolationMode),
+	); err != nil {
+		return err
+	}
 	return nil
 }
 
+const publicEgressReadyMarker = constants.OpenSandboxRootDir + "/public-egress-ready"
+const publicEgressGateArg = "--wait-public-egress"
+const publicEgressCompatUID = 65532
+
+func resetPublicEgressReadyMarker() error {
+	return resetPublicEgressReadyMarkerAt(publicEgressReadyMarker)
+}
+
+func resetPublicEgressReadyMarkerAt(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func writePublicEgressReadyMarker() error {
+	return writePublicEgressReadyMarkerAt(publicEgressReadyMarker)
+}
+
+func writePublicEgressReadyMarkerAt(path string) error {
+	temporary := path + ".tmp"
+	if err := os.WriteFile(temporary, []byte("ready\n"), 0444); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		_ = os.Remove(temporary)
+		return err
+	}
+	return nil
+}
+
+func readyFileOwnedBy(path string, owner uint32) bool {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Mode().Perm()&0022 != 0 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == owner
+}
+
+func waitForPublicEgressFiles(
+	ctx context.Context, caPath, markerPath string, owner uint32, interval time.Duration,
+) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if readyFileOwnedBy(caPath, owner) && readyFileOwnedBy(markerPath, owner) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func runPublicEgressGate(command []string) error {
+	if os.Geteuid() != publicEgressCompatUID {
+		return fmt.Errorf("public egress compatibility gate requires UID %d", publicEgressCompatUID)
+	}
+	if len(command) == 0 || command[0] != "/opt/opensandbox/bootstrap.sh" {
+		return fmt.Errorf("public egress compatibility gate requires the server bootstrap")
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	if err := waitForPublicEgressFiles(
+		ctx,
+		constants.OpenSandboxRootDir+"/mitmproxy-ca-cert.pem",
+		publicEgressReadyMarker,
+		0,
+		250*time.Millisecond,
+	); err != nil {
+		return err
+	}
+	return syscall.Exec(command[0], command, os.Environ())
+}
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == publicEgressGateArg {
+		if err := runPublicEgressGate(os.Args[2:]); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "public egress compatibility gate: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	version.EchoVersion("OpenSandbox Egress")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -82,6 +172,9 @@ func main() {
 	// Erase any stale mitmproxy CA left on the shared volume by a previous
 	// egress generation so the agent's bootstrap wait-loop blocks for this
 	// generation's export. See PurgeStaleExportedCA / upstream issue #1370.
+	if err := resetPublicEgressReadyMarker(); err != nil {
+		log.Fatalf("public egress ready marker cleanup: %v", err)
+	}
 	mitmproxy.PurgeStaleExportedCA()
 
 	strictPolicy, err := publicegress.Parse(os.Getenv(publicegress.EnvPolicy))
@@ -97,13 +190,37 @@ func main() {
 		if err := validatePublicEgressStartup(); err != nil {
 			log.Fatalf("%v", err)
 		}
+		isolationMode, err := publicegress.ParseIsolationMode(
+			os.Getenv(constants.EnvPublicIsolationMode),
+		)
+		if err != nil {
+			log.Fatalf("public egress isolation: %v", err)
+		}
 		installCtx, installCancel := context.WithTimeout(ctx, 15*time.Second)
-		publicGuard, err = publicegress.Install(installCtx, strictPolicy, uint16(spec.Port))
+		switch isolationMode {
+		case publicegress.IsolationCgroupV2Root:
+			publicGuard, err = publicegress.Install(
+				installCtx, strictPolicy, uint16(spec.Port),
+			)
+		case publicegress.IsolationNonRootUID:
+			mitmUID, _, _, lookupErr := mitmproxy.LookupUser(mitmproxy.RunAsUser)
+			if lookupErr != nil {
+				err = lookupErr
+				break
+			}
+			publicGuard, err = publicegress.InstallNonRootUID(
+				installCtx, strictPolicy, uint16(spec.Port), mitmUID,
+			)
+		}
 		installCancel()
 		if err != nil {
-			log.Fatalf("public egress root boundary: %v", err)
+			log.Fatalf("public egress isolation boundary: %v", err)
 		}
-		log.Infof("public egress: cgroup-v2 root boundary installed; no UID fallback")
+		if isolationMode == publicegress.IsolationCgroupV2Root {
+			log.Infof("public egress: cgroup-v2 root boundary installed; no UID fallback")
+		} else {
+			log.Warnf("public egress: nonroot UID compatibility boundary installed; test clusters only")
+		}
 	}
 
 	otelShutdown, err := telemetry.Init(ctx)
@@ -241,6 +358,11 @@ func main() {
 		log.Fatalf("mitmproxy transparent: %v", err)
 	}
 	mitmGate.MarkStackReady()
+	if strictPolicy != nil {
+		if err := writePublicEgressReadyMarker(); err != nil {
+			log.Fatalf("public egress ready marker: %v", err)
+		}
+	}
 	if mitm != nil {
 		mitm.watchMitmproxy(ctx, mitmGate)
 	}

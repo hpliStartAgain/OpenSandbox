@@ -105,6 +105,7 @@ mode = "dns"
 # 按配置的 host 精确匹配，而解析器会把部分服务名（如 otel-collector.observability）
 # 扩展成规则匹配不到的 FQDN。
 # otlp_endpoint = "http://otel-collector.observability.svc.cluster.local:4318"
+# 管理员集中出口及显式 cgroup v1 测试兼容模式见 docs/guides/upstream-proxy.md。
 
 # 按访问续期。默认关闭 — 见 server/README_zh.md。
 [renew_intent]

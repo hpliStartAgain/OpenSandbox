@@ -33,6 +33,7 @@ class UpstreamProxySettings:
     ca_key: str
     identity_secret_name: str
     identity_key: str
+    isolation_mode: str = "cgroup-v2-root"
 
 
 @dataclass(frozen=True)

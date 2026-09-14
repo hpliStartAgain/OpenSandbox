@@ -22,6 +22,7 @@ from opensandbox_server.api.schema import ImageSpec, NetworkPolicy
 from opensandbox_server.config import AppConfig, EgressUpstreamProxyConfig
 from opensandbox_server.services.constants import (
     OPENSANDBOX_EGRESS_DNS_UPSTREAM,
+    OPENSANDBOX_EGRESS_PUBLIC_ISOLATION_MODE,
     OPENSANDBOX_EGRESS_PUBLIC_POLICY,
 )
 from opensandbox_server.services.helpers import split_egress_env
@@ -29,6 +30,7 @@ from opensandbox_server.services.k8s.agent_sandbox_provider import AgentSandboxP
 from opensandbox_server.services.k8s.batchsandbox_provider import BatchSandboxProvider
 from opensandbox_server.services.k8s.egress_helper import (
     apply_egress_to_spec,
+    build_nonroot_compatible_security_context,
     build_root_compatible_security_context,
     validate_upstream_proxy_pod,
 )
@@ -40,7 +42,12 @@ from opensandbox_server.services.k8s.workload_provider import (
 UPSTREAM_EGRESS_IMAGE = "egress:test@sha256:" + "0123456789abcdef" * 4
 
 
-def _config(provider: str = "batchsandbox", *, enabled: bool = True) -> AppConfig:
+def _config(
+    provider: str = "batchsandbox",
+    *,
+    enabled: bool = True,
+    isolation_mode: str = "cgroup-v2-root",
+) -> AppConfig:
     return AppConfig.model_validate(
         {
             "runtime": {"type": "kubernetes", "execd_image": "execd:test"},
@@ -52,6 +59,7 @@ def _config(provider: str = "batchsandbox", *, enabled: bool = True) -> AppConfi
                     "enabled": enabled,
                     "url": "https://gateway.example",
                     "ca_bundle": {"secret_name": "gateway-ca"},
+                    "isolation_mode": isolation_mode,
                     "dns_servers": ["192.0.2.53"],
                     "internal_targets": [
                         {
@@ -85,6 +93,7 @@ def _settings(config: AppConfig) -> EgressWorkloadSettings:
             ca_key=proxy.ca_bundle.key,
             identity_secret_name="egress-identity-test-id",
             identity_key=proxy.identity.key,
+            isolation_mode=proxy.isolation_mode,
         ),
         public_policy=proxy.public_policy_json(),
     )
@@ -101,8 +110,14 @@ def _raw_pod(settings: EgressWorkloadSettings) -> dict:
     return pod
 
 
-def _rendered_pod(provider_cls, provider_name: str, pod_key: str) -> dict:
-    config = _config(provider_name)
+def _rendered_pod(
+    provider_cls,
+    provider_name: str,
+    pod_key: str,
+    *,
+    isolation_mode: str = "cgroup-v2-root",
+) -> dict:
+    config = _config(provider_name, isolation_mode=isolation_mode)
     settings = _settings(config)
     client = MagicMock()
     client.create_custom_object.return_value = {
@@ -194,6 +209,119 @@ def test_both_providers_render_root_compatible_profile_and_native_sidecar(
     assert installer["securityContext"] == build_root_compatible_security_context()
     assert "disable_ipv6" not in str(installer.get("command", []))
     assert "disable_ipv6" not in str(installer.get("args", []))
+
+
+@pytest.mark.parametrize(
+    "provider_cls,provider_name,pod_key",
+    [
+        (BatchSandboxProvider, "batchsandbox", "template"),
+        (AgentSandboxProvider, "agent-sandbox", "podTemplate"),
+    ],
+)
+def test_both_providers_render_nonroot_uid_compatibility_profile(
+    provider_cls, provider_name, pod_key
+):
+    pod = _rendered_pod(
+        provider_cls,
+        provider_name,
+        pod_key,
+        isolation_mode="nonroot-uid",
+    )
+
+    assert [container["name"] for container in pod["containers"]] == [
+        "sandbox",
+        "egress",
+    ]
+    sandbox, sidecar = pod["containers"]
+    assert sandbox["securityContext"] == build_nonroot_compatible_security_context()
+    assert sandbox["command"] == ["/opt/opensandbox/public-egress-gate"]
+    assert sandbox["args"][:3] == [
+        "--wait-public-egress",
+        "/opt/opensandbox/bootstrap.sh",
+        "sleep",
+    ]
+
+    assert [container["name"] for container in pod["initContainers"]] == [
+        "execd-installer",
+        "public-egress-gate-installer",
+    ]
+    gate_installer = pod["initContainers"][1]
+    assert gate_installer["image"] == sidecar["image"]
+    assert "public-egress-gate" in gate_installer["args"][0]
+    assert "chmod 0755 /opt/opensandbox" in gate_installer["args"][0]
+    assert gate_installer["securityContext"] == build_root_compatible_security_context()
+    assert "restartPolicy" not in sidecar
+    assert sidecar["startupProbe"]["exec"]["command"][-1] == "--check-ready"
+    env = {entry["name"]: entry["value"] for entry in sidecar["env"]}
+    assert env[OPENSANDBOX_EGRESS_PUBLIC_ISOLATION_MODE] == "nonroot-uid"
+
+
+def test_nonroot_uid_profile_rejects_gate_uid_and_runtime_volume_mutations():
+    settings = _settings(_config(isolation_mode="nonroot-uid"))
+    pod = {
+        "containers": [
+            {
+                "name": "sandbox",
+                "command": ["/opt/opensandbox/bootstrap.sh", "sleep", "600"],
+                "env": [],
+                "volumeMounts": [
+                    {"name": "opensandbox-bin", "mountPath": "/opt/opensandbox"}
+                ],
+            }
+        ],
+        "initContainers": [],
+        "volumes": [{"name": "opensandbox-bin", "emptyDir": {}}],
+    }
+    apply_egress_to_spec(pod["containers"], settings, pod_spec=pod)
+    validate_upstream_proxy_pod(pod, settings)
+
+    pod["containers"][0]["securityContext"]["runAsUser"] = 0
+    with pytest.raises(ValueError, match="sandbox securityContext"):
+        validate_upstream_proxy_pod(pod, settings)
+
+    pod = {
+        "containers": [
+            {
+                "name": "sandbox",
+                "command": ["/opt/opensandbox/bootstrap.sh"],
+                "env": [],
+                "volumeMounts": [
+                    {"name": "opensandbox-bin", "mountPath": "/opt/opensandbox"}
+                ],
+            }
+        ],
+        "initContainers": [],
+        "volumes": [{"name": "opensandbox-bin", "emptyDir": {}}],
+    }
+    apply_egress_to_spec(pod["containers"], settings, pod_spec=pod)
+    pod["containers"][0]["args"][0] = "--skip-public-egress"
+    with pytest.raises(ValueError, match="readiness gate"):
+        validate_upstream_proxy_pod(pod, settings)
+
+    pod = {
+        "containers": [
+            {
+                "name": "sandbox",
+                "command": ["/opt/opensandbox/bootstrap.sh"],
+                "env": [],
+                "volumeMounts": [
+                    {"name": "opensandbox-bin", "mountPath": "/opt/opensandbox"}
+                ],
+            }
+        ],
+        "initContainers": [],
+        "volumes": [{"name": "opensandbox-bin", "emptyDir": {}}],
+    }
+    apply_egress_to_spec(pod["containers"], settings, pod_spec=pod)
+    pod["volumes"][0] = {"name": "opensandbox-bin", "emptyDir": {"medium": "Memory"}}
+    with pytest.raises(ValueError, match="runtime volume"):
+        validate_upstream_proxy_pod(pod, settings)
+
+
+def test_isolation_mode_defaults_to_root_and_rejects_unknown_values():
+    assert EgressUpstreamProxyConfig().isolation_mode == "cgroup-v2-root"
+    with pytest.raises(ValidationError, match="isolation_mode"):
+        EgressUpstreamProxyConfig(isolation_mode="auto")
 
 
 def test_default_off_keeps_regular_egress_container_and_no_root_profile():
@@ -716,7 +844,14 @@ def test_helper_policy_rejects_all_reserved_internal_ports(reserved_port):
         apply_egress_to_spec(pod["containers"], settings, pod_spec=pod)
 
 
-@pytest.mark.parametrize("name", [OPENSANDBOX_EGRESS_DNS_UPSTREAM, OPENSANDBOX_EGRESS_PUBLIC_POLICY])
+@pytest.mark.parametrize(
+    "name",
+    [
+        OPENSANDBOX_EGRESS_DNS_UPSTREAM,
+        OPENSANDBOX_EGRESS_PUBLIC_ISOLATION_MODE,
+        OPENSANDBOX_EGRESS_PUBLIC_POLICY,
+    ],
+)
 def test_request_cannot_set_server_owned_public_policy_environment(name):
     with pytest.raises(ValueError, match="not allowed"):
         split_egress_env({name: "attacker-controlled"})

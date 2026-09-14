@@ -36,6 +36,11 @@ class PublicEgressManifestTest(unittest.TestCase):
             ):
                 value = module.manifest(root)
                 self.assertEqual(value["mitmproxy"], "11.0.2")
+                self.assertEqual(value["profile"], "public-egress-v1")
+                self.assertEqual(
+                    value["supported_isolation_modes"],
+                    ["cgroup-v2-root", "nonroot-uid"],
+                )
                 self.assertEqual(len(value["sha256"]), len(paths))
                 for path in paths:
                     self.assertEqual(

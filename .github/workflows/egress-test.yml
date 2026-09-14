@@ -95,6 +95,16 @@ jobs:
           chmod +x tests/smoke-nft.sh
           ./tests/smoke-nft.sh
 
+      - name: Run public egress non-root compatibility isolation
+        working-directory: components/egress
+        run: |
+          go test -c -o /tmp/publicegress.test ./pkg/publicegress
+          sudo env "PATH=$PATH" unshare --net -- sh -c '
+            ip link set lo up
+            OSB_DISPOSABLE_NETNS=1 /tmp/publicegress.test \
+              -test.run="^TestKernelNonRootUIDIsolation$" -test.v
+          '
+
       - name: Run dynamic ip test
         working-directory: components/egress
         run: |

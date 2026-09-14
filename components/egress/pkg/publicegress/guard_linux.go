@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,19 +35,22 @@ func runNFT(ctx context.Context, rules string) error {
 // Guard is independent of the mutable user-policy table. It is deliberately
 // NEVER removed on shutdown: a dead/restarting sidecar must not release root.
 type Guard struct {
-	mu          sync.Mutex
-	cfg         *Config
-	cgroup      string
-	gatewayPort uint16
-	run         runner
+	mu                sync.Mutex
+	cfg               *Config
+	cgroup            string
+	trustedSocketExpr string
+	gatewayPort       uint16
+	run               runner
 }
 
-// Install first installs a quarantine, then proves that the live socket's
-// kernel cgroup matches our leaf. No UID or kernel-version-based fallback.
-func Install(ctx context.Context, cfg *Config, gatewayPort uint16) (*Guard, error) {
+func validateGuardInputs(cfg *Config, gatewayPort uint16) error {
 	if cfg == nil || gatewayPort == 0 || IsReservedPort(gatewayPort) {
-		return nil, fmt.Errorf("public egress requires a policy and gateway port")
+		return fmt.Errorf("public egress requires a policy and gateway port")
 	}
+	return nil
+}
+
+func ensureQuarantine(ctx context.Context) error {
 	// add (not create) is idempotent; the transaction never exposes an empty table.
 	quarantine := `add table inet ` + table + `
 delete table inet ` + table + `
@@ -62,12 +66,31 @@ add rule inet ` + table + ` output meta l4proto tcp ct state established ct dire
 	// failed probe/configuration must not relax even local listener protection.
 	if exec.CommandContext(ctx, "nft", "list", "table", "inet", table).Run() != nil {
 		if err := runNFT(ctx, quarantine); err != nil {
-			return nil, err
+			return err
 		}
 	}
+	return nil
+}
+
+func requireProtectedPorts() error {
 	portStart, err := os.ReadFile("/proc/sys/net/ipv4/ip_unprivileged_port_start")
 	if err != nil || strings.TrimSpace(string(portStart)) != "1024" {
-		return nil, fmt.Errorf("public egress requires net.ipv4.ip_unprivileged_port_start=1024 and no application NET_BIND_SERVICE capability")
+		return fmt.Errorf("public egress requires net.ipv4.ip_unprivileged_port_start=1024 and no application NET_BIND_SERVICE capability")
+	}
+	return nil
+}
+
+// Install first installs a quarantine, then proves that the live socket's
+// kernel cgroup matches our leaf. No UID or kernel-version-based fallback.
+func Install(ctx context.Context, cfg *Config, gatewayPort uint16) (*Guard, error) {
+	if err := validateGuardInputs(cfg, gatewayPort); err != nil {
+		return nil, err
+	}
+	if err := ensureQuarantine(ctx); err != nil {
+		return nil, err
+	}
+	if err := requireProtectedPorts(); err != nil {
+		return nil, err
 	}
 	path, err := currentCgroup()
 	if err != nil {
@@ -84,6 +107,61 @@ add rule inet ` + table + ` output meta l4proto tcp ct state established ct dire
 		return nil, err
 	}
 	return g, nil
+}
+
+// InstallNonRootUID is the compatibility boundary for test clusters without
+// cgroup v2. It must never be selected implicitly. The workload renderer owns
+// the other half of the contract: the application runs as a distinct fixed
+// non-root UID with every capability dropped and cannot change identity.
+func InstallNonRootUID(
+	ctx context.Context, cfg *Config, gatewayPort uint16, proxyUID uint32,
+) (*Guard, error) {
+	if err := validateGuardInputs(cfg, gatewayPort); err != nil {
+		return nil, err
+	}
+	if err := ensureQuarantine(ctx); err != nil {
+		return nil, err
+	}
+	if err := requireProtectedPorts(); err != nil {
+		return nil, err
+	}
+	if proxyUID == 0 {
+		return nil, fmt.Errorf("nonroot-uid public egress requires a dedicated non-root proxy UID")
+	}
+	trustedExpr, err := trustedUIDExpression([]uint32{0, proxyUID})
+	if err != nil {
+		return nil, err
+	}
+	g := &Guard{
+		cfg:               cfg,
+		trustedSocketExpr: trustedExpr,
+		gatewayPort:       gatewayPort,
+		run:               runNFT,
+	}
+	if err := g.run(ctx, g.rules()); err != nil {
+		return nil, err
+	}
+	return g, nil
+}
+
+func trustedUIDExpression(trustedUIDs []uint32) (string, error) {
+	seen := make(map[uint32]struct{}, len(trustedUIDs))
+	for _, uid := range trustedUIDs {
+		seen[uid] = struct{}{}
+	}
+	if _, ok := seen[0]; !ok || len(seen) < 2 {
+		return "", fmt.Errorf("nonroot-uid public egress requires root and a dedicated proxy UID")
+	}
+	ordered := make([]uint32, 0, len(seen))
+	for uid := range seen {
+		ordered = append(ordered, uid)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	values := make([]string, 0, len(ordered))
+	for _, uid := range ordered {
+		values = append(values, strconv.FormatUint(uint64(uid), 10))
+	}
+	return "meta skuid { " + strings.Join(values, ", ") + " }", nil
 }
 
 func currentCgroup() (string, error) {
@@ -175,7 +253,10 @@ func probeCgroup(ctx context.Context) error {
 
 func (g *Guard) rules() string {
 	var b strings.Builder
-	cg := "meta mark & " + trustedMark + " != 0"
+	trusted := g.trustedSocketExpr
+	if trusted == "" {
+		trusted = "meta mark & " + trustedMark + " != 0"
+	}
 	fmt.Fprintf(&b, "add table inet %s\ndelete table inet %s\nadd table inet %s\n", table, table, table)
 	fmt.Fprintf(&b, "add set inet %s gateway4 { type ipv4_addr; flags timeout; }\n", table)
 	fmt.Fprintf(&b, "add chain inet %s intercept { type nat hook output priority -110; }\n", table)
@@ -184,7 +265,7 @@ func (g *Guard) rules() string {
 	// unused high frontend, but no control/DNS request can reach that socket.
 	redirect("ip daddr 127.0.0.0/8 tcp dport 18080 redirect to :380")
 	redirect("ip daddr 127.0.0.0/8 meta l4proto { tcp, udp } th dport 15353 redirect to :353")
-	redirect(cg + " return")
+	redirect(trusted + " return")
 	redirect("meta l4proto { tcp, udp } th dport 53 redirect to :353")
 	// Ordinary loopback services stay local; the filter protects egress listeners.
 	redirect("ip daddr 127.0.0.0/8 return")
@@ -203,12 +284,12 @@ func (g *Guard) rules() string {
 	add := func(rule string) { fmt.Fprintf(&b, "add rule inet %s output %s\n", table, rule) }
 	add("meta nfproto ipv6 drop")
 	// Only trusted processes may emit DNS replies, even if root binds a freed port.
-	add(cg + " ip daddr 127.0.0.0/8 accept")
-	add(cg + " udp sport 353 oifname \"lo\" ct direction reply accept")
-	add(cg + " meta l4proto tcp ct state established ct direction reply accept")
-	// The kernel's SYN-ACK request socket is not a full socket, so xt_cgroup
-	// cannot classify it. Permit the handshake, but require the cgroup mark on
-	// subsequent data from every protected listener (including a root impostor).
+	add(trusted + " ip daddr 127.0.0.0/8 accept")
+	add(trusted + " udp sport 353 oifname \"lo\" ct direction reply accept")
+	add(trusted + " meta l4proto tcp ct state established ct direction reply accept")
+	// The kernel's SYN-ACK request socket is not a full socket, so neither the
+	// cgroup path nor socket UID can classify it reliably. Permit the handshake,
+	// but require the selected trusted identity on subsequent listener data.
 	add("tcp flags & (syn | ack) == (syn | ack) ct state established ct direction reply accept")
 	add("meta l4proto { tcp, udp } th sport { 353, 380, 381, 15353, 18080, 18081 } drop")
 	add("tcp dport 381 ct status dnat accept")
@@ -220,15 +301,15 @@ func (g *Guard) rules() string {
 	// an already authenticated CONNECT tunnel (SSE/WSS may last hours). Only
 	// trusted sockets can set/use this reserved conntrack bit. The gateway owns
 	// identity/Grant revocation; application sockets cannot inherit this bypass.
-	add(fmt.Sprintf("%s ct state established ct direction original ct mark & %s != 0 tcp dport %d accept", cg, trustedMark, g.gatewayPort))
-	add(fmt.Sprintf("%s ip daddr @gateway4 tcp dport %d ct mark set ct mark | %s accept", cg, g.gatewayPort, trustedMark))
+	add(fmt.Sprintf("%s ct state established ct direction original ct mark & %s != 0 tcp dport %d accept", trusted, trustedMark, g.gatewayPort))
+	add(fmt.Sprintf("%s ip daddr @gateway4 tcp dport %d ct mark set ct mark | %s accept", trusted, g.gatewayPort, trustedMark))
 	for _, ip := range g.cfg.DNSServers {
-		add(cg + " ip daddr " + ip + " tcp dport 53 accept")
+		add(trusted + " ip daddr " + ip + " tcp dport 53 accept")
 	}
 	for _, t := range g.cfg.InternalTargets {
 		for _, ip := range t.IPs {
 			for _, port := range t.Ports {
-				add(fmt.Sprintf("%s ip daddr %s tcp dport %d accept", cg, ip, port))
+				add(fmt.Sprintf("%s ip daddr %s tcp dport %d accept", trusted, ip, port))
 			}
 		}
 	}

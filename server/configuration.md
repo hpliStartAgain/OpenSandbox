@@ -260,6 +260,9 @@ Administrator-managed HTTPS CONNECT transport is configured under
 `[egress.upstream_proxy]` (default disabled). See the
 [upstream proxy guide](../docs/guides/upstream-proxy.md) for the exact TOML,
 private CA/identity Secret contract, runtime restrictions and rollout limits.
+`isolation_mode` defaults to production-oriented `cgroup-v2-root`; the explicit
+`nonroot-uid` value is limited to dedicated compatibility test Servers and
+forces the sandbox container to UID/GID 65532 with every capability dropped.
 
 ### Egress sidecar metrics
 
