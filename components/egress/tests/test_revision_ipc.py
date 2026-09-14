@@ -27,6 +27,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 MITMSCRIPTS = Path(__file__).resolve().parents[1] / "mitmscripts"
 TOKEN = "0123456789abcdef0123456789abcdef"
@@ -205,6 +206,36 @@ class RevisionIPCTest(unittest.TestCase):
         with self.assertRaises(ipc.ServerError):
             self.server.start()
         self.server.close()
+        self.assertFalse(os.path.exists(self.path))
+        with self.assertRaises(receiver.RevisionError):
+            self.receiver.readback()
+        self.server.close()
+
+    def test_failed_thread_start_is_not_published_to_close(self):
+        self.server = ipc.Server(
+            self.receiver,
+            self.path,
+            TOKEN,
+            max_snapshot_bytes=128,
+            request_timeout=1,
+        )
+        published = caught = None
+        try:
+            with (
+                mock.patch.object(
+                    ipc.threading.Thread,
+                    "start",
+                    side_effect=RuntimeError("secret-bearing thread failure"),
+                ),
+                self.assertRaises(ipc.ServerError) as caught,
+            ):
+                self.server.start()
+        finally:
+            published = self.server._thread
+            self.server._thread = None  # prevent the pre-fix cleanup deadlock
+            self.server.close()
+        self.assertIsNone(published)
+        self.assertNotIn("secret-bearing", str(caught.exception))
         self.assertFalse(os.path.exists(self.path))
         with self.assertRaises(receiver.RevisionError):
             self.receiver.readback()

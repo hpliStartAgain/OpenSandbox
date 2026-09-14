@@ -319,10 +319,14 @@ class Server:
         with self._lock:
             if self._closed or self._thread is not None:
                 raise ServerError("revision IPC server cannot start")
-            self._thread = threading.Thread(
+            thread = threading.Thread(
                 target=self._server.serve_forever, name="revision-ipc", daemon=True
             )
-            self._thread.start()
+            try:
+                thread.start()
+            except RuntimeError:
+                raise ServerError("revision IPC server cannot start") from None
+            self._thread = thread
 
     def close(self) -> None:
         """Idempotently stop IPC, fence the receiver, and remove our socket."""
@@ -331,7 +335,7 @@ class Server:
                 return
             self._closed = True
             thread = self._thread
-        if thread is not None:
+        if thread is not None and thread.is_alive():
             self._server.shutdown()
         self._server.server_close()
         self._receiver.close()
