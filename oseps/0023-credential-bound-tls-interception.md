@@ -453,6 +453,14 @@ installs the whole candidate snapshot atomically. An API response may report a
 new vault revision only after the proxy acknowledges that exact snapshot and
 any required connection fence has been installed.
 
+The local transaction wire splits this conceptual object at the only
+non-circular boundary. The revision envelope carries `controlPlaneGeneration`,
+`subjectGeneration`, the coordinator-allocated `decisionEpoch`, and the digest
+of the exact payload bytes. The versioned canonical payload carries
+`vaultRevision`, `effectivePolicyEpoch`, `interceptionMode`, `state`,
+`tlsBindingHostSelectors`, `fullRenderedBindings`, and `redactions`. Together
+they form the complete snapshot; the receiver validates their agreement.
+
 An installed snapshot has no data TTL. It remains authoritative until it is
 explicitly replaced, the subject generation changes, the proxy process loses
 it, or the owning Go control-plane incarnation disappears. Vault create,
@@ -821,11 +829,15 @@ barrier remain integration work.
 The proxy-side transaction receiver is an in-memory foundation: it validates
 generation/epoch/digest identities, stages immutable bytes, and implements
 commit, abort, and metadata-only readback. Its authenticated IPC endpoint is
-implemented but not connected to the live addon. The next integration must
-supply complete snapshot validation, process-lifetime token handoff, Go-side
-reconciliation, and connection fences before acknowledging public Vault
-mutations. Existing request processing continues to use the conditional ETag
-lookup until that integration is ready.
+implemented but not connected to the live addon. An unused Go builder now emits
+the versioned canonical decision payload from a rendered Vault snapshot and
+policy epoch. It derives and sorts HTTPS selectors from the same canonical
+bindings, preserves redaction order, and rejects non-canonical revisions,
+selectors, or rendered credential/redaction coverage. The next integration
+must add the matching proxy-side payload parser,
+process-lifetime token handoff, Go-side reconciliation, and connection fences
+before acknowledging public Vault mutations. Existing request processing
+continues to use the conditional ETag lookup until that integration is ready.
 
 Implementation has started with the internal host-selector algebra and shared
 Go/Python conformance vectors. The control plane owns non-transitional UTS #46
