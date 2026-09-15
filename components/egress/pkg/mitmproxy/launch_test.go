@@ -201,6 +201,19 @@ func TestCredentialProxyMessageWithoutTimestamp(t *testing.T) {
 	require.Equal(t, "credential proxy: applied binding=prod", msg)
 }
 
+func TestCredentialProxyMessageAcceptsSanitizedFatalRevisionError(t *testing.T) {
+	for _, line := range []string{
+		"mitmdump: credential proxy: invalid revision runtime configuration",
+		"/usr/local/bin/mitmdump: credential proxy: invalid revision runtime configuration",
+	} {
+		msg, ok := credentialProxyMessage(line)
+		require.True(t, ok)
+		require.Equal(t, "credential proxy: invalid revision runtime configuration", msg)
+	}
+	_, ok := credentialProxyMessage("mitmdump: credential proxy: untrusted detail")
+	require.False(t, ok)
+}
+
 func TestCredentialProxyMessageRejectsNonProxyLines(t *testing.T) {
 	_, ok := credentialProxyMessage("172.17.0.1:50210: GET https://example.com/credential proxy: x")
 	require.False(t, ok)

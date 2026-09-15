@@ -62,7 +62,7 @@ import os
 import re
 import socket
 from contextlib import suppress
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import quote, quote_plus, unquote
 
 from mitmproxy import ctx, http
@@ -172,12 +172,19 @@ def _set_fast_sandbox_mode_from_env() -> None:
 _set_fast_sandbox_mode_from_env()
 
 
+def _fatal_revision_runtime() -> NoReturn:
+    # mitmproxy 11 loads -s scripts in a reload watcher. Generic exceptions are
+    # swallowed and OptionsError only stops that watcher, so SystemExit is the
+    # process-level fence that prevents a listener without the system addon.
+    raise SystemExit(_REVISION_RUNTIME_ERROR) from None
+
+
 def _revision_configuration() -> tuple[str, str, str, str, int] | None:
     present = {key for key, name in _REVISION_ENV.items() if name in os.environ}
     if not present:
         return None
     if present != set(_REVISION_ENV):
-        raise RuntimeError(_REVISION_RUNTIME_ERROR)
+        _fatal_revision_runtime()
     values = {key: os.environ[name] for key, name in _REVISION_ENV.items()}
     limit_text = values["limit"]
     if (
@@ -185,13 +192,13 @@ def _revision_configuration() -> tuple[str, str, str, str, int] | None:
         or not limit_text.isascii()
         or not limit_text.isdecimal()
     ):
-        raise RuntimeError(_REVISION_RUNTIME_ERROR)
+        _fatal_revision_runtime()
     try:
         limit = int(limit_text)
     except ValueError:
-        raise RuntimeError(_REVISION_RUNTIME_ERROR) from None
+        _fatal_revision_runtime()
     if limit <= 0 or limit >= 2**63 or str(limit) != limit_text:
-        raise RuntimeError(_REVISION_RUNTIME_ERROR)
+        _fatal_revision_runtime()
     return (
         values["socket"],
         values["token"],
@@ -205,7 +212,7 @@ def load(_loader: Any) -> None:
     """Start one generation-fenced receiver when the launcher enables it."""
     global _revision_receiver, _revision_server
     if _revision_receiver is not None or _revision_server is not None:
-        raise RuntimeError(_REVISION_RUNTIME_ERROR)
+        _fatal_revision_runtime()
     configuration = _revision_configuration()
     if configuration is None:
         return
@@ -236,7 +243,7 @@ def load(_loader: Any) -> None:
         elif receiver is not None:
             with suppress(Exception):
                 receiver.close()
-        raise RuntimeError(_REVISION_RUNTIME_ERROR) from None
+        _fatal_revision_runtime()
     _revision_receiver = receiver
     _revision_server = server
 

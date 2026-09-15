@@ -37,6 +37,8 @@ import (
 
 const RunAsUser = "mitmproxy"
 
+const revisionRuntimeErrorMessage = "credential proxy: invalid revision runtime configuration"
+
 const (
 	revisionIPCSocketEnv            = "OPENSANDBOX_EGRESS_REVISION_IPC_SOCKET"
 	revisionIPCTokenEnv             = "OPENSANDBOX_EGRESS_REVISION_IPC_TOKEN"
@@ -300,6 +302,10 @@ func credentialProxyMessage(line string) (string, bool) {
 		if end := strings.Index(line, "] "); end != -1 {
 			line = line[end+2:]
 		}
+	}
+	if executable, message, found := strings.Cut(line, ": "); found &&
+		filepath.Base(executable) == "mitmdump" && message == revisionRuntimeErrorMessage {
+		return message, true
 	}
 	if !strings.HasPrefix(line, "credential proxy:") {
 		return "", false

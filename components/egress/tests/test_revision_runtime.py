@@ -168,7 +168,7 @@ class RevisionRuntimeTest(unittest.TestCase):
             with self.subTest(values=set(values)):
                 with mock.patch.dict(os.environ, values, clear=True):
                     self.system = load_system()
-                    with self.assertRaises(RuntimeError) as caught:
+                    with self.assertRaises(SystemExit) as caught:
                         self.system.load(None)
                 self.assertEqual(
                     str(caught.exception),
@@ -205,7 +205,7 @@ class RevisionRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(self.system._revision_receiver.acquire().payload, payload)
         with self.assertRaisesRegex(
-            RuntimeError, "invalid revision runtime configuration"
+            SystemExit, "invalid revision runtime configuration"
         ):
             self.system.load(None)
 
@@ -222,6 +222,43 @@ class RevisionRuntimeTest(unittest.TestCase):
 
 @unittest.skipUnless(MITMDUMP, "mitmdump is not installed")
 class RealMitmproxyRevisionRuntimeTest(unittest.TestCase):
+    def test_partial_configuration_exits_nonzero_without_token(self):
+        env = {
+            **os.environ,
+            ENV["token"]: TOKEN,
+        }
+        process = subprocess.Popen(
+            [
+                MITMDUMP,
+                "--listen-host",
+                "127.0.0.1",
+                "--listen-port",
+                "0",
+                "-s",
+                str(MITMSCRIPTS / "system.py"),
+                "--set",
+                "termlog_verbosity=info",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            output = process.communicate(timeout=5)[0]
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            output = process.communicate(timeout=10)[0]
+            self.fail(f"mitmdump accepted partial revision configuration: {output}")
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn(
+            "credential proxy: invalid revision runtime configuration", output
+        )
+        self.assertNotIn("Addon error:", output)
+        self.assertNotIn("Traceback", output)
+        self.assertNotIn("proxy listening", output.lower())
+        self.assertNotIn(TOKEN, output)
+
     def test_process_loads_receiver_and_removes_socket_on_exit(self):
         with tempfile.TemporaryDirectory(prefix="osrr-real-", dir="/tmp") as directory:
             socket_path = os.path.join(directory, "receiver.sock")
