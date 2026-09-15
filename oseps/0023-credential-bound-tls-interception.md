@@ -837,11 +837,14 @@ implemented but not connected to the live addon. An unused Go builder now emits
 the versioned canonical decision payload from a rendered Vault snapshot and
 policy epoch. It derives and sorts HTTPS selectors from the same canonical
 bindings, preserves redaction order, and rejects non-canonical revisions,
-selectors, or rendered credential/redaction coverage. The next integration
-must add the matching proxy-side payload parser,
-process-lifetime token handoff, Go-side reconciliation, and connection fences
-before acknowledging public Vault mutations. Existing request processing
-continues to use the conditional ETag lookup until that integration is ready.
+selectors, or rendered credential/redaction coverage. A matching unused Python
+validator now strictly decodes those exact bytes, checks envelope vault/policy
+agreement, recomputes active state and HTTPS selectors from the full bindings,
+and rejects incomplete redaction coverage with a fixed sanitized error. The
+next integration must add process-lifetime token handoff, Go-side
+reconciliation, and connection fences before acknowledging public Vault
+mutations. Existing request processing continues to use the conditional ETag
+lookup until that integration is ready.
 
 Implementation has started with the internal host-selector algebra and shared
 Go/Python conformance vectors. The control plane owns non-transitional UTS #46
