@@ -187,6 +187,18 @@ class DecisionSnapshotTest(unittest.TestCase):
         candidate["redactions"] = []
         self.assertIsNone(decision.validate(self.snapshot(candidate)))
 
+    def test_accepts_go_del_redaction_variants(self):
+        candidate = self.active()
+        candidate["fullRenderedBindings"] = [
+            binding("del", ["https"], ["api.example.com"])
+        ]
+        candidate["fullRenderedBindings"][0]["substitutions"] = [
+            {"placeholder": "__del__", "value": "\x7f", "in": ["body"]}
+        ]
+        candidate["tlsBindingHostSelectors"] = ["api.example.com"]
+        candidate["redactions"] = ["__del__", "%7F", "%7f", "\x7f"]
+        self.assertIsNone(decision.validate(self.snapshot(candidate)))
+
     def test_redaction_order_uses_utf8_byte_length(self):
         candidate = self.active()
         candidate["fullRenderedBindings"] = [

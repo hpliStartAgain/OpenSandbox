@@ -123,7 +123,7 @@ def _redaction_variants(value: str) -> set[str]:
         form_encoded,
         _PERCENT_ESCAPE.sub(lambda match: f"%{match.group(1).lower()}", form_encoded),
         _go_json_content(value),
-        json.dumps(value)[1:-1],
+        _go_ascii_json_content(value),
     }
     variants.discard("")
     return variants
@@ -138,6 +138,37 @@ def _go_json_content(value: str) -> str:
         .replace("\u2028", r"\u2028")
         .replace("\u2029", r"\u2029")
     )
+
+
+def _go_ascii_json_content(value: str) -> str:
+    encoded = []
+    escapes = {
+        "\\": r"\\",
+        '"': r"\"",
+        "\b": r"\b",
+        "\f": r"\f",
+        "\n": r"\n",
+        "\r": r"\r",
+        "\t": r"\t",
+    }
+    for character in value:
+        if character in escapes:
+            encoded.append(escapes[character])
+            continue
+        codepoint = ord(character)
+        if codepoint < 0x20:
+            encoded.append(f"\\u{codepoint:04x}")
+        elif codepoint < 0x80:
+            encoded.append(character)
+        elif codepoint <= 0xFFFF:
+            encoded.append(f"\\u{codepoint:04x}")
+        else:
+            codepoint -= 0x10000
+            encoded.append(
+                f"\\u{0xD800 + (codepoint >> 10):04x}"
+                f"\\u{0xDC00 + (codepoint & 0x3FF):04x}"
+            )
+    return "".join(encoded)
 
 
 def _binding(value: Any, redactions: set[str]) -> tuple[str, set[str]]:
