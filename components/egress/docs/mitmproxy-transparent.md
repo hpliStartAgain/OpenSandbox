@@ -50,7 +50,7 @@ To bypass decryption for selected domains, edit the baked-in
 | `OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_TRUST_DIR` | No | Trust directory for upstream TLS verification (OpenSSL style); overrides the config.yaml default | `/etc/ssl/certs` |
 | `OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE` | No | Skip upstream TLS verification (`1/true/on`); use when clients connect by IP and SNI is unavailable | Disabled |
 | `OPENSANDBOX_EGRESS_MITMPROXY_EXTRA_PORTS` | No | **Experimental.** Extra destination TCP ports to intercept, appended to the always-on `80,443` (comma-separated, e.g. `8080,8443`). Fails closed at startup on invalid input; total ports (including 80/443) must be ≤ 15. Note: the system addon's credential-binding matcher currently only fires on canonical 80/443 — extras are decrypted and logged but not matched against bindings. | Empty |
-| `OPENSANDBOX_EGRESS_UPSTREAM_PROXY` | No | Chained upstream proxy endpoint (`http://host[:port]` or `https://host[:port]`). When set, the bundled `upstream_proxy.py` addon is loaded after the system addon and every mitmproxy-handled connection is forwarded through the proxy via `CONNECT`. Fail closed: pass-through flows that cannot be chained are refused. | Empty (disabled) |
+| `OPENSANDBOX_EGRESS_UPSTREAM_PROXY` | No | Chained upstream proxy endpoint (`http://host[:port]` or `https://host[:port]`). Requires `OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true`; egress startup fails otherwise. Not supported with `OPENSANDBOX_EGRESS_PROFILE=fast-sandbox`. When set, the bundled `upstream_proxy.py` addon is loaded after the system addon and every mitmproxy-handled connection is forwarded through the proxy via `CONNECT`. Fail closed: pass-through flows that cannot be chained are refused. | Empty (disabled) |
 | `OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH` | No | Complete `Proxy-Authorization` header value sent on the upstream `CONNECT` (e.g. `Basic base64(user:pass)`). Requires `OPENSANDBOX_EGRESS_UPSTREAM_PROXY`; startup fails if set alone. Never logged. | Empty |
 
 Notes:
@@ -199,6 +199,13 @@ Semantics and limits:
 - **Fail closed**: connections that cannot be chained — TLS pass-through
   (no-SNI or `ignore_hosts`/`tcp_hosts`/`udp_hosts` matches) and UDP/QUIC
   dials — are refused rather than silently sent direct.
+- **Requires `OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true`**: the chain only
+  exists inside the transparent mitmproxy path, so egress startup fails if the
+  proxy is configured without transparent mode instead of silently ignoring it.
+- **Unsupported under the fast-sandbox profile**
+  (`OPENSANDBOX_EGRESS_PROFILE=fast-sandbox`): the equivalent infra DNS/nft
+  scoping is not implemented there, so egress startup fails fast rather than
+  running without the proxy.
 - **Requires `connection_strategy: lazy`** (the shipped default): eager
   connects upstream before any request exists, so no `via` can be applied.
 - **Config validation**: a malformed proxy URL, credentials in the URL, or
