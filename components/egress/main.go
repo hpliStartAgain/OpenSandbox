@@ -51,10 +51,19 @@ func main() {
 	ctx = withLogger(ctx)
 	defer log.Logger.Sync()
 
+	// Validate the chained upstream proxy env before profile dispatch: a
+	// configured proxy without transparent mitmproxy, or under fast-sandbox,
+	// fails startup instead of being silently ignored.
+	profile := strings.TrimSpace(os.Getenv(constants.EnvEgressProfile))
+	upstreamSpec, err := upstreamProxySpecForProfile(profile)
+	if err != nil {
+		log.Fatalf("invalid upstream proxy configuration: %v", err)
+	}
+
 	// Fast Sandbox profile: multi-sandbox control plane over the slot
 	// store and the proxy route. Sidecar stays the default; the two profiles
 	// are mutually exclusive deployment forms.
-	if strings.TrimSpace(os.Getenv(constants.EnvEgressProfile)) == constants.ProfileFastSandbox {
+	if profile == constants.ProfileFastSandbox {
 		runFastSandboxProfile(ctx)
 		return
 	}
@@ -93,17 +102,9 @@ func main() {
 	mode := parseMode()
 	log.Infof("enforcement mode: %s", mode)
 
-	// The chained upstream proxy only takes effect with transparent mitmproxy;
-	// parse it here so nft can scope the infra exception and DNS can exempt the
-	// proxy hostname from sandbox policy without feeding the allow sets.
-	var upstreamSpec *mitmproxy.UpstreamProxySpec
-	if constants.IsTruthy(os.Getenv(constants.EnvMitmproxyTransparent)) {
-		spec, err := mitmproxy.UpstreamProxyFromEnv()
-		if err != nil {
-			log.Fatalf("invalid upstream proxy configuration: %v", err)
-		}
-		upstreamSpec = spec
-	}
+	// upstreamSpec was already validated at startup; it scopes the infra nft
+	// exception and lets DNS exempt the proxy hostname from sandbox policy
+	// without feeding the allow sets.
 	nftMgr, err := createNftManager(mode, upstreamSpec)
 	if err != nil {
 		log.Fatalf("nftables options: %v", err)

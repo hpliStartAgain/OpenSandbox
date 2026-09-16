@@ -319,6 +319,8 @@ def _stop(proc: subprocess.Popen) -> None:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+    if proc.stdout is not None:
+        proc.stdout.close()
 
 
 def _proxy_get(port: int, target: str) -> tuple[int, bytes]:
@@ -370,6 +372,64 @@ class UpstreamProxyRuntimeTest(unittest.TestCase):
             )
         finally:
             _stop(proc)
+
+    def test_hostname_upstream_proxy_chained(self) -> None:
+        # A hostname proxy endpoint must stay a hostname in server.address
+        # while the dial resolves it: the server_connect guard compares
+        # address[0] to the configured host, so this only passes if mitmproxy
+        # keeps "localhost" rather than the resolved IP.
+        port = _free_port()
+        proc, log = _start_mitmdump(
+            port,
+            {
+                "OPENSANDBOX_EGRESS_UPSTREAM_PROXY": f"http://localhost:{self._proxy.port}",
+            },
+        )
+        try:
+            before = len(self._proxy.requests)
+            status, body = _proxy_get(port, self._target_url())
+            self.assertEqual(200, status, log)
+            self.assertEqual(b"upstream-proxy-e2e-ok", body)
+            new = self._proxy.requests[before:]
+            self.assertEqual(1, len(new))
+            self.assertEqual(
+                f"127.0.0.1:{self._target.port}", new[0]["authority"]
+            )
+        finally:
+            _stop(proc)
+
+    def test_via_cleared_fails_closed(self) -> None:
+        # A later-loaded addon clearing server_conn.via must not fall back to
+        # a direct dial: server_connect refuses it, so the request fails and
+        # neither the proxy nor the target is contacted.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            breaker = Path(tmp) / "break_via.py"
+            breaker.write_text(
+                "def requestheaders(flow):\n"
+                "    flow.server_conn.via = None\n"
+            )
+            port = _free_port()
+            proc, log = _start_mitmdump(
+                port,
+                {
+                    "OPENSANDBOX_EGRESS_UPSTREAM_PROXY": f"http://127.0.0.1:{self._proxy.port}",
+                },
+                "-s",
+                str(breaker),
+            )
+            try:
+                proxy_before = len(self._proxy.requests)
+                with self._target._lock:
+                    hits_before = self._target.hits
+                status, _ = _proxy_get(port, self._target_url())
+                self.assertEqual(502, status, log)
+                self.assertEqual(proxy_before, len(self._proxy.requests), log)
+                with self._target._lock:
+                    self.assertEqual(hits_before, self._target.hits)
+            finally:
+                _stop(proc)
 
     def test_disabled_env_keeps_direct_path(self) -> None:
         port = _free_port()
