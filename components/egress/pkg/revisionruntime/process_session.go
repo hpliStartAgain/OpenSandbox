@@ -55,6 +55,8 @@ type ProcessSessionConfig struct {
 // profile; the future launcher owner must stop the child before Close.
 type ProcessSession struct {
 	mu            sync.Mutex
+	bootstrapMu   sync.Mutex
+	bootstrap     bootstrapState
 	parentPath    string
 	parentRoot    *os.Root
 	parentInfo    os.FileInfo
