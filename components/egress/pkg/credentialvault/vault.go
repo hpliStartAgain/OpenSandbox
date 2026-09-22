@@ -27,7 +27,6 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,16 +70,18 @@ var (
 var activeSnapshotTagFallback atomic.Uint64
 
 type Store struct {
-	mu           sync.RWMutex
-	exists       bool
-	revision     int64
-	credentials  map[string]record
-	bindings     map[string]Binding
-	activeTag    string
-	mitmGate     *mitmproxy.HealthGate
-	requireToken func() bool
-	sources      *SourceRegistry
-	strictMatch  bool
+	mu             sync.RWMutex
+	exists         bool
+	revision       int64
+	credentials    map[string]record
+	bindings       map[string]Binding
+	activeTag      string
+	activeSnapshot *ActiveSnapshot
+	mutationTag    string
+	mitmGate       *mitmproxy.HealthGate
+	requireToken   func() bool
+	sources        *SourceRegistry
+	strictMatch    bool
 }
 
 type record struct {
@@ -222,6 +223,7 @@ func NewStoreWithRegistry(mitmGate *mitmproxy.HealthGate, requireToken func() bo
 	return &Store{
 		credentials:  make(map[string]record),
 		bindings:     make(map[string]Binding),
+		mutationTag:  newActiveSnapshotTag(),
 		mitmGate:     mitmGate,
 		requireToken: requireToken,
 		sources:      registry,
@@ -236,37 +238,11 @@ func (v *Store) Create(req CreateRequest, pol *policy.NetworkPolicy) (State, err
 		return State{}, ErrExists
 	}
 
-	credentials := make(map[string]record, len(req.Credentials))
-	bindings := make(map[string]Binding, len(req.Bindings))
-	for _, c := range req.Credentials {
-		rec, err := v.normalizeCredential(c, 1)
-		if err != nil {
-			return State{}, err
-		}
-		if _, ok := credentials[rec.Name]; ok {
-			return State{}, fmt.Errorf("duplicate credential name %q", rec.Name)
-		}
-		credentials[rec.Name] = rec
-	}
-	for _, b := range req.Bindings {
-		nb, err := v.normalizeBinding(b)
-		if err != nil {
-			return State{}, err
-		}
-		if _, ok := bindings[nb.Name]; ok {
-			return State{}, fmt.Errorf("duplicate binding name %q", nb.Name)
-		}
-		bindings[nb.Name] = nb
-	}
-	if err := v.validateCandidate(credentials, bindings, pol); err != nil {
+	credentials, bindings, err := v.buildCreate(req, pol)
+	if err != nil {
 		return State{}, err
 	}
-
-	v.exists = true
-	v.revision = 1
-	v.credentials = credentials
-	v.bindings = bindings
-	v.activeTag = newActiveSnapshotTag()
+	v.publishLocked(true, 1, credentials, bindings)
 	return v.sanitizedLocked(), nil
 }
 
@@ -281,23 +257,11 @@ func (v *Store) Patch(req MutationRequest, pol *policy.NetworkPolicy) (State, er
 	}
 
 	nextRevision := v.revision + 1
-	credentials := cloneCredentialRecords(v.credentials)
-	bindings := cloneCredentialBindings(v.bindings)
-
-	if err := v.applyCredentialMutations(credentials, req.Credentials, nextRevision); err != nil {
+	credentials, bindings, err := v.buildPatch(req, pol, nextRevision)
+	if err != nil {
 		return State{}, err
 	}
-	if err := v.applyBindingMutations(bindings, req.Bindings); err != nil {
-		return State{}, err
-	}
-	if err := v.validateCandidate(credentials, bindings, pol); err != nil {
-		return State{}, err
-	}
-
-	v.revision = nextRevision
-	v.credentials = credentials
-	v.bindings = bindings
-	v.activeTag = newActiveSnapshotTag()
+	v.publishLocked(true, nextRevision, credentials, bindings)
 	return v.sanitizedLocked(), nil
 }
 
@@ -307,11 +271,7 @@ func (v *Store) Delete() error {
 	if !v.exists {
 		return ErrNotFound
 	}
-	v.exists = false
-	v.revision = 0
-	v.credentials = make(map[string]record)
-	v.bindings = make(map[string]Binding)
-	v.activeTag = ""
+	v.publishLocked(false, 0, make(map[string]record), make(map[string]Binding))
 	return nil
 }
 
@@ -325,29 +285,7 @@ func (v *Store) Sanitized() (State, error) {
 }
 
 func (v *Store) sanitizedLocked() State {
-	state := State{
-		Revision:    v.revision,
-		Credentials: make([]Metadata, 0, len(v.credentials)),
-		Bindings:    make([]BindingMetadata, 0, len(v.bindings)),
-	}
-	for _, c := range v.credentials {
-		state.Credentials = append(state.Credentials, Metadata{
-			Name:       c.Name,
-			SourceType: c.SourceType,
-			Revision:   c.Revision,
-		})
-	}
-	for _, b := range v.bindings {
-		state.Bindings = append(state.Bindings, BindingMetadata{
-			Name:     b.Name,
-			Revision: v.revision,
-			Match:    b.Match,
-			Auth:     sanitizeAuth(b.Auth),
-		})
-	}
-	sort.Slice(state.Credentials, func(i, j int) bool { return state.Credentials[i].Name < state.Credentials[j].Name })
-	sort.Slice(state.Bindings, func(i, j int) bool { return state.Bindings[i].Name < state.Bindings[j].Name })
-	return state
+	return sanitizedState(v.revision, v.credentials, v.bindings)
 }
 
 func (v *Store) ActiveSnapshot() (ActiveSnapshot, error) {
@@ -375,48 +313,13 @@ func (v *Store) ActiveSnapshotIfChanged(
 	if knownTag != "" && knownTag == v.activeTag {
 		return ActiveSnapshot{Revision: v.revision}, v.activeTag, false, nil
 	}
-	snapshot := ActiveSnapshot{
-		Revision: v.revision,
-		Bindings: make([]ActiveBinding, 0, len(v.bindings)),
+	if v.activeSnapshot != nil {
+		return cloneActiveSnapshot(*v.activeSnapshot), v.activeTag, true, nil
 	}
-	redactions := make(map[string]struct{})
-	names := make([]string, 0, len(v.bindings))
-	for name := range v.bindings {
-		names = append(names, name)
+	snapshot, err := renderActiveSnapshot(ctx, v.revision, v.credentials, v.bindings)
+	if err != nil {
+		return ActiveSnapshot{}, "", false, err
 	}
-	sort.Strings(names)
-	for _, name := range names {
-		b := v.bindings[name]
-		headers, values, err := renderInjectionHeaders(ctx, b.Auth, v.credentials)
-		if err != nil {
-			return ActiveSnapshot{}, "", false, err
-		}
-		substitutions, substitutionValues, err := renderSubstitutions(ctx, b.Auth, v.credentials)
-		if err != nil {
-			return ActiveSnapshot{}, "", false, err
-		}
-		snapshot.Bindings = append(snapshot.Bindings, ActiveBinding{
-			Name:          b.Name,
-			Match:         b.Match,
-			Headers:       headers,
-			Substitutions: substitutions,
-		})
-		values = append(values, substitutionValues...)
-		for _, value := range values {
-			if value != "" {
-				redactions[value] = struct{}{}
-			}
-		}
-	}
-	for value := range redactions {
-		snapshot.Redactions = append(snapshot.Redactions, value)
-	}
-	sort.Slice(snapshot.Redactions, func(i, j int) bool {
-		if len(snapshot.Redactions[i]) != len(snapshot.Redactions[j]) {
-			return len(snapshot.Redactions[i]) > len(snapshot.Redactions[j])
-		}
-		return snapshot.Redactions[i] < snapshot.Redactions[j]
-	})
 	return snapshot, v.activeTag, true, nil
 }
 
@@ -499,7 +402,7 @@ func (v *Store) normalizeCredential(c Credential, revision int64) (record, error
 	if name == "" {
 		return record{}, fmt.Errorf("credential name cannot be blank")
 	}
-	source, err := v.sources.Create(c.Source)
+	source, err := v.sources.Create(append(json.RawMessage(nil), c.Source...))
 	if err != nil {
 		return record{}, fmt.Errorf("credential %q: %w", name, err)
 	}
@@ -507,6 +410,7 @@ func (v *Store) normalizeCredential(c Credential, revision int64) (record, error
 }
 
 func normalizeBinding(b Binding) (Binding, error) {
+	b = cloneBinding(b)
 	b.Name = strings.TrimSpace(b.Name)
 	if b.Name == "" {
 		return Binding{}, fmt.Errorf("binding name cannot be blank")
@@ -1015,7 +919,7 @@ func cloneCredentialRecords(in map[string]record) map[string]record {
 func cloneCredentialBindings(in map[string]Binding) map[string]Binding {
 	out := make(map[string]Binding, len(in))
 	for k, v := range in {
-		out[k] = v
+		out[k] = cloneBinding(v)
 	}
 	return out
 }

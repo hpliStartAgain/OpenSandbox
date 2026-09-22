@@ -852,6 +852,14 @@ path remain unwired. Durable recovery intent after a complete sidecar
 replacement and atomic public-store finalization under the shared mutation
 barrier remain integration work.
 
+The Go Vault store can now prepare unpublished create, patch, and delete
+candidates. A candidate freezes its rendered `ActiveSnapshot` before commit,
+publishes at most once, and uses a private mutation tag to reject concurrent
+changes and delete/recreate ABA even when the public Vault revision repeats.
+This is only the store-side prerequisite: the public handlers still return
+`503` under the internal gate, and ProcessSession update acknowledgement,
+policy serialization, and connection fencing remain unwired.
+
 The proxy-side transaction receiver validates
 generation/epoch/digest identities, stages immutable bytes, and implements
 commit, abort, and metadata-only readback. Its authenticated IPC endpoint is
