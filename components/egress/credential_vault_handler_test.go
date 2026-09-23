@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -214,6 +215,86 @@ func TestCredentialVaultActiveBindingBlocksPolicyReset(t *testing.T) {
 	require.Contains(t, w.Body.String(), "credential vault policy validation")
 	require.Len(t, proxy.updated.Egress, 1)
 	require.Equal(t, 0, nft.calls)
+}
+
+type blockingVaultPolicyNft struct {
+	stubNft
+	entered     chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+func (n *blockingVaultPolicyNft) unblock() {
+	n.releaseOnce.Do(func() { close(n.release) })
+}
+
+func (n *blockingVaultPolicyNft) ApplyStatic(ctx context.Context, p *policy.NetworkPolicy) error {
+	n.calls++
+	n.applied = p
+	select {
+	case n.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-n.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestCredentialVaultCreateWaitsForPolicyMutationBarrier(t *testing.T) {
+	t.Setenv(constants.EnvMitmproxyTransparent, "true")
+	t.Setenv(constants.EnvEgressMode, constants.PolicyDnsNft)
+	initial := testCredentialVaultPolicy(t, `{"defaultAction":"deny","egress":[{"action":"allow","target":"code.example.com"}]}`)
+	proxy := &stubProxy{updated: initial}
+	nft := &blockingVaultPolicyNft{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	srv := &policyServer{
+		proxy:           proxy,
+		nft:             nft,
+		enforcementMode: "dns+nft",
+		credentialVault: credentialvault.NewStore(nil, func() bool { return true }),
+	}
+	t.Cleanup(nft.unblock)
+
+	policyDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodDelete, "/policy", strings.NewReader(`["code.example.com"]`))
+		w := httptest.NewRecorder()
+		srv.handlePolicy(w, req)
+		policyDone <- w
+	}()
+	select {
+	case <-nft.entered:
+	case <-time.After(time.Second):
+		t.Fatal("policy mutation did not reach nft apply")
+	}
+
+	vaultDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		body := `{"credentials":[{"name":"gitlab-token","source":{"type":"inline","value":"secret-token"}}],"bindings":[{"name":"gitlab-api","match":{"hosts":["code.example.com"],"methods":["GET"],"paths":["/api/v8/*"]},"auth":{"type":"apiKey","name":"PRIVATE-TOKEN","credential":"gitlab-token"}}]}`
+		req := httptest.NewRequest(http.MethodPost, "/credential-vault", strings.NewReader(body))
+		req.RemoteAddr = "127.0.0.1:4321"
+		w := httptest.NewRecorder()
+		srv.handleCredentialVault(w, req)
+		vaultDone <- w
+	}()
+
+	select {
+	case w := <-vaultDone:
+		t.Fatalf("Vault create passed while policy apply was still in progress: status %d", w.Code)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	nft.unblock()
+	policyResponse := <-policyDone
+	require.Equal(t, http.StatusOK, policyResponse.Code)
+	vaultResponse := <-vaultDone
+	require.Equal(t, http.StatusBadRequest, vaultResponse.Code)
+	require.Contains(t, vaultResponse.Body.String(), "is not allowed by egress policy")
+	state, err := srv.credentialVault.Sanitized()
+	require.Error(t, err)
+	require.Empty(t, state.Bindings)
 }
 
 func TestCredentialVaultDeleteRequiresReady(t *testing.T) {

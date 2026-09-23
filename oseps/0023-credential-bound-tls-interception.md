@@ -849,16 +849,22 @@ metadata-only readback and exact commit/abort retries: a confirmed identity
 completes bootstrap, while a confirmed non-activation returns to an idle state
 that permits a new candidate. Connection teardown and the public Vault mutation
 path remain unwired. Durable recovery intent after a complete sidecar
-replacement and atomic public-store finalization under the shared mutation
-barrier remain integration work.
+replacement and ProcessSession-backed atomic public-store finalization under
+the shared mutation barrier remain integration work.
 
 The Go Vault store can now prepare unpublished create, patch, and delete
 candidates. A candidate freezes its rendered `ActiveSnapshot` before commit,
 publishes at most once, and uses a private mutation tag to reject concurrent
 changes and delete/recreate ABA even when the public Vault revision repeats.
 This is only the store-side prerequisite: the public handlers still return
-`503` under the internal gate, and ProcessSession update acknowledgement,
-policy serialization, and connection fencing remain unwired.
+`503` under the internal gate, and ProcessSession update acknowledgement and
+connection fencing remain unwired. The sidecar's existing policy mutex now
+serializes effective-policy reads plus Vault create/patch/delete with `/policy`
+updates. Periodic always-rule reload and nft application remain outside this
+barrier and need a separate barrier/transaction that preserves consistent
+policy and nft state on apply failure. This change protects the current
+policy/Vault validation boundary, but does not yet install or acknowledge a
+ProcessSession decision revision.
 
 The proxy-side transaction receiver validates
 generation/epoch/digest identities, stages immutable bytes, and implements

@@ -172,7 +172,7 @@ type policyServer struct {
 	nameserverIPs   []netip.Addr
 	policyFile      string     // if set, successful /policy changes persist (truncate+write+fsync)
 	maxEgressRules  int        // 0 = unlimited; cap len(Egress) for POST/PATCH
-	mu              sync.Mutex // serializes /policy handlers (no lost update across POST vs PATCH)
+	mu              sync.Mutex // serializes /policy updates with effective-policy reads and Vault writes
 
 	alwaysLoader     *policy.AlwaysRuleLoader
 	stopAlwaysReload chan struct{}
@@ -312,7 +312,9 @@ func (s *policyServer) handleCredentialVaultPost(w http.ResponseWriter, r *http.
 		http.Error(w, fmt.Sprintf("invalid credential vault request: %v", err), http.StatusBadRequest)
 		return
 	}
+	s.mu.Lock()
 	state, err := s.credentialVault.Create(req, s.effectivePolicy())
+	s.mu.Unlock()
 	if err != nil {
 		credentialvault.WriteError(w, err)
 		return
@@ -334,7 +336,9 @@ func (s *policyServer) handleCredentialVaultPatch(w http.ResponseWriter, r *http
 		http.Error(w, fmt.Sprintf("invalid credential vault mutation request: %v", err), http.StatusBadRequest)
 		return
 	}
+	s.mu.Lock()
 	state, err := s.credentialVault.Patch(req, s.effectivePolicy())
+	s.mu.Unlock()
 	if err != nil {
 		credentialvault.WriteError(w, err)
 		return
@@ -351,7 +355,10 @@ func (s *policyServer) handleCredentialVaultDelete(w http.ResponseWriter, r *htt
 		http.Error(w, "credential vault writes require TLS or loopback transport", http.StatusUpgradeRequired)
 		return
 	}
-	if err := s.credentialVault.Delete(); err != nil {
+	s.mu.Lock()
+	err := s.credentialVault.Delete()
+	s.mu.Unlock()
+	if err != nil {
 		credentialvault.WriteError(w, err)
 		return
 	}
