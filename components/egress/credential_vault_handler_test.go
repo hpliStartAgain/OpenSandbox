@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -295,6 +296,65 @@ func TestCredentialVaultCreateWaitsForPolicyMutationBarrier(t *testing.T) {
 	state, err := srv.credentialVault.Sanitized()
 	require.Error(t, err)
 	require.Empty(t, state.Bindings)
+}
+
+func TestCredentialVaultMutationPanicReleasesPolicyMutationBarrier(t *testing.T) {
+	t.Setenv(constants.EnvMitmproxyTransparent, "true")
+	t.Setenv(constants.EnvMitmproxySslInsecure, "")
+	t.Setenv(constants.EnvEgressMode, constants.PolicyDnsNft)
+	t.Setenv(constants.EnvExperimentalRevisionRuntime, "")
+
+	for _, method := range []string{http.MethodPost, http.MethodPatch} {
+		t.Run(method, func(t *testing.T) {
+			factoryCalled := make(chan struct{}, 1)
+			registry := credentialvault.NewSourceRegistry()
+			registry.Register("panic", func(json.RawMessage) (credentialvault.CredentialSource, error) {
+				factoryCalled <- struct{}{}
+				panic("credential source factory panic")
+			})
+			store := credentialvault.NewStoreWithRegistry(nil, func() bool { return true }, registry)
+			if method == http.MethodPatch {
+				_, err := store.Create(credentialvault.CreateRequest{Credentials: []credentialvault.Credential{{
+					Name:   "gitlab-token",
+					Source: json.RawMessage(`{"type":"inline","value":"initial-token"}`),
+				}}}, nil)
+				require.NoError(t, err)
+			}
+
+			srv := &policyServer{proxy: &stubProxy{}, credentialVault: store}
+			httpServer := httptest.NewUnstartedServer(http.HandlerFunc(srv.handleCredentialVault))
+			httpServer.Config.ErrorLog = log.New(io.Discard, "", 0)
+			httpServer.Start()
+			defer httpServer.Close()
+
+			var body string
+			if method == http.MethodPost {
+				body = `{"credentials":[{"name":"gitlab-token","source":{"type":"panic"}}],"bindings":[]}`
+			} else {
+				body = `{"credentials":{"replace":[{"name":"gitlab-token","source":{"type":"panic"}}]}}`
+			}
+			req, err := http.NewRequest(method, httpServer.URL+"/credential-vault", strings.NewReader(body))
+			require.NoError(t, err)
+			resp, err := httpServer.Client().Do(req)
+			var responseBody []byte
+			if resp != nil {
+				responseBody, _ = io.ReadAll(resp.Body)
+				resp.Body.Close()
+			}
+			require.Error(t, err, "net/http should recover the panicking handler by closing the request connection")
+			select {
+			case <-factoryCalled:
+			default:
+				if resp == nil {
+					t.Fatalf("credential source factory was not called; request error: %v", err)
+				}
+				t.Fatalf("credential source factory was not called; HTTP status %d body %q", resp.StatusCode, responseBody)
+			}
+
+			require.True(t, srv.mu.TryLock(), "policy mutation barrier should be released after the recovered panic")
+			srv.mu.Unlock()
+		})
+	}
 }
 
 func TestCredentialVaultDeleteRequiresReady(t *testing.T) {

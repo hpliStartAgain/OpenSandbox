@@ -312,9 +312,11 @@ func (s *policyServer) handleCredentialVaultPost(w http.ResponseWriter, r *http.
 		http.Error(w, fmt.Sprintf("invalid credential vault request: %v", err), http.StatusBadRequest)
 		return
 	}
-	s.mu.Lock()
-	state, err := s.credentialVault.Create(req, s.effectivePolicy())
-	s.mu.Unlock()
+	state, err := func() (credentialvault.State, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.credentialVault.Create(req, s.effectivePolicy())
+	}()
 	if err != nil {
 		credentialvault.WriteError(w, err)
 		return
@@ -336,9 +338,11 @@ func (s *policyServer) handleCredentialVaultPatch(w http.ResponseWriter, r *http
 		http.Error(w, fmt.Sprintf("invalid credential vault mutation request: %v", err), http.StatusBadRequest)
 		return
 	}
-	s.mu.Lock()
-	state, err := s.credentialVault.Patch(req, s.effectivePolicy())
-	s.mu.Unlock()
+	state, err := func() (credentialvault.State, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.credentialVault.Patch(req, s.effectivePolicy())
+	}()
 	if err != nil {
 		credentialvault.WriteError(w, err)
 		return
@@ -355,9 +359,11 @@ func (s *policyServer) handleCredentialVaultDelete(w http.ResponseWriter, r *htt
 		http.Error(w, "credential vault writes require TLS or loopback transport", http.StatusUpgradeRequired)
 		return
 	}
-	s.mu.Lock()
-	err := s.credentialVault.Delete()
-	s.mu.Unlock()
+	err := func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.credentialVault.Delete()
+	}()
 	if err != nil {
 		credentialvault.WriteError(w, err)
 		return
