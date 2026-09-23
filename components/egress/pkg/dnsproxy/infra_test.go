@@ -110,3 +110,28 @@ func TestServeDNSNonInfraStillDenied(t *testing.T) {
 	require.Equal(t, dns.RcodeNameError, w.msgs[0].Rcode)
 	require.False(t, infraCalled)
 }
+
+func TestServeDNSInfraDomainWithNilCallbackBypassesPolicy(t *testing.T) {
+	t.Setenv(constants.EnvNameserverExempt, "127.0.0.1")
+	resetNameserverExemptCache(t)
+	upstream := startInfraUpstream(t)
+	proxy := &Proxy{
+		upstreams:               []string{upstream},
+		activeUpstreams:         []string{upstream},
+		upstreamExchangeTimeout: time.Second,
+		effectivePolicy:         policy.DefaultDenyPolicy(),
+		userPolicy:              policy.DefaultDenyPolicy(),
+	}
+	proxy.SetInfraDomain("proxy.example.com", nil)
+	sandboxCalled := false
+	proxy.SetOnResolved(func(string, []nftables.ResolvedIP) { sandboxCalled = true })
+
+	w := &fakeRespWriter{remote: addrFromIP("10.0.0.9")}
+	q := new(dns.Msg)
+	q.SetQuestion("proxy.example.com.", dns.TypeA)
+	proxy.serveDNS(w, q)
+
+	require.Len(t, w.msgs, 1)
+	require.Equal(t, dns.RcodeSuccess, w.msgs[0].Rcode)
+	require.False(t, sandboxCalled)
+}

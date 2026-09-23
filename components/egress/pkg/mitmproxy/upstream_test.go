@@ -31,6 +31,7 @@ func TestParseUpstreamProxyValid(t *testing.T) {
 		{"https://proxy.example.com:8443", "https", "proxy.example.com", 8443},
 		{"http://proxy.example.com", "http", "proxy.example.com", 80},
 		{"https://proxy.example.com", "https", "proxy.example.com", 443},
+		{"http://proxy.example.com:3128/", "http", "proxy.example.com", 3128},
 		{"http://10.0.0.1:3128", "http", "10.0.0.1", 3128},
 		{"http://[fd00::1]:3128", "http", "fd00::1", 3128},
 		{"  http://proxy.example.com:3128  ", "http", "proxy.example.com", 3128},
@@ -58,9 +59,27 @@ func TestParseUpstreamProxyRejectsInvalid(t *testing.T) {
 		"http://proxy:notaport",           // invalid port
 		"http://proxy:0",                  // port out of range
 		"http://proxy:70000",              // port out of range
+		"http://proxy:3128/path",          // path is not part of the endpoint
+		"http://proxy:3128?",              // empty query marker is still a query
+		"http://proxy:3128#",              // empty fragment marker is still a fragment
+		"http://proxy:3128/%2F",           // encoded separator is still a non-root path
 	}
 	for _, raw := range tests {
 		_, err := parseUpstreamProxy(raw)
 		require.Error(t, err, raw)
+	}
+}
+
+func TestParseUpstreamProxyErrorsDoNotExposeURL(t *testing.T) {
+	for _, raw := range []string{
+		"http://user:secret@proxy:1x",
+		"http://user:secret@proxy:70000",
+		"http://user:secret@[invalid",
+	} {
+		_, err := parseUpstreamProxy(raw)
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), raw)
+		require.NotContains(t, err.Error(), "secret")
+		require.NotContains(t, err.Error(), "proxy")
 	}
 }

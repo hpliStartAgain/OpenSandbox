@@ -49,8 +49,8 @@ const (
 // drops so infra reachability is unaffected by blocklist or deny sets.
 func buildUpstreamProxyStatic(table string, ep *UpstreamProxyEndpoint) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "add set inet %s %s { type ipv4_addr; timeout %ds; }\n", table, upstreamProxyV4Set, dynSetTimeoutS)
-	fmt.Fprintf(&b, "add set inet %s %s { type ipv6_addr; timeout %ds; }\n", table, upstreamProxyV6Set, dynSetTimeoutS)
+	fmt.Fprintf(&b, "add set inet %s %s { type ipv4_addr; flags timeout; }\n", table, upstreamProxyV4Set)
+	fmt.Fprintf(&b, "add set inet %s %s { type ipv6_addr; flags timeout; }\n", table, upstreamProxyV6Set)
 	for _, ip := range ep.IPs {
 		addr := ip.Unmap()
 		var set string
@@ -96,6 +96,7 @@ func (m *Manager) AddUpstreamProxyIPs(ctx context.Context, ips []ResolvedIP) err
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, err := m.run(ctx, script.String()); err != nil {
+		telemetry.RecordNftablesUpdateFailed(telemetry.NftOpUpstreamProxyAdd)
 		return err
 	}
 	telemetry.RecordNftablesUpdate()

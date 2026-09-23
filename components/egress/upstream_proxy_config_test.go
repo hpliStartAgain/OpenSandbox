@@ -28,6 +28,7 @@ func TestUpstreamProxySpecForProfile(t *testing.T) {
 		auth        string
 		transparent string
 		profile     string
+		mode        string
 		wantSpec    bool
 		wantErrSubs []string
 	}{
@@ -57,9 +58,10 @@ func TestUpstreamProxySpecForProfile(t *testing.T) {
 			wantErrSubs: []string{constants.EnvUpstreamProxy},
 		},
 		{
-			name:        "proxy with transparent on succeeds for default profile",
+			name:        "proxy with transparent and dns+nft succeeds for default profile",
 			proxy:       "http://proxy.local:3128",
 			transparent: "true",
+			mode:        constants.PolicyDnsNft,
 			wantSpec:    true,
 		},
 		{
@@ -67,6 +69,20 @@ func TestUpstreamProxySpecForProfile(t *testing.T) {
 			proxy:       "http://proxy.local:3128",
 			transparent: "true",
 			profile:     "sidecar",
+			mode:        constants.PolicyDnsNft,
+			wantSpec:    true,
+		},
+		{
+			name:        "proxy requires dns+nft enforcement",
+			proxy:       "http://proxy.local:3128",
+			transparent: "true",
+			wantErrSubs: []string{constants.EnvUpstreamProxy, constants.EnvEgressMode, constants.PolicyDnsNft},
+		},
+		{
+			name:        "proxy accepts explicit dns+nft enforcement",
+			proxy:       "http://proxy.local:3128",
+			transparent: "true",
+			mode:        constants.PolicyDnsNft,
 			wantSpec:    true,
 		},
 		{
@@ -86,6 +102,7 @@ func TestUpstreamProxySpecForProfile(t *testing.T) {
 			t.Setenv(constants.EnvUpstreamProxy, tc.proxy)
 			t.Setenv(constants.EnvUpstreamProxyAuth, tc.auth)
 			t.Setenv(constants.EnvMitmproxyTransparent, tc.transparent)
+			t.Setenv(constants.EnvEgressMode, tc.mode)
 
 			spec, err := upstreamProxySpecForProfile(tc.profile)
 			if len(tc.wantErrSubs) > 0 {

@@ -74,10 +74,10 @@ def _parse_upstream(raw: str) -> tuple[str, str, int]:
     try:
         url = urlsplit(raw)
         port = url.port
-    except ValueError as e:
-        raise ValueError(f"invalid URL: {e}") from e
+    except ValueError:
+        raise ValueError("invalid URL syntax") from None
     if url.scheme not in ("http", "https"):
-        raise ValueError(f"unsupported scheme {url.scheme!r}, want http or https")
+        raise ValueError("unsupported scheme, want http or https")
     if url.username is not None or url.password is not None:
         raise ValueError(
             f"userinfo is not allowed, use {UPSTREAM_PROXY_AUTH_ENV} for credentials"
@@ -85,14 +85,16 @@ def _parse_upstream(raw: str) -> tuple[str, str, int]:
     host = url.hostname
     if not host:
         raise ValueError("missing host")
-    if url.query or url.fragment:
+    if url.query or "?" in raw or url.fragment or "#" in raw:
         raise ValueError("query and fragment are not allowed")
+    if url.path not in ("", "/"):
+        raise ValueError("path is not allowed")
     if port is None:
         port = 443 if url.scheme == "https" else 80
     elif not 1 <= port <= 65535:
-        raise ValueError(f"invalid port {port}")
+        raise ValueError("invalid port")
     if any(c in host for c in " \t\r\n/@"):
-        raise ValueError(f"invalid host {host!r}")
+        raise ValueError("invalid host")
     return url.scheme, host.lower(), port
 
 
@@ -125,10 +127,7 @@ def load(loader) -> None:
     _proxy_address = (host, port)
     _via = (scheme, _proxy_address)
     _proxy_auth = auth or None
-    ctx.log.info(
-        f"upstream proxy: chaining enabled via {scheme}://{host}:{port}"
-        + (" with Proxy-Authorization" if _proxy_auth else "")
-    )
+    ctx.log.info("credential proxy: upstream proxy chaining enabled")
 
 
 def _set_via_on_conn(conn) -> None:
@@ -195,7 +194,10 @@ def server_connect(data) -> None:
     except (TypeError, ValueError):
         is_proxy_conn = False
     if not is_proxy_conn:
-        server.error = (
-            "upstream proxy required: direct egress dial refused "
-            f"({getattr(server, 'transport_protocol', 'tcp')} to {address})"
+        transport = getattr(server, "transport_protocol", "tcp")
+        if transport not in ("tcp", "udp"):
+            transport = "unknown"
+        server.error = "upstream proxy required: direct egress dial refused"
+        ctx.log.warn(
+            f"credential proxy: upstream proxy required; direct {transport} egress dial refused"
         )

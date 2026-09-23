@@ -77,10 +77,10 @@ func parseUpstreamProxy(raw string) (UpstreamProxySpec, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return UpstreamProxySpec{}, fmt.Errorf("invalid URL: %w", err)
+		return UpstreamProxySpec{}, fmt.Errorf("invalid URL syntax")
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return UpstreamProxySpec{}, fmt.Errorf("unsupported scheme %q, want http or https", u.Scheme)
+		return UpstreamProxySpec{}, fmt.Errorf("unsupported scheme, want http or https")
 	}
 	if u.User != nil {
 		return UpstreamProxySpec{}, fmt.Errorf("userinfo is not allowed, use %s for credentials", constants.EnvUpstreamProxyAuth)
@@ -89,14 +89,18 @@ func parseUpstreamProxy(raw string) (UpstreamProxySpec, error) {
 	if host == "" {
 		return UpstreamProxySpec{}, fmt.Errorf("missing host")
 	}
-	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" || strings.Contains(raw, "#") {
 		return UpstreamProxySpec{}, fmt.Errorf("query and fragment are not allowed")
+	}
+	path := u.EscapedPath()
+	if path != "" && path != "/" {
+		return UpstreamProxySpec{}, fmt.Errorf("path is not allowed")
 	}
 	port := 0
 	if p := u.Port(); p != "" {
 		port, err = strconv.Atoi(p)
 		if err != nil || port < 1 || port > 65535 {
-			return UpstreamProxySpec{}, fmt.Errorf("invalid port %q", p)
+			return UpstreamProxySpec{}, fmt.Errorf("invalid port")
 		}
 	} else if u.Scheme == "https" {
 		port = 443
@@ -104,7 +108,7 @@ func parseUpstreamProxy(raw string) (UpstreamProxySpec, error) {
 		port = 80
 	}
 	if strings.ContainsAny(host, " \t\r\n/@") {
-		return UpstreamProxySpec{}, fmt.Errorf("invalid host %q", host)
+		return UpstreamProxySpec{}, fmt.Errorf("invalid host")
 	}
 	return UpstreamProxySpec{Scheme: u.Scheme, Host: strings.ToLower(host), Port: port}, nil
 }

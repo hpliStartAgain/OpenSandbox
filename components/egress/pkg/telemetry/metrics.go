@@ -65,9 +65,10 @@ const (
 
 // Bounded operation values for RecordNftablesUpdateFailed.
 const (
-	NftOpStaticApply = "static_apply"
-	NftOpDynamicAdd  = "dynamic_add"
-	NftOpRemove      = "remove"
+	NftOpStaticApply      = "static_apply"
+	NftOpDynamicAdd       = "dynamic_add"
+	NftOpRemove           = "remove"
+	NftOpUpstreamProxyAdd = "upstream_proxy_add"
 	// Fast Sandbox-profile operations (OSEP-0022).
 	NftOpReset     = "reset"
 	NftOpDenyFirst = "deny_first"

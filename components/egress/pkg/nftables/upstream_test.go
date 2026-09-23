@@ -38,8 +38,8 @@ func TestBuildRulesetWithUpstreamProxyScopesAccept(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	expectContains(t, rendered, "add set inet opensandbox upstream_proxy_v4 { type ipv4_addr; timeout 360s; }")
-	expectContains(t, rendered, "add set inet opensandbox upstream_proxy_v6 { type ipv6_addr; timeout 360s; }")
+	expectContains(t, rendered, "add set inet opensandbox upstream_proxy_v4 { type ipv4_addr; flags timeout; }")
+	expectContains(t, rendered, "add set inet opensandbox upstream_proxy_v6 { type ipv6_addr; flags timeout; }")
 	expectContains(t, rendered, "add element inet opensandbox upstream_proxy_v4 { 10.20.30.40 }")
 	expectContains(t, rendered,
 		"add rule inet opensandbox egress ip daddr @upstream_proxy_v4 tcp dport 8443 meta skuid 10042 accept")

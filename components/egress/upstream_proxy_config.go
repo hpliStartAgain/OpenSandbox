@@ -40,5 +40,9 @@ func upstreamProxySpecForProfile(profile string) (*mitmproxy.UpstreamProxySpec, 
 	if profile == constants.ProfileFastSandbox {
 		return nil, fmt.Errorf("%s is not supported with %s=%s", constants.EnvUpstreamProxy, constants.EnvEgressProfile, constants.ProfileFastSandbox)
 	}
+	mode, err := constants.ParseEgressMode(os.Getenv(constants.EnvEgressMode))
+	if err != nil || mode != constants.PolicyDnsNft {
+		return nil, fmt.Errorf("%s requires %s=%s", constants.EnvUpstreamProxy, constants.EnvEgressMode, constants.PolicyDnsNft)
+	}
 	return spec, nil
 }

@@ -144,6 +144,7 @@ func TestFailureCountersCarryBoundedAttributeWithoutSharingState(t *testing.T) {
 	RecordDNSQueryFailed(DNSFailureRcode)
 	RecordDNSQueryFailed(DNSFailureUpstreamError)
 	RecordNftablesUpdateFailed(NftOpDynamicAdd)
+	RecordNftablesUpdateFailed(NftOpUpstreamProxyAdd)
 	RecordDNSReplyFailed(DNSReplyStageAnswer)
 	RecordDNSReplyFailed(DNSReplyStageAnswer)
 	RecordDNSReplyFailed(DNSReplyStageDeny)
@@ -164,7 +165,7 @@ func TestFailureCountersCarryBoundedAttributeWithoutSharingState(t *testing.T) {
 	}, reply, "each stage must be its own stream")
 
 	nft := counterByAttr(t, &rm, "egress.nftables.updates.failed_total", "operation")
-	assert.Equal(t, map[string]int64{NftOpDynamicAdd: 1}, nft)
+	assert.Equal(t, map[string]int64{NftOpDynamicAdd: 1, NftOpUpstreamProxyAdd: 1}, nft)
 }
 
 // counterByAttr sums an Int64 counter's data points keyed by one attribute, and asserts

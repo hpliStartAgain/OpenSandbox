@@ -25,6 +25,7 @@ import importlib.util
 import os
 import sys
 import types
+import traceback
 import unittest
 from pathlib import Path
 from typing import Any
@@ -141,6 +142,9 @@ class UpstreamProxyConfigTest(unittest.TestCase):
             "http://",
             "http://user:pass@proxy.example.com:3128",
             "http://proxy.example.com:3128?x=1",
+            "http://proxy.example.com:3128?",
+            "http://proxy.example.com:3128/path",
+            "http://proxy.example.com:3128/%2F",
             "http://proxy.example.com:0",
             "http://proxy.example.com:70000",
         ):
@@ -148,6 +152,27 @@ class UpstreamProxyConfigTest(unittest.TestCase):
                 addon = _load_addon()
                 with self.assertRaises(ValueError, msg=raw):
                     addon.load(types.SimpleNamespace())
+
+    def test_parser_errors_do_not_expose_url_or_userinfo(self) -> None:
+        for raw in (
+            "http://user:secret@proxy.example.com:1x",
+            "http://user:secret@proxy.example.com:70000",
+            "http://user:secret@[invalid",
+        ):
+            addon = _load_addon()
+            with self.assertRaises(ValueError) as raised:
+                addon._parse_upstream(raw)
+            self.assertNotIn(raw, str(raised.exception))
+            self.assertNotIn("secret", str(raised.exception))
+            self.assertNotIn("proxy.example.com", str(raised.exception))
+            rendered = "".join(
+                traceback.format_exception(
+                    type(raised.exception), raised.exception, raised.exception.__traceback__
+                )
+            )
+            self.assertNotIn(raw, rendered)
+            self.assertNotIn("secret", rendered)
+            self.assertNotIn("proxy.example.com", rendered)
 
     def test_auth_without_proxy_fails_load(self) -> None:
         with _env(**{UPSTREAM_AUTH_ENV: "Basic dXNlcjpwYXNz"}):
@@ -170,6 +195,18 @@ class UpstreamProxyConfigTest(unittest.TestCase):
                 "Basic dXNlcjpwYXNz",
                 flow.request.headers["Proxy-Authorization"],
             )
+
+    def test_chaining_load_log_is_forwarded_without_auth(self) -> None:
+        with _env(
+            **{
+                UPSTREAM_ENV: "http://proxy.example.com:3128",
+                UPSTREAM_AUTH_ENV: "Bearer top-secret",
+            }
+        ):
+            addon = _load_addon()
+            addon.load(types.SimpleNamespace())
+            self.assertTrue(addon.ctx.log.messages[-1].startswith("credential proxy:"))
+            self.assertNotIn("top-secret", addon.ctx.log.messages[-1])
 
     def test_no_auth_header_when_unset(self) -> None:
         with _env(**{UPSTREAM_ENV: "http://proxy.example.com:3128"}):
@@ -229,6 +266,10 @@ class UpstreamProxyFailClosedTest(unittest.TestCase):
         data = types.SimpleNamespace(server=_Server(("93.184.216.34", 443)))
         addon.server_connect(data)
         self.assertIsNotNone(data.server.error)
+        self.assertTrue(addon.ctx.log.messages[-1].startswith("credential proxy:"))
+        self.assertIn("tcp", addon.ctx.log.messages[-1])
+        self.assertNotIn("93.184.216.34", addon.ctx.log.messages[-1])
+        self.assertNotIn("Proxy-Authorization", addon.ctx.log.messages[-1])
 
     def test_udp_dial_refused(self) -> None:
         addon = self._addon()
