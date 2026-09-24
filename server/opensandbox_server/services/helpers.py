@@ -324,7 +324,7 @@ def validate_upstream_proxy_request(
         or not has_network_policy
     ):
         return
-    if egress_env.get(OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE):
+    if _is_truthy(egress_env.get(OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE)):
         raise ValueError(
             f"'{OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE}' cannot be set when "
             "egress.upstream_proxy is configured"

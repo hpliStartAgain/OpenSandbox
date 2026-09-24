@@ -470,6 +470,22 @@ class TestKubernetesSandboxServiceCreate:
         k8s_service.workload_provider.create_workload.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_create_sandbox_upstream_proxy_ignores_ssl_insecure_false(
+        self, k8s_service, create_sandbox_request
+    ):
+        upstream_proxy = self._configure_upstream_proxy(k8s_service)
+        create_sandbox_request.network_policy = NetworkPolicy(default_action="deny", egress=[])
+        create_sandbox_request.env = {
+            "OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT": "true",
+            "OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE": "false",
+        }
+
+        await self._create_with_egress(k8s_service, create_sandbox_request)
+
+        _, kwargs = k8s_service.workload_provider.create_workload.call_args
+        assert kwargs["egress_settings"].upstream_proxy is upstream_proxy
+
+    @pytest.mark.asyncio
     async def test_create_sandbox_upstream_proxy_without_network_policy_succeeds(
         self, k8s_service, create_sandbox_request
     ):

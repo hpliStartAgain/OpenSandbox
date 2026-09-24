@@ -26,6 +26,7 @@ import ipaddress
 import logging
 import os
 import re
+import string
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Literal, Optional
 from urllib.parse import urlparse, urlsplit
@@ -84,6 +85,14 @@ GATEWAY_ROUTE_MODE_URI = "uri"
 
 EGRESS_MODE_DNS = "dns"
 EGRESS_MODE_DNS_NFT = "dns+nft"
+
+# ASCII characters Go's net/url leaves unescaped in the host slot
+# (shouldEscape(c, encodeHost)); the egress component parses
+# OPENSANDBOX_EGRESS_UPSTREAM_PROXY with url.Parse, so the server validator
+# mirrors that host charset exactly. Non-ASCII stays allowed like Go.
+_UPSTREAM_PROXY_HOST_ASCII = frozenset(
+    string.ascii_letters + string.digits + "-._~!$&'()*+,;=:[]<>\""
+)
 
 
 def _is_valid_kubernetes_container_resource_name(name: str) -> bool:
@@ -850,6 +859,12 @@ class EgressUpstreamProxyConfig(BaseModel):
         url = url.strip()
         if not url:
             raise ValueError("egress.upstream_proxy.url: value is empty")
+        # urlsplit silently strips tab/CR/LF, which Go's parser rejects —
+        # check the raw string first so both sides agree.
+        if any(ord(c) < 0x20 or c == "\x7f" for c in url):
+            raise ValueError(
+                "egress.upstream_proxy.url: control characters are not allowed"
+            )
         if "://" not in url:
             raise ValueError(
                 "egress.upstream_proxy.url: missing scheme, "
@@ -889,7 +904,15 @@ class EgressUpstreamProxyConfig(BaseModel):
             ) from None
         if port is not None and not 1 <= port <= 65535:
             raise ValueError("egress.upstream_proxy.url: invalid port, want 1-65535")
-        if any(c in host for c in " \t\r\n/@"):
+        # userinfo is already rejected, so a bracketed netloc means the
+        # host is an IPv6 literal where "%<zone>" is legitimate.
+        bracketed = parsed.netloc.startswith("[")
+        if "%" in host and not bracketed:
+            raise ValueError("egress.upstream_proxy.url: invalid host")
+        if any(
+            ord(c) < 0x80 and c != "%" and c not in _UPSTREAM_PROXY_HOST_ASCII
+            for c in host
+        ):
             raise ValueError("egress.upstream_proxy.url: invalid host")
         return url
 

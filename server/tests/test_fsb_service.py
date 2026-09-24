@@ -619,6 +619,22 @@ def test_upstream_proxy_config_rejects_network_policy_mutation(persisted_fsb):
     assert fake.last_update is None
 
 
+def test_upstream_proxy_config_allows_delete_network_policy_rules(persisted_fsb):
+    client, fake, service, sandbox_id = persisted_fsb
+    service._app_config.egress = EgressConfig(
+        image="opensandbox/egress:v1.1.7",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(url="http://proxy.local:3128"),
+    )
+    url = f"/v1/sandboxes/{sandbox_id}/networkpolicy"
+
+    # Deleting rules stays available: teardown is not chaining-sensitive.
+    response = client.request("DELETE", url, json=["a.com"])
+
+    assert response.status_code == 200
+    assert fake.last_update is not None
+
+
 def test_upstream_proxy_config_allows_create_without_network_policy(http_fsb):
     client, fake, service = http_fsb
     service._app_config.egress = EgressConfig(

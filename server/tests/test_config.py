@@ -1259,12 +1259,22 @@ def test_load_config_rejects_invalid_egress_resources_at_startup(
         config_module.load_config(config_path)
 
 
+# Expected results verified against the egress Go parseUpstreamProxy
+# (components/egress/pkg/mitmproxy/upstream.go); `%C3%A9` is intentionally
+# stricter than Go.
 @pytest.mark.parametrize(
     "url",
     [
         "http://proxy.local:3128",
         "https://proxy.local",
         "http://[::1]:3128",
+        "HTTP://proxy:3128",
+        "Https://proxy",
+        "http://pro_xy:3128",
+        "http://pro!xy:3128",
+        "http://proxy:",
+        "http://proxy.local:3128/",
+        "http://[fe80::1%25eth0]:3128",
     ],
 )
 def test_egress_upstream_proxy_accepts_valid_urls(url):
@@ -1314,6 +1324,19 @@ def test_egress_upstream_proxy_defaults_to_none():
         "http://proxy:0",
         "http://proxy:70000",
         "http://proxy:abc",
+        "http://proxy\\corp:3128",
+        "http://exa\tmple.com:3128",
+        "http://exa\rmple.com:3128",
+        "http://exa\x00mple:3128",
+        "http://exa\x7fmple:3128",
+        "http://pro%xy:3128",
+        "http://proxy%20name:3128",
+        "http://pro%C3%A9xy:3128",
+        "http://prox y:3128",
+        "http://proxy|a:3128",
+        "http://proxy{a}:3128",
+        "http://proxy^a:3128",
+        "http://proxy`a:3128",
     ],
 )
 def test_egress_upstream_proxy_rejects_invalid_urls(url):

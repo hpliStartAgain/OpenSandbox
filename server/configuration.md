@@ -282,10 +282,10 @@ When configured, the server injects `OPENSANDBOX_EGRESS_UPSTREAM_PROXY` (and `OP
 - Requires `mode = "dns+nft"`; config loading fails otherwise (the egress sidecar refuses the upstream proxy under `dns`).
 - Applies to Docker and Kubernetes sandboxes created **with** `networkPolicy`; sandboxes without a `networkPolicy` get no egress sidecar and are not chained.
 - Each such create request must enable transparent MITM (`credentialProxy.enabled=true` or env `OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true`), or creation is rejected with `400`.
-- `OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE` in the request env is rejected while `upstream_proxy` is configured.
-- Fast sandboxes reject `networkPolicy` on create and on policy mutation while `upstream_proxy` is configured: the shared-Fastlet egress cannot chain through the proxy. Pool mode already rejects `networkPolicy`.
+- `OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE` set to a truthy value (`1`/`true`/`yes`/`y`/`on`) in the request env is rejected while `upstream_proxy` is configured.
+- Fast sandboxes reject `networkPolicy` on create and on policy replace/patch while `upstream_proxy` is configured: the shared-Fastlet egress cannot chain through the proxy. Deleting rules stays available. Pool mode already rejects `networkPolicy`.
 - The endpoint is admin config only — it cannot be set per request, and `OPENSANDBOX_EGRESS_UPSTREAM_PROXY`/`OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH` in request `env` are rejected.
-- `url` must be `http://host[:port]` or `https://host[:port]` (IPv6 literals allowed); credentials in the URL, query, fragment, and non-root paths are rejected at config load. Use `authorization` for credentials.
+- `url` must be `http://host[:port]` or `https://host[:port]` (IPv6 literals allowed); credentials in the URL, query, fragment, and non-root paths are rejected at config load, as are control characters and characters outside the URL host charset (e.g. `\`, space, `|`). `%` is allowed only inside a bracketed IPv6 zone ID. Use `authorization` for credentials.
 - `authorization` is injected as a literal env var into the sidecar — visible via `docker inspect` and the Pod spec, same as `OPENSANDBOX_EGRESS_TOKEN`. Protect the config file.
 - Config changes apply to **newly created** sandboxes only; existing sidecars are unaffected.
 - For an `https://` proxy, the proxy certificate is verified against the egress image's system trust store — a private CA currently requires a custom egress image.

@@ -568,10 +568,17 @@ class FastSandboxService(SandboxService, ExtensionService):
         """Remove rules by target from the persisted egress binding (idempotent)."""
         current = self.get_network_policy(sandbox_id)
         kept = delete_policy_rules(current["policy"], targets)
-        return self._commit_network_policy(sandbox_id, normalized_policy(NetworkPolicy.model_validate(kept)))
+        return self._commit_network_policy(
+            sandbox_id,
+            normalized_policy(NetworkPolicy.model_validate(kept)),
+            guard_upstream_proxy=False,
+        )
 
-    def _commit_network_policy(self, sandbox_id: str, normalized: dict) -> dict:
-        self._reject_network_policy_with_upstream_proxy()
+    def _commit_network_policy(
+        self, sandbox_id: str, normalized: dict, *, guard_upstream_proxy: bool = True
+    ) -> dict:
+        if guard_upstream_proxy:
+            self._reject_network_policy_with_upstream_proxy()
         current = self._cr_reader.get(self._resolve_namespace(), sandbox_id)
         metadata = current["metadata"]
         bindings = [dict(b) for b in current["spec"].get("actionBindings", [])]
@@ -617,7 +624,9 @@ class FastSandboxService(SandboxService, ExtensionService):
 
     def _reject_network_policy_with_upstream_proxy(self) -> None:
         """The shared-Fastlet egress cannot chain through an upstream proxy, so
-        networkPolicy create/mutation is refused while it is configured."""
+        networkPolicy create/replace/patch is refused while it is configured.
+        Deleting rules stays available so operators can still tear down a
+        policy on existing sandboxes."""
         egress = self._app_config.egress
         if egress is None or egress.upstream_proxy is None:
             return
