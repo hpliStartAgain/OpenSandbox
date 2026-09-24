@@ -110,6 +110,7 @@ from opensandbox_server.services.helpers import (
     matches_filter,
     parse_timestamp,
     split_egress_env,
+    validate_upstream_proxy_request,
 )
 from opensandbox_server.services.docker.ossfs_mixin import OSSFSMixin
 from opensandbox_server.services.sandbox_service import SandboxService
@@ -726,6 +727,12 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             raise ValueError(
                 f"'{OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE}' cannot be set when credential proxy is enabled"
             )
+        validate_upstream_proxy_request(
+            self.app_config.egress,
+            has_network_policy=bool(request.network_policy),
+            credential_proxy_enabled=credential_proxy_enabled,
+            egress_env=egress_env or {},
+        )
 
         if egress_env and not request.network_policy:
             dropped_keys = sorted(egress_env.keys())

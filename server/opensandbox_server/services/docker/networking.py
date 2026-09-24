@@ -56,6 +56,7 @@ from opensandbox_server.services.endpoint_auth import (
     build_egress_auth_headers,
     merge_endpoint_headers,
 )
+from opensandbox_server.services.helpers import upstream_proxy_egress_env
 from opensandbox_server.services.validators import (
     ensure_credential_proxy_configured,
     ensure_egress_configured,
@@ -482,6 +483,10 @@ class DockerNetworkingMixin:
             sidecar_env.append(
                 f"{OTEL_EXPORTER_OTLP_ENDPOINT}={self.app_config.egress.otlp_endpoint}"
             )
+        for key, value in upstream_proxy_egress_env(
+            self.app_config.egress.upstream_proxy
+        ).items():
+            sidecar_env.append(f"{key}={value}")
         if credential_proxy_enabled:
             sidecar_env.append(f"{OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT}=true")
 

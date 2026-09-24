@@ -26,6 +26,7 @@ from opensandbox_server.config import (
     EGRESS_MODE_DNS,
     EGRESS_MODE_DNS_NFT,
     EgressConfig,
+    EgressUpstreamProxyConfig,
     ExecdInitResources,
     GatewayConfig,
     GatewayRouteModeConfig,
@@ -1255,6 +1256,203 @@ def test_load_config_rejects_invalid_egress_resources_at_startup(
     )
 
     with pytest.raises(ValidationError, match=error):
+        config_module.load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://proxy.local:3128",
+        "https://proxy.local",
+        "http://[::1]:3128",
+    ],
+)
+def test_egress_upstream_proxy_accepts_valid_urls(url):
+    cfg = EgressConfig(
+        image="opensandbox/egress:v1",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(url=url),
+    )
+    assert cfg.upstream_proxy is not None
+    assert cfg.upstream_proxy.url == url
+    assert cfg.upstream_proxy.authorization is None
+
+
+def test_egress_upstream_proxy_authorization_is_secret():
+    cfg = EgressConfig(
+        image="opensandbox/egress:v1",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128",
+            authorization=SecretStr("Basic s3cr3t-value"),
+        ),
+    )
+    assert cfg.upstream_proxy is not None
+    assert isinstance(cfg.upstream_proxy.authorization, SecretStr)
+    assert (
+        cfg.upstream_proxy.authorization.get_secret_value()
+        == "Basic s3cr3t-value"
+    )
+    assert "s3cr3t-value" not in repr(cfg)
+    assert "s3cr3t-value" not in str(cfg)
+
+
+def test_egress_upstream_proxy_defaults_to_none():
+    cfg = EgressConfig(image="opensandbox/egress:v1")
+    assert cfg.upstream_proxy is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "proxy:3128",
+        "ftp://proxy:21",
+        "http://:3128",
+        "http://proxy:3128/x",
+        "http://proxy:3128?x=1",
+        "http://proxy:3128#f",
+        "http://proxy:0",
+        "http://proxy:70000",
+        "http://proxy:abc",
+    ],
+)
+def test_egress_upstream_proxy_rejects_invalid_urls(url):
+    with pytest.raises(ValidationError):
+        EgressConfig(
+            image="opensandbox/egress:v1",
+            mode=EGRESS_MODE_DNS_NFT,
+            upstream_proxy=EgressUpstreamProxyConfig(url=url),
+        )
+
+
+def test_egress_upstream_proxy_userinfo_error_does_not_leak_credentials():
+    with pytest.raises(ValidationError) as exc_info:
+        EgressConfig(
+            image="opensandbox/egress:v1",
+            mode=EGRESS_MODE_DNS_NFT,
+            upstream_proxy=EgressUpstreamProxyConfig(
+                url="http://user:s3cr3t@proxy:3128"
+            ),
+        )
+    assert "s3cr3t" not in str(exc_info.value)
+
+
+def test_egress_upstream_proxy_authorization_rejects_newlines_without_leak():
+    with pytest.raises(ValidationError) as exc_info:
+        EgressConfig(
+            image="opensandbox/egress:v1",
+            mode=EGRESS_MODE_DNS_NFT,
+            upstream_proxy=EgressUpstreamProxyConfig(
+                url="http://proxy.local:3128",
+                authorization=SecretStr("Basic s3cr3t\nInjected: x"),
+            ),
+        )
+    assert "s3cr3t" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("authorization", ["   ", "\t"])
+def test_egress_upstream_proxy_whitespace_authorization_normalizes_to_none(
+    authorization,
+):
+    cfg = EgressUpstreamProxyConfig(
+        url="http://proxy.local:3128", authorization=SecretStr(authorization)
+    )
+    assert cfg.authorization is None
+
+
+def test_load_config_with_egress_upstream_proxy(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "http://proxy.local:3128"
+            authorization = "Basic dGVzdDp0ZXN0"
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.egress is not None
+    assert loaded.egress.upstream_proxy is not None
+    assert loaded.egress.upstream_proxy.url == "http://proxy.local:3128"
+    assert loaded.egress.upstream_proxy.authorization is not None
+    assert (
+        loaded.egress.upstream_proxy.authorization.get_secret_value()
+        == "Basic dGVzdDp0ZXN0"
+    )
+
+
+def test_load_config_rejects_upstream_proxy_userinfo_without_leak(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "http://user:s3cr3t@proxy.local:3128"
+            """
+        )
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        config_module.load_config(config_path)
+
+    assert "s3cr3t" not in str(exc_info.value)
+
+
+def test_egress_upstream_proxy_requires_dns_nft_mode():
+    with pytest.raises(ValidationError, match='egress.mode = "dns\\+nft"'):
+        EgressConfig(
+            image="opensandbox/egress:v1",
+            upstream_proxy=EgressUpstreamProxyConfig(
+                url="http://proxy.local:3128"
+            ),
+        )
+
+
+def test_load_config_rejects_upstream_proxy_without_dns_nft(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+
+            [egress.upstream_proxy]
+            url = "http://proxy.local:3128"
+            """
+        )
+    )
+
+    with pytest.raises(ValidationError, match="dns\\+nft"):
         config_module.load_config(config_path)
 
 

@@ -241,6 +241,7 @@ Configures the **egress sidecar** image and enforcement mode. The server only at
 | `readiness_timeout_seconds` | float | `30.0` | **Docker only.** Maximum time to wait for the egress sidecar health endpoint to become ready. Must be greater than `0`. |
 | `requests` | map string → string \| omitted | `null` | **Kubernetes only.** Resource requests for the generated egress sidecar. |
 | `limits` | map string → string \| omitted | `null` | **Kubernetes only.** Resource limits for the generated egress sidecar. |
+| `upstream_proxy` | table \| omitted | `null` | `[egress.upstream_proxy]` sub-table (`url`, optional `authorization`) chaining mitmproxy-handled egress through an upstream HTTP(S) CONNECT proxy. Requires `mode = "dns+nft"`. See [Chained upstream proxy](#chained-upstream-proxy). |
 
 ```toml
 [egress]
@@ -262,6 +263,33 @@ When `otlp_endpoint` is configured, the server injects it into every egress side
 - The value is infrastructure config: it is read only from the server config file and is not settable through the create API or per-request `env`.
 - Use a **fully qualified service name or an IP** (e.g. `otel-collector.observability.svc.cluster.local` on Kubernetes). The sidecar's automatic egress allow rule matches the configured host exactly, while the resolver expands partial service names (e.g. `otel-collector.observability`) to FQDNs the rule does not match, so telemetry would be blocked under a default-deny policy.
 - The sidecar exports **delta** temporality; a collector feeding Prometheus/GMP needs the `deltatocumulative` processor.
+
+### Chained upstream proxy
+
+```toml
+[egress]
+image = "opensandbox/egress:v1.1.7"
+mode = "dns+nft"
+
+[egress.upstream_proxy]
+url = "http://proxy.example.com:3128"
+# Optional: complete Proxy-Authorization header value for the upstream CONNECT.
+# authorization = "Basic <base64>"
+```
+
+When configured, the server injects `OPENSANDBOX_EGRESS_UPSTREAM_PROXY` (and `OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH` when `authorization` is set) into every egress sidecar, chaining all mitmproxy-handled egress through the proxy. Notes:
+
+- Requires `mode = "dns+nft"`; config loading fails otherwise (the egress sidecar refuses the upstream proxy under `dns`).
+- Applies to Docker and Kubernetes sandboxes created **with** `networkPolicy`; sandboxes without a `networkPolicy` get no egress sidecar and are not chained.
+- Each such create request must enable transparent MITM (`credentialProxy.enabled=true` or env `OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true`), or creation is rejected with `400`.
+- `OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE` in the request env is rejected while `upstream_proxy` is configured.
+- Fast sandboxes reject `networkPolicy` on create and on policy mutation while `upstream_proxy` is configured: the shared-Fastlet egress cannot chain through the proxy. Pool mode already rejects `networkPolicy`.
+- The endpoint is admin config only — it cannot be set per request, and `OPENSANDBOX_EGRESS_UPSTREAM_PROXY`/`OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH` in request `env` are rejected.
+- `url` must be `http://host[:port]` or `https://host[:port]` (IPv6 literals allowed); credentials in the URL, query, fragment, and non-root paths are rejected at config load. Use `authorization` for credentials.
+- `authorization` is injected as a literal env var into the sidecar — visible via `docker inspect` and the Pod spec, same as `OPENSANDBOX_EGRESS_TOKEN`. Protect the config file.
+- Config changes apply to **newly created** sandboxes only; existing sidecars are unaffected.
+- For an `https://` proxy, the proxy certificate is verified against the egress image's system trust store — a private CA currently requires a custom egress image.
+- Data-plane behavior (fail-closed direct-dial guard, UID+IP+port-scoped nft reachability, infra DNS for hostname endpoints) is documented in [`components/egress/docs/mitmproxy-transparent.md`](../components/egress/docs/mitmproxy-transparent.md#6-chain-through-an-upstream-proxy-corporateforward-egress).
 
 ### IPv6 and egress
 

@@ -31,7 +31,10 @@ from opensandbox_server.api.schema import Endpoint, Sandbox, SandboxFilter
 from opensandbox_server.services.constants import (
     ALLOWED_EGRESS_ENV_VARS,
     EGRESS_ENV_PREFIX,
+    OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
+    OPENSANDBOX_EGRESS_UPSTREAM_PROXY,
+    OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH,
     OPEN_SANDBOX_INGRESS_HEADER,
 )
 from opensandbox_server.config import (
@@ -39,6 +42,8 @@ from opensandbox_server.config import (
     GATEWAY_ROUTE_MODE_URI,
     GATEWAY_ROUTE_MODE_WILDCARD,
     INGRESS_MODE_GATEWAY,
+    EgressConfig,
+    EgressUpstreamProxyConfig,
     IngressConfig,
 )
 
@@ -279,6 +284,63 @@ def split_egress_env(
     return sandbox_env, egress_env
 
 
+def _is_truthy(value: Optional[str]) -> bool:
+    """Mirror the egress component's constants.IsTruthy."""
+    return bool(value) and value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def upstream_proxy_egress_env(
+    upstream_proxy: Optional[EgressUpstreamProxyConfig],
+) -> Dict[str, str]:
+    """Env entries injected into the egress sidecar for the configured
+    [egress.upstream_proxy]. Empty when no upstream proxy is configured."""
+    if upstream_proxy is None:
+        return {}
+    env = {OPENSANDBOX_EGRESS_UPSTREAM_PROXY: upstream_proxy.url}
+    if upstream_proxy.authorization is not None:
+        env[OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH] = (
+            upstream_proxy.authorization.get_secret_value()
+        )
+    return env
+
+
+def validate_upstream_proxy_request(
+    egress_config: Optional[EgressConfig],
+    *,
+    has_network_policy: bool,
+    credential_proxy_enabled: bool,
+    egress_env: Dict[str, Optional[str]],
+) -> None:
+    """Reject create requests that cannot be chained through the configured
+    [egress.upstream_proxy].
+
+    Chaining only exists inside the transparent mitmproxy path, so a sandbox
+    with a networkPolicy must enable transparent MITM, and the ssl-insecure
+    escape hatch is refused while a trusted upstream proxy chain is configured.
+    """
+    if (
+        egress_config is None
+        or egress_config.upstream_proxy is None
+        or not has_network_policy
+    ):
+        return
+    if egress_env.get(OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE):
+        raise ValueError(
+            f"'{OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE}' cannot be set when "
+            "egress.upstream_proxy is configured"
+        )
+    if not (
+        credential_proxy_enabled
+        or _is_truthy(egress_env.get(OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT))
+    ):
+        raise ValueError(
+            "egress.upstream_proxy is configured, so sandboxes with "
+            "networkPolicy must enable transparent MITM: set "
+            "credentialProxy.enabled=true or env "
+            f"{OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT}=true"
+        )
+
+
 __all__ = [
     "parse_memory_limit",
     "parse_nano_cpus",
@@ -288,4 +350,6 @@ __all__ = [
     "format_ingress_endpoint",
     "matches_filter",
     "split_egress_env",
+    "upstream_proxy_egress_env",
+    "validate_upstream_proxy_request",
 ]

@@ -99,6 +99,11 @@ mode = "dns"
 # 按配置的 host 精确匹配，而解析器会把部分服务名（如 otel-collector.observability）
 # 扩展成规则匹配不到的 FQDN。
 # otlp_endpoint = "http://otel-collector.observability.svc.cluster.local:4318"
+# 可选：将 sidecar 出口流量经上游 HTTP(S) CONNECT 代理链式转发。要求 mode = "dns+nft"，
+# 且每个 sandbox 启用透明 MITM（credentialProxy.enabled 或 OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true）。
+# [egress.upstream_proxy]
+# url = "http://proxy.example.com:3128"
+# authorization = "Basic <base64>"
 
 # 按访问续期。默认关闭 — 见 server/README_zh.md。
 [renew_intent]

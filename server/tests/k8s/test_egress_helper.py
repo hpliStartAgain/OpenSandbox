@@ -18,16 +18,20 @@ import subprocess
 from typing import Optional
 
 import pytest
+from pydantic import SecretStr
 
 from opensandbox_server.api.schema import NetworkPolicy, NetworkRule
 from opensandbox_server.config import (
     EGRESS_MODE_DNS,
     EGRESS_MODE_DNS_NFT,
+    EgressUpstreamProxyConfig,
 )
 from opensandbox_server.services.constants import (
     EGRESS_MODE_ENV,
     EGRESS_RULES_ENV,
     OTEL_EXPORTER_OTLP_ENDPOINT,
+    OPENSANDBOX_EGRESS_UPSTREAM_PROXY,
+    OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH,
     OPEN_SANDBOX_EGRESS_AUTH_HEADER,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
     OPENSANDBOX_EGRESS_SANDBOX_ID,
@@ -57,6 +61,7 @@ def _egress_settings(
     resource_requests: Optional[dict[str, str]] = None,
     resource_limits: Optional[dict[str, str]] = None,
     otlp_endpoint: Optional[str] = None,
+    upstream_proxy: Optional[EgressUpstreamProxyConfig] = None,
 ) -> EgressWorkloadSettings:
     return EgressWorkloadSettings(
         network_policy=network_policy,
@@ -69,6 +74,7 @@ def _egress_settings(
         resource_requests=resource_requests,
         resource_limits=resource_limits,
         otlp_endpoint=otlp_endpoint,
+        upstream_proxy=upstream_proxy,
     )
 
 
@@ -585,6 +591,68 @@ class TestApplyEgressToSpec:
         env_names = {e["name"] for e in containers[0]["env"]}
         assert OTEL_EXPORTER_OTLP_ENDPOINT not in env_names
 
+    def test_upstream_proxy_env_injected_with_auth(self):
+        containers: list = []
+        network_policy = NetworkPolicy(
+            default_action="deny",
+            egress=[NetworkRule(action="allow", target="example.com")],
+        )
+
+        apply_egress_to_spec(
+            containers,
+            _egress_settings(
+                network_policy,
+                upstream_proxy=EgressUpstreamProxyConfig(
+                    url="http://proxy.local:3128",
+                    authorization=SecretStr("Basic dGVzdDp0ZXN0"),
+                ),
+            ),
+        )
+
+        env_by_name = {e["name"]: e["value"] for e in containers[0]["env"]}
+        assert env_by_name[OPENSANDBOX_EGRESS_UPSTREAM_PROXY] == "http://proxy.local:3128"
+        assert (
+            env_by_name[OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH]
+            == "Basic dGVzdDp0ZXN0"
+        )
+
+    def test_upstream_proxy_env_injected_without_auth(self):
+        containers: list = []
+        network_policy = NetworkPolicy(
+            default_action="deny",
+            egress=[NetworkRule(action="allow", target="example.com")],
+        )
+
+        apply_egress_to_spec(
+            containers,
+            _egress_settings(
+                network_policy,
+                upstream_proxy=EgressUpstreamProxyConfig(
+                    url="https://proxy.local:8443"
+                ),
+            ),
+        )
+
+        env_by_name = {e["name"]: e["value"] for e in containers[0]["env"]}
+        assert env_by_name[OPENSANDBOX_EGRESS_UPSTREAM_PROXY] == "https://proxy.local:8443"
+        assert OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH not in env_by_name
+
+    def test_upstream_proxy_env_omitted_when_not_configured(self):
+        containers: list = []
+        network_policy = NetworkPolicy(
+            default_action="deny",
+            egress=[NetworkRule(action="allow", target="example.com")],
+        )
+
+        apply_egress_to_spec(
+            containers,
+            _egress_settings(network_policy),
+        )
+
+        env_names = {e["name"] for e in containers[0]["env"]}
+        assert OPENSANDBOX_EGRESS_UPSTREAM_PROXY not in env_names
+        assert OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH not in env_names
+
 
 class TestPrepExecdInitForEgress:
     @staticmethod
@@ -695,6 +763,19 @@ class TestSplitEgressEnv:
         """OPENSANDBOX_EGRESS_SANDBOX_ID is server-injected; users must not set it."""
         with pytest.raises(ValueError, match="not allowed"):
             split_egress_env({"OPENSANDBOX_EGRESS_SANDBOX_ID": "spoofed"})
+
+    def test_rejects_disallowed_upstream_proxy(self):
+        """OPENSANDBOX_EGRESS_UPSTREAM_PROXY comes only from [egress.upstream_proxy]."""
+        with pytest.raises(ValueError, match="not allowed"):
+            split_egress_env(
+                {"OPENSANDBOX_EGRESS_UPSTREAM_PROXY": "http://proxy.local:3128"}
+            )
+
+    def test_rejects_disallowed_upstream_proxy_auth(self):
+        with pytest.raises(ValueError, match="not allowed"):
+            split_egress_env(
+                {"OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH": "Basic abc"}
+            )
 
     def test_allows_mitmproxy_transparent(self):
         env = {"OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT": "true"}

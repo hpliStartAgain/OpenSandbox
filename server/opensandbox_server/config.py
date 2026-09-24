@@ -28,10 +28,18 @@ import os
 import re
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Literal, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from kubernetes.utils.quantity import parse_quantity
-from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 try:  # Python 3.11+
     import tomllib  # type: ignore[attr-defined]
@@ -805,6 +813,103 @@ class StorageConfig(BaseModel):
 
 DEFAULT_EGRESS_DISABLE_IPV6 = True
 
+
+class EgressUpstreamProxyConfig(BaseModel):
+    """Chained upstream CONNECT proxy for the egress sidecar.
+
+    Mirrors the egress component's ``parseUpstreamProxy`` validation so an
+    invalid endpoint fails server startup instead of failing sandbox creation
+    later. Error messages never echo the configured URL: a userinfo URL would
+    otherwise leak credentials into logs.
+    """
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    url: str = Field(
+        ...,
+        description=(
+            "Upstream proxy endpoint (http://host[:port] or https://host[:port]). "
+            "Injected into the egress sidecar as OPENSANDBOX_EGRESS_UPSTREAM_PROXY. "
+            "Credentials, query, fragment, and paths are rejected; use "
+            "authorization for credentials."
+        ),
+        min_length=1,
+    )
+    authorization: Optional[SecretStr] = Field(
+        default=None,
+        description=(
+            "Complete Proxy-Authorization header value sent on the upstream "
+            "CONNECT (e.g. 'Basic <base64>'), injected as "
+            "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH. Never logged."
+        ),
+    )
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, url: str) -> str:
+        url = url.strip()
+        if not url:
+            raise ValueError("egress.upstream_proxy.url: value is empty")
+        if "://" not in url:
+            raise ValueError(
+                "egress.upstream_proxy.url: missing scheme, "
+                "want http://host:port or https://host:port"
+            )
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            raise ValueError("egress.upstream_proxy.url: invalid URL") from None
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                "egress.upstream_proxy.url: unsupported scheme, want http or https"
+            )
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or "@" in parsed.netloc
+        ):
+            raise ValueError(
+                "egress.upstream_proxy.url: userinfo is not allowed, "
+                "use authorization for credentials"
+            )
+        host = parsed.hostname
+        if not host:
+            raise ValueError("egress.upstream_proxy.url: missing host")
+        if "?" in url or "#" in url or parsed.query or parsed.fragment:
+            raise ValueError(
+                "egress.upstream_proxy.url: query and fragment are not allowed"
+            )
+        if parsed.path not in ("", "/"):
+            raise ValueError("egress.upstream_proxy.url: path is not allowed")
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError(
+                "egress.upstream_proxy.url: invalid port, want 1-65535"
+            ) from None
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError("egress.upstream_proxy.url: invalid port, want 1-65535")
+        if any(c in host for c in " \t\r\n/@"):
+            raise ValueError("egress.upstream_proxy.url: invalid host")
+        return url
+
+    @field_validator("authorization")
+    @classmethod
+    def validate_authorization(
+        cls, authorization: Optional[SecretStr]
+    ) -> Optional[SecretStr]:
+        if authorization is None:
+            return None
+        secret = authorization.get_secret_value()
+        if not secret.strip():
+            return None
+        if "\r" in secret or "\n" in secret:
+            raise ValueError(
+                "egress.upstream_proxy.authorization must not contain newlines"
+            )
+        return authorization
+
+
 class EgressConfig(BaseModel):
     image: Optional[str] = Field(
         default=None,
@@ -856,6 +961,17 @@ class EgressConfig(BaseModel):
             "If both are unset, the resources block is omitted (namespace LimitRange defaults may apply)."
         ),
     )
+    upstream_proxy: Optional[EgressUpstreamProxyConfig] = Field(
+        default=None,
+        description=(
+            "Chained upstream HTTP(S) CONNECT proxy for mitmproxy-handled egress. "
+            "Server-side only; injected as OPENSANDBOX_EGRESS_UPSTREAM_PROXY[_AUTH] "
+            "on every egress sidecar. Sandboxes created with networkPolicy must "
+            "enable transparent MITM (credentialProxy.enabled or env "
+            "OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true) or creation is rejected. "
+            'Requires mode = "dns+nft".'
+        ),
+    )
 
     @field_validator("otlp_endpoint")
     @classmethod
@@ -905,6 +1021,15 @@ class EgressConfig(BaseModel):
             limit = limits[resource_name]
             if parse_quantity(request) > parse_quantity(limit):
                 raise ValueError(f"resource request for {resource_name!r} ({request!r}) must not exceed limit ({limit!r})")
+        return self
+
+    @model_validator(mode="after")
+    def validate_upstream_proxy_requires_dns_nft(self) -> EgressConfig:
+        # The egress sidecar refuses the upstream proxy unless
+        # OPENSANDBOX_EGRESS_MODE=dns+nft; fail at config load instead of
+        # crash-looping every sidecar.
+        if self.upstream_proxy is not None and self.mode != EGRESS_MODE_DNS_NFT:
+            raise ValueError('egress.upstream_proxy requires egress.mode = "dns+nft"')
         return self
 
 
@@ -1243,6 +1368,10 @@ class TenantsConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
+    # Config values may be secrets (store dsn, egress upstream proxy
+    # authorization); never echo raw inputs inside validation errors.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     server: ServerConfig = Field(default_factory=ServerConfig)
     proxy: ProxyConfig = Field(
         default_factory=ProxyConfig,
@@ -1450,6 +1579,7 @@ __all__ = [
     "PostgreSQLStoreConfig",
     "KubernetesRuntimeConfig",
     "EgressConfig",
+    "EgressUpstreamProxyConfig",
     "EGRESS_MODE_DNS",
     "EGRESS_MODE_DNS_NFT",
     "SecureRuntimeConfig",

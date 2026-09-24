@@ -30,7 +30,10 @@ from opensandbox_server.services.constants import (
     SANDBOX_MANUAL_CLEANUP_LABEL,
     SANDBOX_SNAPSHOT_ID_LABEL,
 )
-from opensandbox_server.services.helpers import split_egress_env
+from opensandbox_server.services.helpers import (
+    split_egress_env,
+    validate_upstream_proxy_request,
+)
 from opensandbox_server.services.k8s.workload_provider import EgressWorkloadSettings
 from opensandbox_server.services.validators import calculate_expiration_or_raise
 
@@ -102,6 +105,12 @@ def _build_create_workload_context(
         raise ValueError(
             f"'{OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE}' cannot be set when credential proxy is enabled"
         )
+    validate_upstream_proxy_request(
+        app_config.egress,
+        has_network_policy=bool(request.network_policy),
+        credential_proxy_enabled=credential_proxy_enabled,
+        egress_env=egress_env,
+    )
 
     if egress_env and not request.network_policy:
         dropped_keys = sorted(egress_env.keys())
@@ -128,6 +137,7 @@ def _build_create_workload_context(
             resource_requests=egress_config.requests,
             resource_limits=egress_config.limits,
             otlp_endpoint=egress_config.otlp_endpoint,
+            upstream_proxy=egress_config.upstream_proxy,
         )
 
     return _CreateWorkloadContext(

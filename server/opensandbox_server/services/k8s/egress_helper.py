@@ -34,6 +34,7 @@ from opensandbox_server.services.constants import (
     OPENSANDBOX_RUNTIME_MOUNT_PATH,
     OPENSANDBOX_RUNTIME_VOLUME_NAME,
 )
+from opensandbox_server.services.helpers import upstream_proxy_egress_env
 from opensandbox_server.services.k8s.workload_provider import EgressWorkloadSettings
 
 _IPV6_DISABLE_PATH = "/proc/sys/net/ipv6/conf/all/disable_ipv6"
@@ -105,6 +106,8 @@ def apply_egress_to_spec(
         env.append(
             {"name": OTEL_EXPORTER_OTLP_ENDPOINT, "value": egress_settings.otlp_endpoint}
         )
+    for name, value in upstream_proxy_egress_env(egress_settings.upstream_proxy).items():
+        env.append({"name": name, "value": value})
     if sandbox_id:
         env.append({"name": OPENSANDBOX_EGRESS_SANDBOX_ID, "value": sandbox_id})
     if egress_settings.credential_proxy_enabled:

@@ -99,6 +99,11 @@ mode = "dns"
 readiness_timeout_seconds = 30.0
 # Optional: export the egress sidecar's OpenTelemetry metrics (OTLP/HTTP only).
 # otlp_endpoint = "http://otel-collector.observability:4318"
+# Optional: chain sidecar egress through an upstream HTTP(S) CONNECT proxy. Requires mode = "dns+nft"
+# and transparent MITM per sandbox (credentialProxy.enabled or OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true).
+# [egress.upstream_proxy]
+# url = "http://proxy.example.com:3128"
+# authorization = "Basic <base64>"
 
 # Renew-on-access. Off by default — see server/README.md.
 [renew_intent]

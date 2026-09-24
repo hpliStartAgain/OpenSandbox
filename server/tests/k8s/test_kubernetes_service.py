@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import cast
 from unittest.mock import MagicMock, patch
 from fastapi import HTTPException
+from pydantic import SecretStr
 
 from opensandbox_server.services.k8s.kubernetes_service import KubernetesSandboxService
 from opensandbox_server.services.constants import (
@@ -41,6 +42,7 @@ from opensandbox_server.config import (
     EGRESS_MODE_DNS,
     EGRESS_MODE_DNS_NFT,
     EgressConfig,
+    EgressUpstreamProxyConfig,
     GatewayConfig,
     GatewayRouteModeConfig,
     IngressConfig,
@@ -392,6 +394,110 @@ class TestKubernetesSandboxServiceCreate:
         assert kwargs["env"] == {"SANDBOX_ENV": "value"}
         assert "network_policy" not in kwargs
         assert kwargs["annotations"][SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY] == "egress-token"
+
+    def _configure_upstream_proxy(self, k8s_service) -> EgressUpstreamProxyConfig:
+        upstream_proxy = EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128",
+            authorization=SecretStr("Basic dGVzdDp0ZXN0"),
+        )
+        k8s_service.app_config.egress = EgressConfig(
+            image="opensandbox/egress:v1.1.7",
+            mode=EGRESS_MODE_DNS_NFT,
+            upstream_proxy=upstream_proxy,
+        )
+        return upstream_proxy
+
+    async def _create_with_egress(self, k8s_service, create_sandbox_request):
+        k8s_service.workload_provider.create_workload.return_value = {
+            "name": "test-id", "uid": "uid-1"
+        }
+        k8s_service.workload_provider.get_workload.return_value = MagicMock()
+        k8s_service.workload_provider.get_status.return_value = {
+            "state": "Running", "reason": "", "message": "",
+            "last_transition_at": datetime.now(timezone.utc),
+        }
+        with patch(
+            "opensandbox_server.services.k8s.kubernetes_service.generate_egress_token",
+            return_value="egress-token",
+        ):
+            await k8s_service.create_sandbox(create_sandbox_request)
+
+    @pytest.mark.asyncio
+    async def test_create_sandbox_upstream_proxy_with_credential_proxy_succeeds(
+        self, k8s_service, create_sandbox_request
+    ):
+        upstream_proxy = self._configure_upstream_proxy(k8s_service)
+        create_sandbox_request.network_policy = NetworkPolicy(default_action="deny", egress=[])
+        create_sandbox_request.credential_proxy = CredentialProxyConfig(enabled=True)
+
+        await self._create_with_egress(k8s_service, create_sandbox_request)
+
+        _, kwargs = k8s_service.workload_provider.create_workload.call_args
+        assert kwargs["egress_settings"].upstream_proxy is upstream_proxy
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("transparent", ["true", "yes"])
+    async def test_create_sandbox_upstream_proxy_with_transparent_env_succeeds(
+        self, k8s_service, create_sandbox_request, transparent
+    ):
+        self._configure_upstream_proxy(k8s_service)
+        create_sandbox_request.network_policy = NetworkPolicy(default_action="deny", egress=[])
+        create_sandbox_request.env = {
+            "OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT": transparent
+        }
+
+        await self._create_with_egress(k8s_service, create_sandbox_request)
+
+        _, kwargs = k8s_service.workload_provider.create_workload.call_args
+        assert kwargs["egress_settings"].upstream_proxy is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("env", [{}, {"OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT": "false"}])
+    async def test_create_sandbox_upstream_proxy_requires_transparent_mitm(
+        self, k8s_service, create_sandbox_request, env
+    ):
+        self._configure_upstream_proxy(k8s_service)
+        create_sandbox_request.network_policy = NetworkPolicy(default_action="deny", egress=[])
+        create_sandbox_request.env = env
+
+        with pytest.raises(HTTPException) as exc_info:
+            await k8s_service.create_sandbox(create_sandbox_request)
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["code"] == SandboxErrorCodes.INVALID_PARAMETER
+        assert "credentialProxy.enabled" in exc_info.value.detail["message"]
+        assert "OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT" in exc_info.value.detail["message"]
+        k8s_service.workload_provider.create_workload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_sandbox_upstream_proxy_without_network_policy_succeeds(
+        self, k8s_service, create_sandbox_request
+    ):
+        self._configure_upstream_proxy(k8s_service)
+
+        await self._create_with_egress(k8s_service, create_sandbox_request)
+
+        _, kwargs = k8s_service.workload_provider.create_workload.call_args
+        assert kwargs["egress_settings"] is None
+
+    @pytest.mark.asyncio
+    async def test_create_sandbox_upstream_proxy_rejects_ssl_insecure(
+        self, k8s_service, create_sandbox_request
+    ):
+        self._configure_upstream_proxy(k8s_service)
+        create_sandbox_request.network_policy = NetworkPolicy(default_action="deny", egress=[])
+        create_sandbox_request.env = {
+            "OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT": "true",
+            "OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE": "true",
+        }
+
+        with pytest.raises(HTTPException) as exc_info:
+            await k8s_service.create_sandbox(create_sandbox_request)
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["code"] == SandboxErrorCodes.INVALID_PARAMETER
+        assert "OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE" in exc_info.value.detail["message"]
+        k8s_service.workload_provider.create_workload.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_create_sandbox_with_secure_access_passes_annotations(

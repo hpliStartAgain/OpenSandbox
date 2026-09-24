@@ -217,6 +217,8 @@ class FastSandboxService(SandboxService, ExtensionService):
         return await asyncio.to_thread(self._create_sandbox_sync, request)
 
     def _create_sandbox_sync(self, request: CreateSandboxRequest) -> CreateSandboxResponse:
+        if request.network_policy is not None:
+            self._reject_network_policy_with_upstream_proxy()
         created_at = datetime.now(timezone.utc)
         # Template mode: the resolved artifact reference becomes
         # the FastPath image; workload shape comes from the golden image.
@@ -569,6 +571,7 @@ class FastSandboxService(SandboxService, ExtensionService):
         return self._commit_network_policy(sandbox_id, normalized_policy(NetworkPolicy.model_validate(kept)))
 
     def _commit_network_policy(self, sandbox_id: str, normalized: dict) -> dict:
+        self._reject_network_policy_with_upstream_proxy()
         current = self._cr_reader.get(self._resolve_namespace(), sandbox_id)
         metadata = current["metadata"]
         bindings = [dict(b) for b in current["spec"].get("actionBindings", [])]
@@ -611,6 +614,24 @@ class FastSandboxService(SandboxService, ExtensionService):
         return None
 
     # -- helpers -----------------------------------------------------------
+
+    def _reject_network_policy_with_upstream_proxy(self) -> None:
+        """The shared-Fastlet egress cannot chain through an upstream proxy, so
+        networkPolicy create/mutation is refused while it is configured."""
+        egress = self._app_config.egress
+        if egress is None or egress.upstream_proxy is None:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": SandboxErrorCodes.INVALID_PARAMETER,
+                "message": (
+                    "networkPolicy is not supported for fast sandboxes while "
+                    "egress.upstream_proxy is configured: the shared-Fastlet "
+                    "egress cannot chain through the upstream proxy"
+                ),
+            },
+        )
 
     def _unsupported(
         self, feature: str, status_code: int = status.HTTP_400_BAD_REQUEST

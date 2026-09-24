@@ -34,6 +34,9 @@ from opensandbox_server.api import lifecycle, network_policy
 from opensandbox_server.api.schema import RenewSandboxExpirationRequest
 from opensandbox_server.config import (
     AppConfig,
+    EGRESS_MODE_DNS_NFT,
+    EgressConfig,
+    EgressUpstreamProxyConfig,
     IngressConfig,
     KubernetesRuntimeConfig,
     RuntimeConfig,
@@ -571,6 +574,71 @@ def test_delete_uses_cr_identity_when_runtime_observation_is_gone(persisted_fsb)
     assert client.delete(url).status_code == 204
     assert fake.last_delete.sandbox.expected_uid == uid
     assert client.delete(url).status_code == 404
+
+
+def test_upstream_proxy_config_rejects_network_policy_create(http_fsb):
+    client, fake, service = http_fsb
+    service._app_config.egress = EgressConfig(
+        image="opensandbox/egress:v1.1.7",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(url="http://proxy.local:3128"),
+    )
+
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+            "networkPolicy": {"defaultAction": "deny", "egress": []},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "SANDBOX::INVALID_PARAMETER"
+    assert "egress.upstream_proxy" in response.json()["detail"]["message"]
+    assert fake.last_create is None
+
+
+def test_upstream_proxy_config_rejects_network_policy_mutation(persisted_fsb):
+    client, fake, service, sandbox_id = persisted_fsb
+    service._app_config.egress = EgressConfig(
+        image="opensandbox/egress:v1.1.7",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(url="http://proxy.local:3128"),
+    )
+
+    response = client.put(
+        f"/v1/sandboxes/{sandbox_id}/networkpolicy",
+        json={"defaultAction": "deny", "egress": []},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "SANDBOX::INVALID_PARAMETER"
+    assert fake.last_update is None
+
+
+def test_upstream_proxy_config_allows_create_without_network_policy(http_fsb):
+    client, fake, service = http_fsb
+    service._app_config.egress = EgressConfig(
+        image="opensandbox/egress:v1.1.7",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(url="http://proxy.local:3128"),
+    )
+
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+        },
+    )
+
+    assert response.status_code == 202
+    assert fake.last_create is not None
 
 
 def test_http_policy_replace_preserves_bindings_and_fences_updates(persisted_fsb):
