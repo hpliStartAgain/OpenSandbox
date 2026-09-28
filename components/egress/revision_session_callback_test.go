@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/credentialvault"
 	"github.com/alibaba/opensandbox/egress/pkg/mitmproxy"
@@ -131,6 +132,55 @@ func TestWithRevisionMutationSessionHoldsReadLockUntilCallbackReturns(t *testing
 			}
 		})
 	}
+}
+
+func TestWithRevisionMutationSessionAllowsCurrentGenerationRead(t *testing.T) {
+	m := &mitmTransparent{
+		running:         &mitmproxy.Running{},
+		revisionSession: &fakeRevisionProcessSession{},
+		currentGen:      17,
+	}
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	callbackDone := make(chan error, 1)
+	go func() {
+		callbackDone <- m.withRevisionMutationSession(
+			context.Background(),
+			func(context.Context, revisionMutationSession) error {
+				close(callbackEntered)
+				<-releaseCallback
+				return nil
+			},
+		)
+	}()
+	released := false
+	defer func() {
+		if !released {
+			close(releaseCallback)
+		}
+	}()
+	entryCtx, entryCancel := context.WithTimeout(context.Background(), time.Second)
+	defer entryCancel()
+	select {
+	case <-callbackEntered:
+	case <-entryCtx.Done():
+		t.Fatal("revision mutation callback did not start")
+	}
+
+	generation := make(chan uint64, 1)
+	go func() { generation <- m.getCurrentGen() }()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	select {
+	case got := <-generation:
+		require.Equal(t, uint64(17), got)
+	case <-ctx.Done():
+		t.Fatal("current generation read blocked behind a lifecycle reader")
+	}
+
+	close(releaseCallback)
+	released = true
+	require.NoError(t, <-callbackDone)
 }
 
 func TestWithRevisionMutationSessionReturnsCallbackErrorUnchanged(t *testing.T) {

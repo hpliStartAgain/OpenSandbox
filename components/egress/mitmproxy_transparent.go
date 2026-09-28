@@ -119,8 +119,8 @@ func (m *mitmTransparent) closeRevisionSession(gen uint64) {
 }
 
 func (m *mitmTransparent) getCurrentGen() uint64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.currentGen
 }
 
