@@ -3,7 +3,7 @@ title: Credential-Bound TLS Interception
 authors:
   - "@hpliStartAgain"
 creation-date: 2026-09-04
-last-updated: 2026-09-26
+last-updated: 2026-09-28
 status: implementing
 ---
 
@@ -867,6 +867,17 @@ permits discarding only when it confirms the frozen previous identity remains
 active. Other attempts are rejected without transport activity; reconciliation
 errors retain the attempt, and a concurrent update remains blocked without
 transport activity.
+
+The sidecar now has an internal generation-pinned callback that holds the live
+process/session lifecycle read lock for the callback's full duration. This is
+only an ownership primitive: public mutation handlers, Vault Store candidate
+finalization, and connection fences are still not connected to it, so no
+public mutation acknowledgement is live. The callback accepts only the narrow
+update/reconcile session interface and requires a bounded context with a
+deadline canceled when sidecar shutdown begins. Callbacks must pass that same
+context to session operations and return promptly on cancellation; shutdown
+waits for a running callback to release the lifecycle read lock, and the helper
+cannot terminate a callback that ignores cancellation.
 
 `ErrClosed` and `ErrTransportUnavailable`, including a local parent-path fence
 failure after the receiver committed, are terminal session failures rather

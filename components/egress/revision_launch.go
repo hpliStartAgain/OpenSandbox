@@ -33,7 +33,13 @@ const (
 	defaultRevisionMaxSnapshotSize = 8 << 20
 )
 
+type revisionMutationSession interface {
+	Update(context.Context, credentialvault.ActiveSnapshot, int64) (revision.Identity, error)
+	ReconcileUpdate(context.Context, revision.Identity) (bool, error)
+}
+
 type revisionProcessSession interface {
+	revisionMutationSession
 	MitmproxyConfig() (*mitmproxy.RevisionIPCConfig, error)
 	Bootstrap(context.Context, credentialvault.ActiveSnapshot, int64) (revision.Identity, error)
 	ReconcileBootstrap(context.Context) (*revision.Identity, error)

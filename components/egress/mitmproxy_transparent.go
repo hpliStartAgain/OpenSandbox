@@ -39,7 +39,7 @@ type exitEvent struct {
 }
 
 type mitmTransparent struct {
-	mu              sync.Mutex
+	mu              sync.RWMutex
 	running         *mitmproxy.Running
 	revisionSession revisionProcessSession
 	currentGen      uint64 // generation of the mitmdump currently considered live
