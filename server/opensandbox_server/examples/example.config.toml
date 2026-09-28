@@ -104,6 +104,9 @@ readiness_timeout_seconds = 30.0
 # [egress.upstream_proxy]
 # url = "http://proxy.example.com:3128"
 # authorization = "Basic <base64>"
+# Optional: absolute path on the Docker daemon host to a PEM CA bundle trusted in
+# addition to the system roots; mounted read-only into the egress sidecar only.
+# ca_cert_path = "/etc/ssl/private-ca/upstream-proxy-ca.pem"
 
 # Renew-on-access. Off by default — see server/README.md.
 [renew_intent]

@@ -104,6 +104,9 @@ mode = "dns"
 # [egress.upstream_proxy]
 # url = "http://proxy.example.com:3128"
 # authorization = "Basic <base64>"
+# 可选：包含额外上游 CA bundle 的 Secret（固定键名 "ca.crt"）；
+# 仅以只读方式挂载到 egress sidecar。
+# ca_secret_name = "corp-proxy-ca"
 
 # 按访问续期。默认关闭 — 见 server/README_zh.md。
 [renew_intent]

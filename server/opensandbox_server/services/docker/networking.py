@@ -42,6 +42,7 @@ from opensandbox_server.services.constants import (
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
     OPENSANDBOX_EGRESS_SANDBOX_ID,
     OPENSANDBOX_EGRESS_TOKEN,
+    EGRESS_UPSTREAM_EXTRA_CA_PATH,
     OPENSANDBOX_RUNTIME_MOUNT_PATH,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
     SANDBOX_EMBEDDING_PROXY_PORT_LABEL,
@@ -511,10 +512,18 @@ class DockerNetworkingMixin:
             "cap_add": ["NET_ADMIN"],
             "port_bindings": normalize_port_bindings(sidecar_port_bindings),
         }
+        sidecar_binds: list[str] = []
         if runtime_volume_name:
-            base_sidecar_host_config_kwargs["binds"] = [
+            sidecar_binds.append(
                 f"{runtime_volume_name}:{OPENSANDBOX_RUNTIME_MOUNT_PATH}:rw"
-            ]
+            )
+        upstream_proxy = self.app_config.egress.upstream_proxy
+        if upstream_proxy is not None and upstream_proxy.ca_cert_path is not None:
+            sidecar_binds.append(
+                f"{upstream_proxy.ca_cert_path}:{EGRESS_UPSTREAM_EXTRA_CA_PATH}:ro"
+            )
+        if sidecar_binds:
+            base_sidecar_host_config_kwargs["binds"] = sidecar_binds
 
         def build_sidecar_host_config(*, include_ipv6_sysctls: bool) -> Any:
             sidecar_host_config_kwargs = dict(base_sidecar_host_config_kwargs)

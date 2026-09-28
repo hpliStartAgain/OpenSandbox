@@ -48,6 +48,7 @@ To bypass decryption for selected domains, edit the baked-in
 | `OPENSANDBOX_EGRESS_MITMPROXY_PORT` | No | mitmdump listen port; `iptables` redirects `80/443` here | `18081` |
 | `OPENSANDBOX_EGRESS_MITMPROXY_SCRIPT` | No | User mitm addon script paths (comma-separated); each is passed as `-s` and loaded after the system addon in order | Empty |
 | `OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_TRUST_DIR` | No | Trust directory for upstream TLS verification (OpenSSL style); overrides the config.yaml default | `/etc/ssl/certs` |
+| `OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA` | No | Path to a PEM file with one or more extra CA certificates; passed to mitmproxy `ssl_verify_upstream_trusted_ca`. **Additive** with the system/confdir trust — it does not replace `/etc/ssl/certs` — and applies to **every** mitmproxy upstream TLS connection (HTTPS proxy and intercepted origins), not only the proxy hop | Empty |
 | `OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE` | No | Skip upstream TLS verification (`1/true/on`); use when clients connect by IP and SNI is unavailable | Disabled |
 | `OPENSANDBOX_EGRESS_MITMPROXY_EXTRA_PORTS` | No | **Experimental.** Extra destination TCP ports to intercept, appended to the always-on `80,443` (comma-separated, e.g. `8080,8443`). Fails closed at startup on invalid input; total ports (including 80/443) must be ≤ 15. Note: the system addon's credential-binding matcher currently only fires on canonical 80/443 — extras are decrypted and logged but not matched against bindings. | Empty |
 | `OPENSANDBOX_EGRESS_UPSTREAM_PROXY` | No | Chained upstream proxy endpoint (`http://host[:port]` or `https://host[:port]`), with no credentials, query, fragment, or non-root path. Requires `OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true` and `OPENSANDBOX_EGRESS_MODE=dns+nft`; egress startup fails otherwise. Not supported with `OPENSANDBOX_EGRESS_PROFILE=fast-sandbox`. When set, the bundled `upstream_proxy.py` addon is loaded after the system addon and every mitmproxy-handled connection is forwarded through the proxy via `CONNECT`. Fail closed: pass-through flows that cannot be chained are refused and logged with the `credential proxy:` prefix. | Empty (disabled) |
@@ -69,6 +70,7 @@ This is the single source of truth for:
 - `listen_host` (`127.0.0.1`) — mitm default is `0.0.0.0`
 - `stream_large_bodies` (`1m`) — mitm default is unset (entire body buffered)
 - `ssl_verify_upstream_trusted_confdir` (`/etc/ssl/certs`) — mitm default is unset; overridable per-deployment via env
+- `ssl_verify_upstream_trusted_ca` — unset by default; per-deployment env `OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA` points it at a PEM bundle that **augments** the confdir trust for all upstream TLS verification
 - `connection_strategy` (`lazy`) — mitmproxy 10+ changed the default from `lazy` to `eager`; pinned explicitly to preserve the historical behavior of deferring upstream connections until the full request arrives
 - `ignore_hosts` (`[]`) — matches the mitm default; kept in the file as a discoverable extension point for operators adding TLS pass-through entries
 
@@ -195,7 +197,10 @@ Semantics and limits:
   verification against the proxy host, using the same
   `ssl_verify_upstream_trusted_confdir`/`_trusted_ca` options that verify real
   upstreams (default `/etc/ssl/certs`, overridable via
-  `OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_TRUST_DIR`).
+  `OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_TRUST_DIR`). To trust a private CA for
+  the proxy connection, deliver the PEM via
+  `OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA` — it is additive to the
+  system roots and also applies to intercepted origin TLS.
 - **Fail closed**: connections that cannot be chained — TLS pass-through
   (no-SNI or `ignore_hosts`/`tcp_hosts`/`udp_hosts` matches) and UDP/QUIC
   dials — are refused rather than silently sent direct.

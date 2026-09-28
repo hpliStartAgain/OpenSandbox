@@ -852,6 +852,20 @@ class EgressUpstreamProxyConfig(BaseModel):
             "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH. Never logged."
         ),
     )
+    ca_cert_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "Docker only: absolute path on the Docker daemon host to a PEM CA "
+            "bundle mounted read-only into the egress sidecar."
+        ),
+    )
+    ca_secret_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Kubernetes only: Secret containing the upstream CA bundle under "
+            "the fixed ca.crt key; mounted only into the egress sidecar."
+        ),
+    )
 
     @field_validator("url")
     @classmethod
@@ -931,6 +945,45 @@ class EgressUpstreamProxyConfig(BaseModel):
                 "egress.upstream_proxy.authorization must not contain newlines"
             )
         return authorization
+
+    @field_validator("ca_cert_path")
+    @classmethod
+    def validate_ca_cert_path(cls, path: Optional[str]) -> Optional[str]:
+        if path is None:
+            return None
+        path = path.strip()
+        if not path:
+            raise ValueError("egress.upstream_proxy.ca_cert_path: value is empty")
+        if "\x00" in path:
+            raise ValueError(
+                "egress.upstream_proxy.ca_cert_path: NUL is not allowed"
+            )
+        # The path lives on the Docker daemon host, which may be remote —
+        # never stat it here.
+        if not Path(path).is_absolute():
+            raise ValueError(
+                "egress.upstream_proxy.ca_cert_path must be an absolute path"
+            )
+        return path
+
+    @field_validator("ca_secret_name")
+    @classmethod
+    def validate_ca_secret_name(cls, name: Optional[str]) -> Optional[str]:
+        if name is None:
+            return None
+        name = name.strip()
+        if not name or len(name) > 253:
+            raise ValueError(
+                "egress.upstream_proxy.ca_secret_name must be a DNS-1123 subdomain"
+            )
+        if not all(
+            0 < len(label) <= 63 and _KUBERNETES_DNS_LABEL_RE.fullmatch(label)
+            for label in name.split(".")
+        ):
+            raise ValueError(
+                "egress.upstream_proxy.ca_secret_name must be a DNS-1123 subdomain"
+            )
+        return name
 
 
 class EgressConfig(BaseModel):
@@ -1455,6 +1508,16 @@ class AppConfig(BaseModel):
                 )
         else:
             raise ValueError(f"Unsupported runtime type '{self.runtime.type}'.")
+        upstream_proxy = self.egress.upstream_proxy if self.egress else None
+        if upstream_proxy is not None:
+            if self.runtime.type == "docker" and upstream_proxy.ca_secret_name is not None:
+                raise ValueError(
+                    "egress.upstream_proxy.ca_secret_name requires runtime.type = 'kubernetes'"
+                )
+            if self.runtime.type == "kubernetes" and upstream_proxy.ca_cert_path is not None:
+                raise ValueError(
+                    "egress.upstream_proxy.ca_cert_path requires runtime.type = 'docker'"
+                )
         return self
 
 

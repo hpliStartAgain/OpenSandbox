@@ -1163,6 +1163,154 @@ async def test_create_sandbox_network_policy_enables_mitm_only_for_credential_pr
 
 @pytest.mark.asyncio
 @patch("opensandbox_server.services.docker.docker_service.docker")
+async def test_create_sandbox_mounts_upstream_proxy_ca_only_on_egress_sidecar(
+    mock_docker,
+):
+    mock_client = MagicMock()
+    mock_client.containers.list.return_value = []
+
+    def host_cfg_side_effect(**kwargs):
+        return kwargs
+
+    mock_client.api.create_host_config.side_effect = host_cfg_side_effect
+    mock_client.api.create_container.side_effect = [
+        {"Id": "sidecar-id"},
+        {"Id": "main-id"},
+    ]
+    mock_client.containers.get.side_effect = [
+        MagicMock(id="sidecar-id"),
+        MagicMock(id="main-id"),
+    ]
+    mock_docker.from_env.return_value = mock_client
+
+    cfg = _app_config()
+    cfg.docker.network_mode = "bridge"
+    cfg.egress = EgressConfig(
+        image="egress:latest",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(
+            url="https://proxy.local:8443",
+            ca_cert_path="/etc/ssl/private-ca/upstream.pem",
+        ),
+    )
+    service = DockerSandboxService(config=cfg)
+
+    req = CreateSandboxRequest(
+        image=ImageSpec(uri="python:3.11"),
+        timeout=120,
+        resourceLimits=ResourceLimits(root={}),
+        env={},
+        metadata={},
+        entrypoint=["python"],
+        networkPolicy=NetworkPolicy(default_action="deny", egress=[]),
+        credentialProxy=CredentialProxyConfig(enabled=True),
+    )
+
+    with (
+        patch(
+            "opensandbox_server.services.docker.docker_service.generate_egress_token",
+            return_value="egress-token",
+        ),
+        patch(
+            "opensandbox_server.services.docker.docker_service.allocate_port_bindings",
+            return_value={
+                "44772": ("0.0.0.0", 44772),
+                "8080": ("0.0.0.0", 8080),
+                "18080": ("0.0.0.0", 18080),
+            },
+        ),
+        patch.object(service, "_ensure_image_available"),
+        patch.object(service, "_prepare_sandbox_runtime"),
+        patch.object(service, "_wait_for_egress_sidecar_ready"),
+    ):
+        await service.create_sandbox(req)
+
+    sidecar_kwargs = mock_client.api.create_container.call_args_list[0].kwargs
+    main_kwargs = mock_client.api.create_container.call_args_list[1].kwargs
+
+    ca_bind = (
+        "/etc/ssl/private-ca/upstream.pem"
+        ":/etc/ssl/certs/opensandbox-upstream-extra-ca.pem:ro"
+    )
+    sidecar_env = sidecar_kwargs["environment"]
+    assert (
+        "OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA="
+        "/etc/ssl/certs/opensandbox-upstream-extra-ca.pem" in sidecar_env
+    )
+
+    sidecar_binds = sidecar_kwargs["host_config"]["binds"]
+    runtime_volume = (
+        "opensandbox-runtime-" + main_kwargs["labels"][SANDBOX_ID_LABEL]
+    )
+    expected_runtime_bind = (
+        f"{runtime_volume}:{OPENSANDBOX_RUNTIME_MOUNT_PATH}:rw"
+    )
+    assert expected_runtime_bind in sidecar_binds
+    assert ca_bind in sidecar_binds
+    assert ca_bind.endswith(":ro")
+
+    main_binds = main_kwargs["host_config"].get("binds", [])
+    assert ca_bind not in main_binds
+    assert not any(
+        entry.startswith("OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA")
+        for entry in main_kwargs["environment"]
+    )
+
+
+@patch("opensandbox_server.services.docker.docker_service.docker")
+def test_egress_sidecar_omits_upstream_ca_bind_when_not_configured(mock_docker):
+    mock_client = MagicMock()
+    mock_client.containers.list.return_value = []
+
+    def host_cfg_side_effect(**kwargs):
+        return kwargs
+
+    mock_client.api.create_host_config.side_effect = host_cfg_side_effect
+    mock_client.api.create_container.return_value = {"Id": "sidecar-id"}
+    mock_client.containers.get.return_value = MagicMock()
+    mock_docker.from_env.return_value = mock_client
+
+    cfg = _app_config()
+    cfg.docker.network_mode = "bridge"
+    cfg.egress = EgressConfig(
+        image="egress:latest",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(
+            url="https://proxy.local:8443"
+        ),
+    )
+    service = DockerSandboxService(config=cfg)
+
+    with (
+        patch.object(service, "_ensure_image_available"),
+        patch.object(service, "_docker_operation") as mock_op,
+    ):
+        mock_op.return_value.__enter__.return_value = None
+        mock_op.return_value.__exit__.return_value = None
+        service._start_egress_sidecar(
+            "sbx-abc123",
+            NetworkPolicy(defaultAction="deny", egress=[]),
+            egress_token="egress-token",
+            host_execd_port=44772,
+            host_http_port=8080,
+        )
+
+    sidecar_env = mock_client.api.create_container.call_args.kwargs["environment"]
+    assert not any(
+        entry.startswith("OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA")
+        for entry in sidecar_env
+    )
+    sidecar_host_config = (
+        mock_client.api.create_host_config.call_args_list[0].kwargs
+    )
+    assert not any(
+        "opensandbox-upstream-extra-ca" in bind
+        for bind in sidecar_host_config.get("binds", [])
+    )
+
+
+@pytest.mark.asyncio
+@patch("opensandbox_server.services.docker.docker_service.docker")
 async def test_create_sandbox_rejects_secure_access_on_docker_runtime(mock_docker):
     mock_client = MagicMock()
     mock_client.containers.list.return_value = []

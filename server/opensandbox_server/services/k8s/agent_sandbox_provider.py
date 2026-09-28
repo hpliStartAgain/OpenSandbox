@@ -356,6 +356,7 @@ class AgentSandboxProvider(WorkloadProvider):
             containers=containers,
             egress_settings=egress_settings,
             sandbox_id=sandbox_id,
+            pod_volumes=pod_spec["volumes"],
         )
 
         return pod_spec

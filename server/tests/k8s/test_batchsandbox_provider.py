@@ -30,13 +30,18 @@ from opensandbox_server.config import (
     AppConfig,
     EGRESS_MODE_DNS,
     EGRESS_MODE_DNS_NFT,
+    EgressUpstreamProxyConfig,
     ExecdInitResources,
     KubernetesRuntimeConfig,
     RuntimeConfig,
 )
 from opensandbox_server.services.constants import (
+    EGRESS_UPSTREAM_EXTRA_CA_PATH,
+    EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+    EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
     OPEN_SANDBOX_EGRESS_AUTH_HEADER,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
+    OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA,
     OPENSANDBOX_RUNTIME_MOUNT_PATH,
     OPENSANDBOX_RUNTIME_VOLUME_NAME,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
@@ -93,6 +98,7 @@ def _egress_settings(
     auth_token: str | None = None,
     credential_proxy_enabled: bool = False,
     disable_ipv6: bool = True,
+    upstream_proxy: EgressUpstreamProxyConfig | None = None,
 ) -> EgressWorkloadSettings:
     return EgressWorkloadSettings(
         network_policy=network_policy,
@@ -104,6 +110,7 @@ def _egress_settings(
         disable_ipv6=disable_ipv6,
         resource_requests=None,
         resource_limits=None,
+        upstream_proxy=upstream_proxy,
     )
 
 
@@ -2377,6 +2384,78 @@ class TestBatchSandboxProviderEgress:
         assert len(policy_json["egress"]) == 2
         assert policy_json["egress"][0]["action"] == "allow"
         assert policy_json["egress"][0]["target"] == "pypi.org"
+
+    def test_create_workload_mounts_upstream_proxy_ca_secret_only_on_egress(
+        self, mock_k8s_client
+    ):
+        provider = BatchSandboxProvider(mock_k8s_client)
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "test-uid"}
+        }
+        network_policy = NetworkPolicy(
+            default_action="deny",
+            egress=[NetworkRule(action="allow", target="pypi.org")],
+        )
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={},
+            labels={},
+            expires_at=datetime(2025, 12, 31, 10, 0, 0, tzinfo=timezone.utc),
+            execd_image="execd:latest",
+            egress_settings=_egress_settings(
+                network_policy,
+                credential_proxy_enabled=True,
+                upstream_proxy=EgressUpstreamProxyConfig(
+                    url="https://proxy.local:8443",
+                    ca_secret_name="corp-proxy-ca",
+                ),
+            ),
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pod_spec = body["spec"]["template"]["spec"]
+        containers = pod_spec["containers"]
+
+        ca_volume = {
+            "name": EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
+            "secret": {
+                "secretName": "corp-proxy-ca",
+                "items": [
+                    {
+                        "key": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+                        "path": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+                    }
+                ],
+            },
+        }
+        assert ca_volume in pod_spec["volumes"]
+
+        sidecar = next(c for c in containers if c["name"] == "egress")
+        assert {
+            "name": EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
+            "mountPath": EGRESS_UPSTREAM_EXTRA_CA_PATH,
+            "subPath": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+            "readOnly": True,
+        } in sidecar["volumeMounts"]
+        env_vars = {e["name"]: e["value"] for e in sidecar["env"]}
+        assert (
+            env_vars[OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA]
+            == EGRESS_UPSTREAM_EXTRA_CA_PATH
+        )
+
+        main = next(c for c in containers if c["name"] == "sandbox")
+        assert EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME not in {
+            m["name"] for m in main.get("volumeMounts", [])
+        }
+        assert (
+            OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA
+            not in {e["name"] for e in main.get("env", [])}
+        )
 
     def test_main_container_no_security_context_without_network_policy(self, mock_k8s_client):
         provider = BatchSandboxProvider(mock_k8s_client)
