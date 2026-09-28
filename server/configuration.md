@@ -300,6 +300,7 @@ When configured, the server injects `OPENSANDBOX_EGRESS_UPSTREAM_PROXY` (and `OP
 - The extra CA **augments** the system trust store — it does not replace `/etc/ssl/certs` — and applies globally to **all** mitmproxy upstream TLS verification (the HTTPS proxy connection and intercepted origins), not only the proxy hop.
 - Without a CA field, an `https://` proxy's certificate is verified against the egress image's system trust store, so a private CA needs one of the fields above (or a custom egress image).
 - Data-plane behavior (fail-closed direct-dial guard, UID+IP+port-scoped nft reachability, infra DNS for hostname endpoints) is documented in [`components/egress/docs/mitmproxy-transparent.md`](../components/egress/docs/mitmproxy-transparent.md#6-chain-through-an-upstream-proxy-corporateforward-egress).
+- For runtime compatibility, rotation, verification, and troubleshooting, see [Chained Upstream Proxy Operations](../docs/guides/egress-upstream-proxy.md).
 
 ### IPv6 and egress
 
