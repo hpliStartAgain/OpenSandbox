@@ -855,8 +855,8 @@ class EgressUpstreamProxyConfig(BaseModel):
     ca_cert_path: Optional[str] = Field(
         default=None,
         description=(
-            "Docker only: absolute path on the Docker daemon host to a PEM CA "
-            "bundle mounted read-only into the egress sidecar."
+            "Docker only: absolute POSIX path on the Docker daemon host to a "
+            "PEM CA bundle mounted read-only into the egress sidecar."
         ),
     )
     ca_secret_name: Optional[str] = Field(
@@ -959,10 +959,15 @@ class EgressUpstreamProxyConfig(BaseModel):
                 "egress.upstream_proxy.ca_cert_path: NUL is not allowed"
             )
         # The path lives on the Docker daemon host, which may be remote —
-        # never stat it here.
-        if not Path(path).is_absolute():
+        # never stat it here. It must be POSIX-absolute because the bind
+        # source is resolved by the daemon (typically Linux); Path.is_absolute
+        # is platform-dependent and would reject "/x/y" when the server itself
+        # runs on Windows. ":" is rejected because it collides with the
+        # "src:dst:mode" bind syntax.
+        if not path.startswith("/") or ":" in path:
             raise ValueError(
-                "egress.upstream_proxy.ca_cert_path must be an absolute path"
+                "egress.upstream_proxy.ca_cert_path must be an absolute POSIX "
+                "path without ':'"
             )
         return path
 

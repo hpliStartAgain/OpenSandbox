@@ -1502,6 +1502,8 @@ def test_egress_upstream_proxy_ca_cert_path_valid(path):
         "relative/ca.pem",
         "./ca.pem",
         "ca.pem",
+        "C:\\ca\\proxy.pem",
+        "/has:colon/ca.pem",
         "/bad/\x00ca.pem",
     ],
 )
