@@ -942,8 +942,19 @@ host returns `needs_registry`; this is not a decrypt instruction. This step
 fails malformed ECH/static-selector arguments closed with `reason=invalid_input`
 while preserving early identity, ECH, and no-SNI ordering. It does not connect
 the classifier to the system addon or receiver commit path,
-does not add a connection registry, and does not change Go, public
-configuration, or live traffic. Selective TLS remains disabled.
+and does not change Go, public configuration, or live traffic. Selective TLS
+remains disabled.
+
+An unused sidecar-only connection-registry foundation now consumes the pure
+classification result under one lock with bounded admission. It records only
+bound, admitted connections with their generation and decision epoch; capacity
+exhaustion denies new bound admission rather than making it opaque, while
+unbound pass-through consumes no entry. One Registry instance accepts only one
+sidecar generation; a replacement process creates a fresh instance. Deactivation
+denies later non-exempt SNI-bearing decisions and returns existing memberships
+for the future owner to close, but does not close transports itself. Receiver
+publication, host-removal request fences, mitmproxy hooks, fast-sandbox budgets,
+and live traffic remain unwired.
 
 1. **Decision telemetry and red tests**
    - Add fail-closed tests that distinguish authoritative empty from lookup
