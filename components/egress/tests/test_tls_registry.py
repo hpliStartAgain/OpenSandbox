@@ -18,7 +18,9 @@ import hashlib
 import importlib.util
 import json
 import sys
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 MITMSCRIPTS = Path(__file__).resolve().parents[1] / "mitmscripts"
@@ -186,6 +188,109 @@ class TLSRegistryTest(unittest.TestCase):
         )
         with self.assertRaises(registry_module.RegistryError):
             registry.activate(forged)
+
+    def test_wildcard_to_exact_returns_only_newly_uncovered_memberships(self):
+        registry = registry_module.BoundConnectionRegistry(capacity=3)
+        registry.activate(self.snapshot(host="*.example.com"))
+        api = self.admit(registry, sni="API.EXAMPLE.COM.")
+        docs = self.admit(registry, sni="docs.example.com")
+        nested = self.admit(registry, sni="a.b.example.com")
+
+        uncovered = registry.activate(self.snapshot(epoch=2, host="api.example.com"))
+
+        self.assertEqual(uncovered, (docs.token, nested.token))
+        self.assertEqual(registry.count, 3)
+        self.assertEqual(self.admit(registry, sni="docs.example.com").action,
+                         "passthrough")
+        self.assertTrue(registry.release(api.token))
+        self.assertTrue(registry.release(docs.token))
+        self.assertTrue(registry.release(nested.token))
+
+    def test_exact_to_wildcard_keeps_existing_host_covered(self):
+        registry = registry_module.BoundConnectionRegistry(capacity=2)
+        registry.activate(self.snapshot())
+        api = self.admit(registry)
+
+        self.assertEqual(registry.activate(
+            self.snapshot(epoch=2, host="*.example.com")), ())
+        docs = self.admit(registry, sni="docs.example.com")
+        self.assertEqual((docs.action, registry.count), ("decrypt", 2))
+        self.assertTrue(registry.release(api.token))
+
+    def test_empty_and_unchanged_host_transitions_do_not_repeat_old_uncoverage(self):
+        registry = registry_module.BoundConnectionRegistry(capacity=2)
+        registry.activate(self.snapshot(host="*.example.com"))
+        api = self.admit(registry)
+        docs = self.admit(registry, sni="docs.example.com")
+
+        self.assertEqual(registry.activate(
+            self.snapshot(epoch=2, host="api.example.com")), (docs.token,))
+        self.assertEqual(registry.activate(
+            self.snapshot(epoch=3, host="api.example.com")), ())
+        self.assertEqual(registry.activate(
+            self.snapshot(epoch=4, host=None)), (api.token,))
+        self.assertEqual(registry.count, 2)
+        self.assertEqual(self.admit(registry).action, "passthrough")
+
+    def test_rejected_transition_preserves_old_view_and_memberships(self):
+        registry = registry_module.BoundConnectionRegistry(capacity=2)
+        registry.activate(self.snapshot(epoch=2, host="*.example.com"))
+        old = self.admit(registry, sni="docs.example.com")
+
+        with self.assertRaises(registry_module.RegistryError):
+            registry.activate(self.snapshot(epoch=1, host="api.example.com"))
+
+        self.assertEqual(registry.count, 1)
+        other = self.admit(registry, sni="other.example.com")
+        self.assertEqual(other.action, "decrypt")
+        self.assertEqual(registry.activate(
+            self.snapshot(epoch=3, host="api.example.com")),
+            (old.token, other.token))
+
+    def test_invalid_snapshot_does_not_replace_active_view(self):
+        registry = registry_module.BoundConnectionRegistry(capacity=2)
+        registry.activate(self.snapshot(host="*.example.com"))
+        old = self.admit(registry, sni="docs.example.com")
+        candidate = self.snapshot(epoch=2, host="api.example.com")
+        invalid = receiver.Snapshot(candidate.revision, b"invalid snapshot")
+
+        with self.assertRaises(registry_module.RegistryError):
+            registry.activate(invalid)
+
+        self.assertEqual(registry.count, 1)
+        other = self.admit(registry, sni="other.example.com")
+        self.assertEqual(other.action, "decrypt")
+        self.assertEqual(registry.activate(candidate),
+                         (old.token, other.token))
+
+    def test_admission_racing_with_cutover_is_either_reported_or_passthrough(self):
+        old = self.snapshot(host="*.example.com")
+        new = self.snapshot(epoch=2, host="api.example.com")
+        for _ in range(24):
+            registry = registry_module.BoundConnectionRegistry(capacity=1)
+            registry.activate(old)
+            start = threading.Barrier(3)
+
+            def admit():
+                start.wait()
+                return self.admit(registry, sni="docs.example.com")
+
+            def cutover():
+                start.wait()
+                return registry.activate(new)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                admitted = pool.submit(admit)
+                transitioned = pool.submit(cutover)
+                start.wait()
+                result = admitted.result(timeout=2)
+                uncovered = transitioned.result(timeout=2)
+
+            if result.action == "decrypt":
+                self.assertEqual(uncovered, (result.token,))
+            else:
+                self.assertEqual((result.action, result.reason, uncovered),
+                                 ("passthrough", "no_binding_host", ()))
 
 
 if __name__ == "__main__":

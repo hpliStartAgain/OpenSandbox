@@ -73,8 +73,12 @@ class BoundConnectionRegistry:
         self._entries: dict[int, AdmissionToken] = {}
         self._next_serial = 0
 
-    def activate(self, snapshot: Snapshot) -> None:
-        """Validate and publish a confirmed snapshot for this one generation."""
+    def activate(self, snapshot: Snapshot) -> tuple[AdmissionToken, ...]:
+        """Publish a confirmed snapshot and return newly uncovered memberships.
+
+        The result identifies transports for a future owner to fence; this
+        method neither closes them nor authorizes a mutation acknowledgement.
+        """
         if type(snapshot) is not Snapshot:
             raise RegistryError("invalid TLS registry activation")
         valid = True
@@ -86,6 +90,7 @@ class BoundConnectionRegistry:
             raise RegistryError("invalid TLS registry activation")
         with self._lock:
             previous = self._view
+            newly_uncovered: tuple[AdmissionToken, ...] = ()
             new = view.revision
             new_generation = (new.control_generation, new.subject_generation)
             if self._closed or self._generation not in (None, new_generation):
@@ -96,8 +101,14 @@ class BoundConnectionRegistry:
                     new.decision_epoch == old.decision_epoch and view != previous
                 ):
                     raise RegistryError("invalid TLS registry activation")
+                newly_uncovered = tuple(
+                    token for token in self._entries.values()
+                    if any(selector.matches(token.sni) for selector in previous.selectors)
+                    and not any(selector.matches(token.sni) for selector in view.selectors)
+                )
             self._view = view
             self._generation = new_generation
+            return newly_uncovered
 
     def deactivate(self) -> tuple[AdmissionToken, ...]:
         """Fence future decisions and hand existing memberships to the owner.

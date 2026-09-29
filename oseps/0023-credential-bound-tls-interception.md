@@ -3,7 +3,7 @@ title: Credential-Bound TLS Interception
 authors:
   - "@hpliStartAgain"
 creation-date: 2026-09-04
-last-updated: 2026-09-28
+last-updated: 2026-09-29
 status: implementing
 ---
 
@@ -955,6 +955,16 @@ denies later non-exempt SNI-bearing decisions and returns existing memberships
 for the future owner to close, but does not close transports itself. Receiver
 publication, host-removal request fences, mitmproxy hooks, fast-sandbox budgets,
 and live traffic remain unwired.
+
+The unused sidecar registry now also reports which still-tracked decrypted
+connections become newly uncovered when a validated decision snapshot is
+activated. It compares the old and new selector coverage of each admitted SNI
+under the same lock as new TLS admissions, so overlapping wildcard and exact
+selectors are evaluated semantically rather than by raw set subtraction.
+Already-uncovered entries are not reported again, but remain tracked until
+released. The returned tokens are only a future fence target: this step does
+not close transports, stop new HTTP requests or streams on old connections,
+couple registry activation to receiver commit, or authorize mutation ACK.
 
 1. **Decision telemetry and red tests**
    - Add fail-closed tests that distinguish authoritative empty from lookup
