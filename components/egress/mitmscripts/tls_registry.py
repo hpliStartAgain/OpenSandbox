@@ -26,11 +26,20 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from host_selectors import Selector
-from revision_receiver import Revision, Snapshot
+from revision_receiver import Receiver, Revision, Snapshot
 from tls_decision import Generation, Reason, TLSSelectorView, classify, compile_view
 
 RegistryAction = Literal["deny", "passthrough", "decrypt"]
 RegistryReason = Reason | Literal["registry_exhausted"]
+RequestReason = Literal[
+    "admitted",
+    "invalid_token",
+    "connection_fenced",
+    "registry_closed",
+    "snapshot_missing",
+    "snapshot_mismatch",
+    "receiver_unavailable",
+]
 
 
 class RegistryError(Exception):
@@ -54,6 +63,15 @@ class AdmissionResult:
     token: AdmissionToken | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RequestAdmission:
+    """Request lifecycle eligibility, not authorization to inject credentials."""
+
+    action: Literal["allow", "deny"]
+    reason: RequestReason
+    snapshot: Snapshot | None = field(default=None, repr=False)
+
+
 class BoundConnectionRegistry:
     """Atomically classify and admit only bound sidecar TLS connections.
 
@@ -61,25 +79,34 @@ class BoundConnectionRegistry:
     connections before acknowledging a host-removal or generation transition.
     """
 
-    def __init__(self, *, capacity: int) -> None:
+    def __init__(self, *, capacity: int, receiver: Receiver | None = None) -> None:
         if type(capacity) is not int or capacity <= 0:
             raise ValueError("positive TLS registry capacity required")
+        if receiver is not None and type(receiver) is not Receiver:
+            raise TypeError("TLS registry receiver required")
         self._capacity = capacity
+        self._receiver = receiver
         self._lock = threading.Lock()
         self._owner = object()
         self._view: TLSSelectorView | None = None
         self._generation: Generation | None = None
         self._closed = False
         self._entries: dict[int, AdmissionToken] = {}
+        self._request_fenced: set[int] = set()
         self._next_serial = 0
 
     def activate(self, snapshot: Snapshot) -> tuple[AdmissionToken, ...]:
         """Publish a confirmed snapshot and return newly uncovered memberships.
 
-        The result identifies transports for a future owner to fence; this
-        method neither closes them nor authorizes a mutation acknowledgement.
+        Newly uncovered members are permanently fenced from new requests.
+        The result still identifies transports for a future owner to drain;
+        this method neither closes them nor authorizes a mutation ACK.
         """
-        if type(snapshot) is not Snapshot:
+        if (
+            type(snapshot) is not Snapshot
+            or type(snapshot.revision) is not Revision
+            or type(snapshot.payload) is not bytes
+        ):
             raise RegistryError("invalid TLS registry activation")
         valid = True
         try:
@@ -106,8 +133,10 @@ class BoundConnectionRegistry:
                     if any(selector.matches(token.sni) for selector in previous.selectors)
                     and not any(selector.matches(token.sni) for selector in view.selectors)
                 )
+            fenced = self._request_fenced.union(token.serial for token in newly_uncovered)
             self._view = view
             self._generation = new_generation
+            self._request_fenced = fenced
             return newly_uncovered
 
     def deactivate(self) -> tuple[AdmissionToken, ...]:
@@ -155,6 +184,48 @@ class BoundConnectionRegistry:
             self._entries[token.serial] = token
             return AdmissionResult("decrypt", "binding_host", token)
 
+    def acquire_request(self, token: AdmissionToken | None) -> RequestAdmission:
+        """Pin one coherent snapshot while connection eligibility is stable.
+
+        Lock order is Registry -> Receiver. The receiver must never call back
+        into this registry while holding its state lock. A successful request
+        is admitted when Receiver.acquire pins its snapshot, even if commit or
+        close happens before this method returns. Its caller must retain that
+        same snapshot through binding checks, injection and response redaction.
+
+        Independent Receiver/Registry publications may temporarily deny requests;
+        this primitive is not their joint commit or a transport drain owner.
+        """
+        with self._lock:
+            if (
+                type(token) is not AdmissionToken
+                or token.owner is not self._owner
+                or type(token.serial) is not int
+                or self._entries.get(token.serial) is not token
+            ):
+                return RequestAdmission("deny", "invalid_token")
+            if self._closed:
+                return RequestAdmission("deny", "registry_closed")
+            if token.serial in self._request_fenced:
+                return RequestAdmission("deny", "connection_fenced")
+            if self._view is None or self._receiver is None:
+                return RequestAdmission("deny", "snapshot_missing")
+            born = token.revision
+            current = self._view.revision
+            if (born.control_generation, born.subject_generation) != (
+                current.control_generation, current.subject_generation
+            ):
+                return RequestAdmission("deny", "invalid_token")
+            try:
+                snapshot = self._receiver.acquire()
+            except Exception:  # noqa: BLE001 - never expose receiver error contents
+                return RequestAdmission("deny", "receiver_unavailable")
+            if snapshot is None:
+                return RequestAdmission("deny", "snapshot_missing")
+            if snapshot.revision != current:
+                return RequestAdmission("deny", "snapshot_mismatch")
+            return RequestAdmission("allow", "admitted", snapshot)
+
     def release(self, token: AdmissionToken | None) -> bool:
         """Idempotently remove an exact admission; serials are never reused."""
         if type(token) is not AdmissionToken or token.owner is not self._owner:
@@ -163,6 +234,7 @@ class BoundConnectionRegistry:
             if self._entries.get(token.serial) != token:
                 return False
             del self._entries[token.serial]
+            self._request_fenced.discard(token.serial)
             return True
 
     @property

@@ -3,7 +3,7 @@ title: Credential-Bound TLS Interception
 authors:
   - "@hpliStartAgain"
 creation-date: 2026-09-04
-last-updated: 2026-09-29
+last-updated: 2026-09-30
 status: implementing
 ---
 
@@ -952,19 +952,42 @@ exhaustion denies new bound admission rather than making it opaque, while
 unbound pass-through consumes no entry. One Registry instance accepts only one
 sidecar generation; a replacement process creates a fresh instance. Deactivation
 denies later non-exempt SNI-bearing decisions and returns existing memberships
-for the future owner to close, but does not close transports itself. Receiver
-publication, host-removal request fences, mitmproxy hooks, fast-sandbox budgets,
-and live traffic remain unwired.
+for the future owner to close, but does not close transports itself. Joint
+Receiver publication, mitmproxy hooks, fast-sandbox budgets, and live traffic
+remain unwired.
 
 The unused sidecar registry now also reports which still-tracked decrypted
 connections become newly uncovered when a validated decision snapshot is
 activated. It compares the old and new selector coverage of each admitted SNI
 under the same lock as new TLS admissions, so overlapping wildcard and exact
 selectors are evaluated semantically rather than by raw set subtraction.
-Already-uncovered entries are not reported again, but remain tracked until
-released. The returned tokens are only a future fence target: this step does
-not close transports, stop new HTTP requests or streams on old connections,
-couple registry activation to receiver commit, or authorize mutation ACK.
+Already-uncovered entries are not reported again on consecutive uncovered
+views, but remain tracked until released. Remove/readd/remove can report the
+same token again; a future transport owner must not reset its first retirement
+deadline on repeated notifications.
+
+The unused registry now permanently fences those tokens from its internal
+request-admission primitive. A Registry may bind one Receiver at construction;
+request admission without one denies. Under the Registry lock, `acquire_request`
+checks exact live token ownership, generation, and the monotonic connection
+fence, then acquires the Receiver snapshot and compares the complete revision.
+Only a coherent immutable Snapshot is returned. The sole nested lock order is
+Registry -> Receiver; successful admission linearizes when Receiver.acquire
+pins that snapshot. Neither later publication nor teardown revokes an already
+admitted request's bytes. Credential or request-selector updates retain the
+connection token, but new requests use the new snapshot once both views agree.
+Removed/readded hosts require a new connection; releasing a connection removes
+its fence without reusing its serial or accumulating tombstones.
+
+This is a local request fence, not a joint Receiver/Registry transaction.
+Either publication order fails closed while revisions disagree, with no old
+credential fallback. A future owner still needs prepared joint publication,
+failure handling and a mutation barrier before live hooks or public mutation
+ACKs can depend on it. Request admission is not full binding or destination
+authorization. No live HTTP request/stream uses this primitive yet; transport
+closure, HTTP/2 GOAWAY and request drain, including credential-only rotation
+drain, remain unimplemented. Holders must retain one snapshot through response
+redaction; this primitive provides neither a drain deadline nor zeroization.
 
 1. **Decision telemetry and red tests**
    - Add fail-closed tests that distinguish authoritative empty from lookup
