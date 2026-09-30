@@ -333,12 +333,14 @@ internal class EgressAdapter(
             requestHeaders?.let { selectors ->
                 put(
                     "requestHeaders",
-                    JsonArray(selectors.map { selector ->
-                        buildJsonObject {
-                            put("name", JsonPrimitive(selector.name))
-                            selector.value?.let { put("value", JsonPrimitive(it)) }
-                        }
-                    }),
+                    JsonArray(
+                        selectors.map { selector ->
+                            buildJsonObject {
+                                put("name", JsonPrimitive(selector.name))
+                                selector.value?.let { put("value", JsonPrimitive(it)) }
+                            }
+                        },
+                    ),
                 )
             }
         }
@@ -455,13 +457,15 @@ internal class EgressAdapter(
         optionalStringArray("methods")?.let { builder.methods(it) }
         optionalStringArray("paths")?.let { builder.paths(it) }
         optionalArray("requestHeaders")?.let { selectors ->
-            builder.requestHeaders(selectors.map { selector ->
-                val item = selector.jsonObject
-                CredentialRequestHeaderSelector.builder()
-                    .name(item.requiredString("name"))
-                    .apply { item.optionalString("value")?.let { value(it) } }
-                    .build()
-            })
+            builder.requestHeaders(
+                selectors.map { selector ->
+                    val item = selector.jsonObject
+                    CredentialRequestHeaderSelector.builder()
+                        .name(item.requiredString("name"))
+                        .apply { item.optionalString("value")?.let { value(it) } }
+                        .build()
+                },
+            )
         }
         return builder.build()
     }
