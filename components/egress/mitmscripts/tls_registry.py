@@ -39,11 +39,12 @@ RequestReason = Literal[
     "snapshot_missing",
     "snapshot_mismatch",
     "receiver_unavailable",
+    "request_registry_exhausted",
 ]
 
 
 class RegistryError(Exception):
-    """A fixed activation error that never contains snapshot data."""
+    """A fixed registry error that never contains snapshot data."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,12 +65,36 @@ class AdmissionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingRequest:
+    """Internal metadata only; neither a finish capability nor proof of drain."""
+
+    serial: int
+    connection_serial: int
+    revision: Revision
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class RequestHandle:
+    """Exact in-process request membership; finish on every terminal path."""
+
+    serial: int
+    owner: object = field(repr=False)
+    connection: AdmissionToken = field(repr=False)
+    snapshot: Snapshot = field(repr=False)
+
+    @property
+    def revision(self) -> Revision:
+        return self.snapshot.revision
+
+
+@dataclass(frozen=True, slots=True)
 class RequestAdmission:
     """Request lifecycle eligibility, not authorization to inject credentials."""
 
     action: Literal["allow", "deny"]
     reason: RequestReason
     snapshot: Snapshot | None = field(default=None, repr=False)
+    handle: RequestHandle | None = field(default=None, repr=False)
 
 
 class BoundConnectionRegistry:
@@ -79,12 +104,21 @@ class BoundConnectionRegistry:
     connections before acknowledging a host-removal or generation transition.
     """
 
-    def __init__(self, *, capacity: int, receiver: Receiver | None = None) -> None:
+    def __init__(
+        self, *, capacity: int, receiver: Receiver | None = None,
+        request_capacity: int | None = None,
+    ) -> None:
         if type(capacity) is not int or capacity <= 0:
             raise ValueError("positive TLS registry capacity required")
         if receiver is not None and type(receiver) is not Receiver:
             raise TypeError("TLS registry receiver required")
+        if request_capacity is None:
+            request_capacity = capacity
+        if type(request_capacity) is not int or request_capacity <= 0:
+            raise ValueError("positive request registry capacity required")
         self._capacity = capacity
+        # This compatibility default is not a production HTTP/2 sizing policy.
+        self._request_capacity = request_capacity
         self._receiver = receiver
         self._lock = threading.Lock()
         self._owner = object()
@@ -94,6 +128,18 @@ class BoundConnectionRegistry:
         self._entries: dict[int, AdmissionToken] = {}
         self._request_fenced: set[int] = set()
         self._next_serial = 0
+        self._requests: dict[int, RequestHandle] = {}
+        self._requests_by_connection: dict[int, set[int]] = {}
+        self._next_request_serial = 0
+
+    def _owns_connection(self, token: AdmissionToken | None) -> bool:
+        """Check exact membership with the Registry lock already held."""
+        return (
+            type(token) is AdmissionToken
+            and token.owner is self._owner
+            and type(token.serial) is int
+            and self._entries.get(token.serial) is token
+        )
 
     def activate(self, snapshot: Snapshot) -> tuple[AdmissionToken, ...]:
         """Publish a confirmed snapshot and return newly uncovered memberships.
@@ -185,24 +231,22 @@ class BoundConnectionRegistry:
             return AdmissionResult("decrypt", "binding_host", token)
 
     def acquire_request(self, token: AdmissionToken | None) -> RequestAdmission:
-        """Pin one coherent snapshot while connection eligibility is stable.
+        """Pin and register one snapshot while connection eligibility is stable.
 
         Lock order is Registry -> Receiver. The receiver must never call back
         into this registry while holding its state lock. A successful request
         is admitted when Receiver.acquire pins its snapshot, even if commit or
         close happens before this method returns. Its caller must retain that
         same snapshot through binding checks, injection and response redaction.
+        The caller must finish its handle in every completion/cancellation/error
+        path. Terminal connection release also removes its request records, but
+        does not revoke external handles or cancel work still using them.
 
         Independent Receiver/Registry publications may temporarily deny requests;
         this primitive is not their joint commit or a transport drain owner.
         """
         with self._lock:
-            if (
-                type(token) is not AdmissionToken
-                or token.owner is not self._owner
-                or type(token.serial) is not int
-                or self._entries.get(token.serial) is not token
-            ):
+            if not self._owns_connection(token):
                 return RequestAdmission("deny", "invalid_token")
             if self._closed:
                 return RequestAdmission("deny", "registry_closed")
@@ -216,6 +260,8 @@ class BoundConnectionRegistry:
                 current.control_generation, current.subject_generation
             ):
                 return RequestAdmission("deny", "invalid_token")
+            if len(self._requests) >= self._request_capacity:
+                return RequestAdmission("deny", "request_registry_exhausted")
             try:
                 snapshot = self._receiver.acquire()
             except Exception:  # noqa: BLE001 - never expose receiver error contents
@@ -224,18 +270,102 @@ class BoundConnectionRegistry:
                 return RequestAdmission("deny", "snapshot_missing")
             if snapshot.revision != current:
                 return RequestAdmission("deny", "snapshot_mismatch")
-            return RequestAdmission("allow", "admitted", snapshot)
+            serial = self._next_request_serial + 1
+            handle = RequestHandle(serial, self._owner, token, snapshot)
+            result = RequestAdmission("allow", "admitted", snapshot, handle)
+            members = self._requests_by_connection.get(token.serial)
+            if members is None:
+                members = set()
+            self._next_request_serial = serial
+            registered = True
+            try:
+                self._requests[serial] = handle
+                self._requests_by_connection[token.serial] = members
+                members.add(serial)
+            except Exception:  # noqa: BLE001 - roll back without exposing payloads
+                self._requests.pop(serial, None)
+                members.discard(serial)
+                if not members:
+                    self._requests_by_connection.pop(token.serial, None)
+                registered = False
+            if not registered:
+                # Raise outside the handler: no secret-bearing exception context.
+                raise RegistryError("request registration failed")
+            return result
+
+    def finish_request(self, handle: RequestHandle | None) -> bool:
+        """Idempotently remove an exact live request, leaving its connection open."""
+        with self._lock:
+            if (
+                type(handle) is not RequestHandle
+                or handle.owner is not self._owner
+                or type(handle.serial) is not int
+                or self._requests.get(handle.serial) is not handle
+            ):
+                return False
+            del self._requests[handle.serial]
+            connection_serial = handle.connection.serial
+            members = self._requests_by_connection[connection_serial]
+            members.remove(handle.serial)
+            if not members:
+                del self._requests_by_connection[connection_serial]
+            return True
 
     def release(self, token: AdmissionToken | None) -> bool:
-        """Idempotently remove an exact admission; serials are never reused."""
-        if type(token) is not AdmissionToken or token.owner is not self._owner:
-            return False
+        """Remove an exact terminal connection and all of its request records.
+
+        Only call after the transport owner confirms terminal state, not to start
+        drain. This clears accounting, not external references or running work.
+        A request admitted first may return its handle after terminal release.
+        """
         with self._lock:
-            if self._entries.get(token.serial) != token:
+            if not self._owns_connection(token):
                 return False
+            for serial in self._requests_by_connection.pop(token.serial, ()):
+                del self._requests[serial]
             del self._entries[token.serial]
             self._request_fenced.discard(token.serial)
             return True
+
+    def pending_requests(
+        self, *, connection: AdmissionToken | None = None,
+        revision: Revision | None = None, after_serial: int = 0, limit: int = 128,
+    ) -> tuple[PendingRequest, ...]:
+        """Return a bounded metadata page, without snapshots or finish handles.
+
+        Each page is consistent under the lock; pages are not a frozen view.
+        Completions can disappear and new admissions can appear between pages.
+        The last returned serial is the next cursor. Empty is not proof of
+        transport drain or permission to acknowledge a public mutation.
+        """
+        if (
+            type(after_serial) is not int or after_serial < 0
+            or type(limit) is not int or not 1 <= limit <= 128
+            or revision is not None and type(revision) is not Revision
+        ):
+            raise ValueError("invalid pending request query")
+        with self._lock:
+            if connection is not None and not self._owns_connection(connection):
+                return ()
+            result = []
+            # Dict insertion order is serial order; serials are never reused.
+            for serial, handle in self._requests.items():
+                if (
+                    serial <= after_serial
+                    or connection is not None and handle.connection is not connection
+                    or revision is not None and handle.revision != revision
+                ):
+                    continue
+                result.append(PendingRequest(serial, handle.connection.serial, handle.revision))
+                if len(result) == limit:
+                    break
+            return tuple(result)
+
+    @property
+    def request_count(self) -> int:
+        """Registry-held records only, not all externally retained snapshots."""
+        with self._lock:
+            return len(self._requests)
 
     @property
     def count(self) -> int:

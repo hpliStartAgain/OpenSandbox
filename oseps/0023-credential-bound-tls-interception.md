@@ -989,6 +989,32 @@ closure, HTTP/2 GOAWAY and request drain, including credential-only rotation
 drain, remain unimplemented. Holders must retain one snapshot through response
 redaction; this primitive provides neither a drain deadline nor zeroization.
 
+Successful internal request admission now also registers an exact, immutable
+request handle before returning, with the same pinned Snapshot as the result.
+Request records have a separate global capacity; the compatibility default is
+the connection capacity, not a production HTTP/2 sizing recommendation. An
+adapter must choose its budget explicitly. Exhaustion denies without waiting,
+eviction or pass-through, and one connection can consume the entire request
+budget; this is not per-connection fairness or tenant isolation.
+
+The future adapter must call `finish_request` on completion, cancellation and
+error paths. Exact terminal connection `release` also removes that connection's
+request records; copied tokens cannot release a real connection or its requests.
+Release is only for confirmed transport termination, not the start of drain.
+Host removal and Registry deactivation retain admitted requests for completion
+or terminal cleanup, and Receiver close does not revoke their immutable bytes.
+Empty connection indexes are removed and serials are never reused. Registration
+failures roll back partial indexes and expose only a fixed error.
+
+`pending_requests` exposes bounded, serial-ordered metadata pages containing
+only request serial, connection serial and complete revision, with optional
+exact-connection and revision filters. It exposes no Snapshot or finish handle.
+Each page is lock-consistent, but completion and new admission can change later
+pages; there is no frozen query view or high-watermark drain protocol. An empty
+page and `request_count` describe only Registry bookkeeping, not network drain,
+mutation ACK readiness, external Snapshot references or credential zeroization.
+This foundation still has no live calls, timer, drain deadline or GOAWAY owner.
+
 1. **Decision telemetry and red tests**
    - Add fail-closed tests that distinguish authoritative empty from lookup
      failure.

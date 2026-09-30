@@ -347,16 +347,23 @@ class TLSRequestAdmissionTest(unittest.TestCase):
         active.prepare(snapshot.revision, snapshot.payload)
         active.commit(snapshot.revision)
 
-    def setup_registry(self, snapshot=None, *, capacity=4):
+    def setup_registry(self, snapshot=None, *, capacity=4, request_capacity=None):
         snapshot = self.snapshot() if snapshot is None else snapshot
         active = self.new_receiver(snapshot)
-        registry = registry_module.BoundConnectionRegistry(capacity=capacity, receiver=active)
+        registry = registry_module.BoundConnectionRegistry(
+            capacity=capacity, receiver=active, request_capacity=request_capacity,
+        )
         registry.activate(snapshot)
         return registry, active
 
     def assert_denied(self, registry, token, reason):
+        requests = dict(registry._requests)
+        index = {key: set(value) for key, value in registry._requests_by_connection.items()}
         result = registry.acquire_request(token)
         self.assertEqual((result.action, result.reason, result.snapshot), ("deny", reason, None))
+        self.assertIsNone(result.handle)
+        self.assertEqual(registry._requests, requests)
+        self.assertEqual(registry._requests_by_connection, index)
 
     def test_allow_pins_real_immutable_snapshot(self):
         registry, active = self.setup_registry(self.snapshot(secret="canaryCredential"))
@@ -514,6 +521,9 @@ class TLSRequestAdmissionTest(unittest.TestCase):
                     self.assertEqual(header["value"], secret)
                     self.assertEqual(payload["redactions"], [secret])
                 self.assertEqual(registry._request_fenced, set())
+                self.assertTrue(registry.finish_request(old_request.handle))
+                self.assertTrue(registry.finish_request(new_request.handle))
+                self.assertEqual(registry.request_count, 0)
 
     def test_semantic_coverage_fences_only_truly_uncovered_hosts(self):
         cases = (
@@ -694,6 +704,11 @@ class TLSRequestAdmissionTest(unittest.TestCase):
                             mutation.result(timeout=5)
                     self.assertEqual(result.action, "allow")
                     self.assertIs(result.snapshot, old)
+                    self.assertEqual(registry.request_count, 0 if operation == "release" else 1)
+                    self.assertEqual(
+                        registry.finish_request(result.handle), operation != "release",
+                    )
+                    self.assertEqual(registry._requests_by_connection, {})
                     reason = {
                         "remove": "connection_fenced", "release": "invalid_token",
                         "deactivate": "registry_closed",
@@ -736,6 +751,8 @@ class TLSRequestAdmissionTest(unittest.TestCase):
                 }[operation]
                 self.assertEqual((result.action, result.reason, result.snapshot),
                                  ("deny", reason, None))
+                self.assertIsNone(result.handle)
+                self.assertEqual(registry.request_count, 0)
 
     def test_receiver_commit_and_close_before_or_after_pin(self):
         for pinned in (False, True):
@@ -774,6 +791,8 @@ class TLSRequestAdmissionTest(unittest.TestCase):
                     if pinned:
                         self.assertEqual(result.action, "allow")
                         self.assertIs(result.snapshot, old)
+                        self.assertEqual(registry.request_count, 1)
+                        self.assertTrue(registry.finish_request(result.handle))
                     else:
                         reason = (
                             "snapshot_mismatch" if operation == "commit"
@@ -781,6 +800,9 @@ class TLSRequestAdmissionTest(unittest.TestCase):
                         )
                         self.assertEqual((result.action, result.reason, result.snapshot),
                                          ("deny", reason, None))
+                        self.assertIsNone(result.handle)
+                    self.assertEqual(registry.request_count, 0)
+                    self.assertEqual(registry._requests_by_connection, {})
 
     def test_request_before_view_publication_denies_receiver_ahead(self):
         registry, active = self.setup_registry()
@@ -838,6 +860,470 @@ class TLSRequestAdmissionTest(unittest.TestCase):
         self.assertIs(registry._view, view)
         self.assertEqual(registry._request_fenced, {token.serial})
         self.assert_denied(registry, token, "connection_fenced")
+
+
+class TLSRequestLifecycleTest(unittest.TestCase):
+    identity = TLSRequestAdmissionTest.identity
+    snapshot = TLSRequestAdmissionTest.snapshot
+    admit = TLSRequestAdmissionTest.admit
+    new_receiver = TLSRequestAdmissionTest.new_receiver
+    commit = TLSRequestAdmissionTest.commit
+    setup_registry = TLSRequestAdmissionTest.setup_registry
+    assert_denied = TLSRequestAdmissionTest.assert_denied
+
+    def assert_consistent(self, registry):
+        with registry._lock:
+            expected = {}
+            for serial, handle in registry._requests.items():
+                self.assertEqual(serial, handle.serial)
+                self.assertIs(registry._entries[handle.connection.serial], handle.connection)
+                expected.setdefault(handle.connection.serial, set()).add(serial)
+            self.assertEqual(registry._requests_by_connection, expected)
+            self.assertLessEqual(len(registry._requests), registry._request_capacity)
+            self.assertLessEqual(registry._request_fenced, set(registry._entries))
+
+    def test_success_is_registered_and_capacity_is_reclaimed_by_finish(self):
+        registry, _ = self.setup_registry(capacity=1, request_capacity=2)
+        token = self.admit(registry).token
+        first, second = [registry.acquire_request(token) for _ in range(2)]
+        self.assertEqual(registry.request_count, 2)
+        self.assertIs(first.snapshot, first.handle.snapshot)
+        self.assertIs(first.handle.connection, token)
+        self.assertIs(first.handle.revision, first.snapshot.revision)
+        denied = registry.acquire_request(token)
+        self.assertEqual((denied.action, denied.reason, denied.snapshot, denied.handle),
+                         ("deny", "request_registry_exhausted", None, None))
+        self.assertTrue(registry.finish_request(first.handle))
+        self.assertFalse(registry.finish_request(first.handle))
+        third = registry.acquire_request(token)
+        self.assertGreater(third.handle.serial, second.handle.serial)
+        self.assertTrue(registry.finish_request(second.handle))
+        self.assertTrue(registry.finish_request(third.handle))
+        self.assertEqual(registry.request_count, 0)
+        self.assert_consistent(registry)
+
+    def test_connection_release_rejects_copied_token(self):
+        # This test also runs against the old constructor to expose its equality bug.
+        registry = registry_module.BoundConnectionRegistry(capacity=1)
+        registry.activate(self.snapshot())
+        token = self.admit(registry).token
+        self.assertFalse(registry.release(replace(token)))
+        self.assertEqual(registry.count, 1)
+
+    def test_default_and_explicit_capacity_are_strict_and_independent(self):
+        for value in (0, -1, True, False, 1.0, "1", [], object()):
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaisesRegex(
+                    ValueError, "^positive request registry capacity required$",
+                ):
+                    registry_module.BoundConnectionRegistry(capacity=2, request_capacity=value)
+        for capacity, request_capacity, expected in ((2, None, 2), (1, 3, 3), (3, 1, 1)):
+            with self.subTest(capacity=capacity, requests=request_capacity):
+                registry, _ = self.setup_registry(
+                    capacity=capacity, request_capacity=request_capacity,
+                )
+                token = self.admit(registry).token
+                handles = [registry.acquire_request(token).handle for _ in range(expected)]
+                self.assertEqual(registry.count, 1)
+                self.assertEqual(registry.request_count, expected)
+                self.assert_denied(registry, token, "request_registry_exhausted")
+                self.assertTrue(registry.release(token))
+                for handle in handles:
+                    self.assertFalse(registry.finish_request(handle))
+                self.assertEqual(registry.request_count, 0)
+                self.assert_consistent(registry)
+
+    def test_full_capacity_keeps_identity_and_fence_reason_priority(self):
+        for action, reason in (("invalid", "invalid_token"),
+                               ("remove", "connection_fenced"),
+                               ("deactivate", "registry_closed")):
+            with self.subTest(action=action):
+                registry, active = self.setup_registry(request_capacity=1)
+                token = self.admit(registry).token
+                held = registry.acquire_request(token).handle
+                candidate = token
+                if action == "invalid":
+                    candidate = replace(token)
+                elif action == "remove":
+                    registry.activate(self.snapshot(epoch=2, host=None))
+                else:
+                    registry.deactivate()
+                with patch.object(active, "acquire", wraps=active.acquire) as acquire:
+                    self.assert_denied(registry, candidate, reason)
+                    acquire.assert_not_called()
+                self.assertEqual(registry.request_count, 1)
+                self.assertTrue(registry.finish_request(held))
+                self.assert_consistent(registry)
+
+    def test_handles_are_exact_immutable_private_capabilities(self):
+        registry, _ = self.setup_registry(self.snapshot(secret="canaryCredential"))
+        token = self.admit(registry).token
+        handle = registry.acquire_request(token).handle
+        other, _ = self.setup_registry()
+        foreign = other.acquire_request(self.admit(other).token).handle
+
+        class BadHash(int):
+            def __hash__(self):
+                raise AssertionError("untrusted hash evaluated")
+
+        class HandleSubclass(registry_module.RequestHandle):
+            pass
+
+        bad = (None, {}, object(), foreign, replace(handle),
+               replace(handle, serial=True), replace(handle, serial=[]),
+               replace(handle, serial=BadHash(handle.serial)),
+               replace(handle, snapshot=self.snapshot(epoch=2)),
+               HandleSubclass(handle.serial, handle.owner, handle.connection, handle.snapshot))
+        for candidate in bad:
+            self.assertFalse(registry.finish_request(candidate))
+            self.assertEqual(registry.request_count, 1)
+            self.assert_consistent(registry)
+        self.assertNotEqual(handle, replace(handle))
+        with self.assertRaises(FrozenInstanceError):
+            handle.serial = 99
+        self.assertFalse(hasattr(handle, "__dict__"))
+        self.assertEqual(repr(handle), f"RequestHandle(serial={handle.serial})")
+        self.assertTrue(registry.finish_request(handle))
+        self.assertFalse(registry.finish_request(handle))
+        self.assertEqual(other.request_count, 1)
+        self.assertTrue(other.finish_request(foreign))
+
+    def test_only_exact_terminal_connection_cascades_its_requests(self):
+        registry, _ = self.setup_registry(request_capacity=4)
+        first, second = self.admit(registry).token, self.admit(registry).token
+        requests = [registry.acquire_request(token).handle for token in (first, first, second)]
+        other, _ = self.setup_registry()
+        foreign = self.admit(other).token
+
+        class BadHash(int):
+            def __hash__(self):
+                raise AssertionError("untrusted hash evaluated")
+
+        class TokenSubclass(registry_module.AdmissionToken):
+            pass
+
+        for token in (None, {}, foreign, replace(first), replace(first, serial=True),
+                      replace(first, serial=[]), replace(first, serial=BadHash(first.serial)),
+                      TokenSubclass(first.serial, first.revision, first.sni, first.owner)):
+            self.assertFalse(registry.release(token))
+            self.assertEqual(registry.request_count, 3)
+            self.assert_consistent(registry)
+        self.assertTrue(registry.release(first))
+        self.assertEqual(registry.request_count, 1)
+        self.assertEqual(registry.count, 1)
+        self.assertFalse(registry.release(first))
+        self.assertFalse(registry.finish_request(requests[0]))
+        self.assertFalse(registry.finish_request(requests[1]))
+        self.assertTrue(registry.finish_request(requests[2]))
+        self.assert_consistent(registry)
+
+    def test_rotations_and_shutdown_preserve_registered_old_requests(self):
+        for terminal in ("remove", "deactivate", "receiver_close"):
+            with self.subTest(terminal=terminal):
+                registry, active = self.setup_registry(self.snapshot(secret="oldCredential"))
+                token = self.admit(registry).token
+                old = registry.acquire_request(token).handle
+                new_snapshot = self.snapshot(epoch=2, secret="newCredential")
+                self.commit(active, new_snapshot)
+                registry.activate(new_snapshot)
+                new = registry.acquire_request(token).handle
+                self.assertEqual(registry.request_count, 2)
+                if terminal == "remove":
+                    registry.activate(self.snapshot(epoch=3, host=None))
+                    restored = self.snapshot(epoch=4, secret="newCredential")
+                    self.commit(active, restored)
+                    registry.activate(restored)
+                    self.assert_denied(registry, token, "connection_fenced")
+                elif terminal == "deactivate":
+                    self.assertEqual(registry.deactivate(), (token,))
+                    self.assertEqual(registry.deactivate(), (token,))
+                    self.assert_denied(registry, token, "registry_closed")
+                else:
+                    active.close()
+                    self.assert_denied(registry, token, "receiver_unavailable")
+                self.assertEqual(registry.request_count, 2)
+                self.assertIn(b"oldCredential", old.snapshot.payload)
+                self.assertIn(b"newCredential", new.snapshot.payload)
+                self.assertTrue(registry.finish_request(old))
+                self.assertEqual(
+                    [item.serial for item in registry.pending_requests()], [new.serial],
+                )
+                self.assertTrue(registry.release(token))
+                self.assertFalse(registry.finish_request(new))
+                self.assertIn(b"oldCredential", old.snapshot.payload)
+                self.assertIn(b"newCredential", new.snapshot.payload)
+                self.assert_consistent(registry)
+
+    def test_pending_metadata_is_bounded_private_and_not_a_finish_handle(self):
+        registry, _ = self.setup_registry(
+            self.snapshot(secret="canaryCredential"), capacity=1, request_capacity=130,
+        )
+        token = self.admit(registry).token
+        handles = [registry.acquire_request(token).handle for _ in range(130)]
+        page = registry.pending_requests()
+        self.assertIs(type(page), tuple)
+        self.assertEqual(len(page), 128)
+        self.assertEqual([row.serial for row in page], [h.serial for h in handles[:128]])
+        self.assertEqual(set(page[0].__dataclass_fields__),
+                         {"serial", "connection_serial", "revision"})
+        self.assertFalse(hasattr(page[0], "__dict__"))
+        with self.assertRaises(FrozenInstanceError):
+            page[0].serial = 99
+        self.assertFalse(registry.finish_request(page[0]))
+        for secret in ("canaryCredential", "api.example.com", "Snapshot", "owner="):
+            self.assertNotIn(secret, repr(page))
+        rest = registry.pending_requests(after_serial=page[-1].serial)
+        self.assertEqual([row.serial for row in rest], [h.serial for h in handles[128:]])
+        self.assertEqual(registry.pending_requests(after_serial=rest[-1].serial), ())
+        registry.release(token)
+        self.assertEqual(registry.pending_requests(), ())
+        self.assertEqual(registry.pending_requests(connection=token), ())
+        self.assert_consistent(registry)
+
+    def test_pending_filters_use_complete_revision_and_exact_connection(self):
+        registry, active = self.setup_registry(request_capacity=5)
+        first, second = self.admit(registry).token, self.admit(registry).token
+        old = registry.acquire_request(first).handle
+        new_snapshot = self.snapshot(epoch=2)
+        self.commit(active, new_snapshot)
+        registry.activate(new_snapshot)
+        new = [registry.acquire_request(token).handle for token in (first, second)]
+        self.assertEqual([r.serial for r in registry.pending_requests(revision=old.revision)],
+                         [old.serial])
+        self.assertEqual([r.serial for r in registry.pending_requests(
+            connection=first, revision=new_snapshot.revision)], [new[0].serial])
+        for field, value in (
+            ("control_generation", "other"), ("subject_generation", "other"),
+            ("decision_epoch", 9), ("vault_revision", 9), ("policy_epoch", 9),
+            ("digest", "0" * 64),
+        ):
+            changed = replace(old.revision, **{field: value})
+            self.assertEqual(registry.pending_requests(revision=changed), ())
+        for token in (replace(first), replace(first, serial=[]), replace(first, serial=True), {}):
+            self.assertEqual(registry.pending_requests(connection=token), ())
+        registry.release(first)
+        self.assertEqual([r.serial for r in registry.pending_requests()], [new[1].serial])
+        self.assert_consistent(registry)
+
+    def test_pending_rejects_invalid_query_values_without_data_in_error(self):
+        registry, _ = self.setup_registry()
+        for kwargs in (
+            {"limit": 0}, {"limit": -1}, {"limit": 129}, {"limit": True},
+            {"limit": 1.0}, {"after_serial": -1}, {"after_serial": True},
+            {"after_serial": []}, {"after_serial": "canaryCredential"},
+            {"revision": "canaryCredential"}, {"revision": self.snapshot()},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(ValueError, "^invalid pending request query$"):
+                    registry.pending_requests(**kwargs)
+
+    def test_pending_pages_allow_completion_and_new_admission_between_calls(self):
+        registry, _ = self.setup_registry(request_capacity=4)
+        token = self.admit(registry).token
+        handles = [registry.acquire_request(token).handle for _ in range(3)]
+        first = registry.pending_requests(limit=1)
+        registry.finish_request(handles[0])
+        registry.finish_request(handles[1])
+        added = registry.acquire_request(token).handle
+        rest = registry.pending_requests(after_serial=first[-1].serial)
+        self.assertEqual([r.serial for r in rest], [handles[2].serial, added.serial])
+        self.assert_consistent(registry)
+
+    def test_registration_failure_rolls_back_both_indexes_without_secret_context(self):
+        class FailingDict(dict):
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                raise RuntimeError("canaryCredential")
+
+        class FailingSet(set):
+            def add(self, value):
+                super().add(value)
+                raise RuntimeError("canaryCredential")
+
+        for stage in ("requests", "connection_index", "new_members", "existing_members"):
+            with self.subTest(stage=stage):
+                registry, _ = self.setup_registry(request_capacity=2)
+                token = self.admit(registry).token
+                old = None
+                if stage == "existing_members":
+                    old = registry.acquire_request(token).handle
+                    registry._requests_by_connection[token.serial] = FailingSet({old.serial})
+                elif stage == "requests":
+                    registry._requests = FailingDict()
+                elif stage == "connection_index":
+                    registry._requests_by_connection = FailingDict()
+                before = registry.pending_requests()
+                factory = FailingSet if stage == "new_members" else set
+                with patch.object(registry_module, "set", factory, create=True):
+                    try:
+                        registry.acquire_request(token)
+                    except registry_module.RegistryError as error:
+                        self.assertEqual(str(error), "request registration failed")
+                        self.assertIsNone(error.__context__)
+                        formatted = "".join(traceback.format_exception(error))
+                        self.assertNotIn("canaryCredential", formatted)
+                    else:
+                        self.fail("registration failure unexpectedly admitted")
+                self.assertEqual(registry.pending_requests(), before)
+                self.assert_consistent(registry)
+                if old:
+                    self.assertTrue(registry.finish_request(old))
+
+    def test_long_finish_and_terminal_cleanup_loops_leave_no_tombstones(self):
+        registry, active = self.setup_registry(capacity=1, request_capacity=3)
+        last_request = 0
+        for iteration in range(100):
+            token = self.admit(registry).token
+            handles = [registry.acquire_request(token).handle for _ in range(3)]
+            self.assertGreater(handles[0].serial, last_request)
+            last_request = handles[-1].serial
+            self.assertTrue(registry.finish_request(handles[1]))
+            self.assert_consistent(registry)
+            if iteration % 2:
+                removed = self.snapshot(epoch=iteration * 2 + 2, host=None)
+                self.commit(active, removed)
+                registry.activate(removed)
+            self.assertTrue(registry.release(token))
+            self.assertEqual(registry.request_count, 0)
+            self.assertEqual(registry._requests_by_connection, {})
+            self.assertEqual(registry._request_fenced, set())
+            self.assert_consistent(registry)
+            restored = self.snapshot(epoch=iteration * 2 + 3)
+            self.commit(active, restored)
+            registry.activate(restored)
+
+    def test_two_requests_compete_for_last_global_slot(self):
+        registry, _ = self.setup_registry(capacity=2, request_capacity=1)
+        tokens = [self.admit(registry).token for _ in range(2)]
+        start = threading.Barrier(3)
+
+        def acquire(token):
+            start.wait(timeout=5)
+            return registry.acquire_request(token)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(acquire, token) for token in tokens]
+            start.wait(timeout=5)
+            results = [future.result(timeout=5) for future in futures]
+        self.assertEqual(sorted(result.action for result in results), ["allow", "deny"])
+        denied = next(result for result in results if result.action == "deny")
+        self.assertEqual((denied.reason, denied.handle, denied.snapshot),
+                         ("request_registry_exhausted", None, None))
+        held = next(result.handle for result in results if result.action == "allow")
+        self.assertEqual(registry.request_count, 1)
+        self.assert_consistent(registry)
+        self.assertTrue(registry.finish_request(held))
+        self.assert_consistent(registry)
+
+    def test_concurrent_duplicate_finish_removes_one_record(self):
+        registry, _ = self.setup_registry()
+        handle = registry.acquire_request(self.admit(registry).token).handle
+        start = threading.Barrier(3)
+
+        def finish():
+            start.wait(timeout=5)
+            return registry.finish_request(handle)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(finish) for _ in range(2)]
+            start.wait(timeout=5)
+            results = [future.result(timeout=5) for future in futures]
+        self.assertEqual(sorted(results), [False, True])
+        self.assertEqual(registry.request_count, 0)
+        self.assert_consistent(registry)
+
+    def test_finish_and_terminal_release_have_both_lock_orderings(self):
+        for finish_first in (True, False):
+            with self.subTest(finish_first=finish_first):
+                registry, _ = self.setup_registry()
+                token = self.admit(registry).token
+                handle = registry.acquire_request(token).handle
+                mutex = ObservedLock()
+                registry._lock = mutex
+                mutex.pause_next_exit = True
+                finish = lambda: registry.finish_request(handle)
+                release = lambda: registry.release(token)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    first = pool.submit(finish if finish_first else release)
+                    try:
+                        self.assertTrue(mutex.before_unlock.wait(5))
+                        mutex.attempted.clear()
+                        second = pool.submit(release if finish_first else finish)
+                        self.assertTrue(mutex.attempted.wait(5))
+                        self.assertFalse(second.done())
+                    finally:
+                        mutex.resume.set()
+                    self.assertTrue(first.result(timeout=5))
+                    self.assertEqual(second.result(timeout=5), finish_first)
+                self.assertEqual(registry.request_count, 0)
+                self.assertEqual(registry.count, 0)
+                self.assert_consistent(registry)
+
+    def test_finish_and_admission_serialize_capacity_reuse(self):
+        for finish_first in (True, False):
+            with self.subTest(finish_first=finish_first):
+                registry, _ = self.setup_registry(request_capacity=1)
+                token = self.admit(registry).token
+                old = registry.acquire_request(token).handle
+                mutex = ObservedLock()
+                registry._lock = mutex
+                mutex.pause_next_exit = True
+                finish = lambda: registry.finish_request(old)
+                acquire = lambda: registry.acquire_request(token)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    first = pool.submit(finish if finish_first else acquire)
+                    try:
+                        self.assertTrue(mutex.before_unlock.wait(5))
+                        mutex.attempted.clear()
+                        second = pool.submit(acquire if finish_first else finish)
+                        self.assertTrue(mutex.attempted.wait(5))
+                        self.assertFalse(second.done())
+                    finally:
+                        mutex.resume.set()
+                    first_result, second_result = first.result(timeout=5), second.result(timeout=5)
+                result = second_result if finish_first else first_result
+                self.assertTrue(first_result if finish_first else second_result)
+                if finish_first:
+                    self.assertEqual(result.action, "allow")
+                    self.assertGreater(result.handle.serial, old.serial)
+                    self.assertEqual(registry.request_count, 1)
+                    self.assertTrue(registry.finish_request(result.handle))
+                else:
+                    self.assertEqual((result.reason, result.handle, result.snapshot),
+                                     ("request_registry_exhausted", None, None))
+                self.assertEqual(registry.request_count, 0)
+                self.assert_consistent(registry)
+
+    def test_query_cannot_observe_partial_registration(self):
+        registry, _ = self.setup_registry()
+        token = self.admit(registry).token
+        entered, resume = threading.Event(), threading.Event()
+        mutex = ObservedLock()
+        registry._lock = mutex
+
+        class PausingDict(dict):
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                entered.set()
+                if not resume.wait(5):
+                    raise AssertionError("request registration timed out")
+
+        registry._requests = PausingDict()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            request = pool.submit(registry.acquire_request, token)
+            try:
+                self.assertTrue(entered.wait(5))
+                mutex.attempted.clear()
+                query = pool.submit(registry.pending_requests)
+                self.assertTrue(mutex.attempted.wait(5))
+                self.assertFalse(query.done())
+            finally:
+                resume.set()
+            result = request.result(timeout=5)
+            page = query.result(timeout=5)
+        self.assertEqual([row.serial for row in page], [result.handle.serial])
+        self.assert_consistent(registry)
+        self.assertTrue(registry.finish_request(result.handle))
 
 
 if __name__ == "__main__":
