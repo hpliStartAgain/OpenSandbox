@@ -987,7 +987,7 @@ ACKs can depend on it. Request admission is not full binding or destination
 authorization. No live HTTP request/stream uses this primitive yet; transport
 closure, HTTP/2 GOAWAY and request drain, including credential-only rotation
 drain, remain unimplemented. Holders must retain one snapshot through response
-redaction; this primitive provides neither a drain deadline nor zeroization.
+redaction; this primitive provides neither live deadline enforcement nor zeroization.
 
 Successful internal request admission now also registers an exact, immutable
 request handle before returning, with the same pinned Snapshot as the result.
@@ -1013,7 +1013,31 @@ Each page is lock-consistent, but completion and new admission can change later
 pages; there is no frozen query view or high-watermark drain protocol. An empty
 page and `request_count` describe only Registry bookkeeping, not network drain,
 mutation ACK readiness, external Snapshot references or credential zeroization.
-This foundation still has no live calls, timer, drain deadline or GOAWAY owner.
+The unused registry now records monotonic retirement deadlines at activation
+under its admission lock. Newly uncovered connections receive a deadline even
+when idle; unfinished requests pinned to older revisions receive independent
+deadlines, including on credential-only, request-scope or policy updates. The
+internal constructor accepts an integer timeout of `1..300` seconds, default
+`30`; the operator environment setting remains unwired. Repeated publication,
+further rotations and remove/readd/remove never extend the first deadline.
+Exact request completion removes its deadline; exact terminal connection
+release removes all corresponding deadlines. Deactivation preserves existing
+deadlines and returns all transports for shutdown without starting a new grace
+period.
+
+`expired_connections` returns bounded, serial-ordered pages of exact live
+connection tokens whose connection deadline or at least one unfinished retired
+request deadline has expired. Multiple expired requests yield one target. A
+completed old request no longer causes expiry on a still-covered connection;
+newer requests alone do not retire that connection. Pages are observations,
+not closure commands: completion or release may invalidate a returned target,
+and each new scan must restart at zero because lower serials can expire later.
+Expiry neither releases bookkeeping nor cancels work, revokes external
+Snapshots, fences new requests on still-covered connections, or proves ACK
+readiness. A future transport owner must inspect promptly and close expired
+targets, potentially interrupting newer requests sharing the same transport.
+There is still no live timer, transport closure or HTTP/2 GOAWAY owner, and no
+joint Receiver/Registry publication or public mutation ACK integration.
 
 1. **Decision telemetry and red tests**
    - Add fail-closed tests that distinguish authoritative empty from lookup

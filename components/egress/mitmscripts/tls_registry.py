@@ -22,6 +22,7 @@ alone neither closes old connections nor authorizes a public mutation ACK.
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -107,6 +108,7 @@ class BoundConnectionRegistry:
     def __init__(
         self, *, capacity: int, receiver: Receiver | None = None,
         request_capacity: int | None = None,
+        drain_timeout_seconds: int = 30,
     ) -> None:
         if type(capacity) is not int or capacity <= 0:
             raise ValueError("positive TLS registry capacity required")
@@ -116,9 +118,12 @@ class BoundConnectionRegistry:
             request_capacity = capacity
         if type(request_capacity) is not int or request_capacity <= 0:
             raise ValueError("positive request registry capacity required")
+        if type(drain_timeout_seconds) is not int or not 1 <= drain_timeout_seconds <= 300:
+            raise ValueError("TLS drain timeout must be an integer from 1 to 300")
         self._capacity = capacity
         # This compatibility default is not a production HTTP/2 sizing policy.
         self._request_capacity = request_capacity
+        self._drain_timeout = drain_timeout_seconds
         self._receiver = receiver
         self._lock = threading.Lock()
         self._owner = object()
@@ -131,6 +136,8 @@ class BoundConnectionRegistry:
         self._requests: dict[int, RequestHandle] = {}
         self._requests_by_connection: dict[int, set[int]] = {}
         self._next_request_serial = 0
+        self._connection_deadlines: dict[int, float] = {}
+        self._request_deadlines: dict[int, float] = {}
 
     def _owns_connection(self, token: AdmissionToken | None) -> bool:
         """Check exact membership with the Registry lock already held."""
@@ -145,6 +152,8 @@ class BoundConnectionRegistry:
         """Publish a confirmed snapshot and return newly uncovered memberships.
 
         Newly uncovered members are permanently fenced from new requests.
+        Their connections and requests pinned to older revisions receive a
+        monotonic retirement deadline. Repeated publication never extends it.
         The result still identifies transports for a future owner to drain;
         this method neither closes them nor authorizes a mutation ACK.
         """
@@ -180,16 +189,28 @@ class BoundConnectionRegistry:
                     and not any(selector.matches(token.sni) for selector in view.selectors)
                 )
             fenced = self._request_fenced.union(token.serial for token in newly_uncovered)
+            connection_deadlines = self._connection_deadlines.copy()
+            request_deadlines = self._request_deadlines.copy()
+            if previous is not None and new != previous.revision:
+                deadline = time.monotonic() + self._drain_timeout
+                for token in newly_uncovered:
+                    connection_deadlines.setdefault(token.serial, deadline)
+                for serial, handle in self._requests.items():
+                    if handle.revision != new:
+                        request_deadlines.setdefault(serial, deadline)
             self._view = view
             self._generation = new_generation
             self._request_fenced = fenced
+            self._connection_deadlines = connection_deadlines
+            self._request_deadlines = request_deadlines
             return newly_uncovered
 
     def deactivate(self) -> tuple[AdmissionToken, ...]:
         """Fence future decisions and hand existing memberships to the owner.
 
         The caller must close those transports and release their tokens. This
-        method does not close sockets or permit this registry to resume.
+        method does not close sockets or permit this registry to resume. It
+        preserves existing deadlines but starts no new grace period for shutdown.
         """
         with self._lock:
             self._closed = True
@@ -304,6 +325,7 @@ class BoundConnectionRegistry:
             ):
                 return False
             del self._requests[handle.serial]
+            self._request_deadlines.pop(handle.serial, None)
             connection_serial = handle.connection.serial
             members = self._requests_by_connection[connection_serial]
             members.remove(handle.serial)
@@ -323,9 +345,52 @@ class BoundConnectionRegistry:
                 return False
             for serial in self._requests_by_connection.pop(token.serial, ()):
                 del self._requests[serial]
+                self._request_deadlines.pop(serial, None)
             del self._entries[token.serial]
             self._request_fenced.discard(token.serial)
+            self._connection_deadlines.pop(token.serial, None)
             return True
+
+    def expired_connections(
+        self, *, after_serial: int = 0, limit: int = 128,
+    ) -> tuple[AdmissionToken, ...]:
+        """Inspect a bounded page of live transports with expired retirements.
+
+        An uncovered connection expires even when idle. On a still-covered
+        connection, only an unfinished retired request makes it expire; newer
+        requests do not extend the older request's deadline. A transport owner
+        must arrange prompt inspection and actual closure, which may also
+        interrupt newer requests on that connection. This method does not
+        fence, close, release, or establish mutation ACK readiness.
+
+        Pages are serial-ordered and lock-consistent, not a frozen view. A
+        previously skipped lower serial can expire later, so restart each scan
+        at zero. Finishing a request or releasing a connection can invalidate
+        a returned target. Repeated inspection retains targets until cleanup.
+        """
+        if (
+            type(after_serial) is not int or after_serial < 0
+            or type(limit) is not int or not 1 <= limit <= 128
+        ):
+            raise ValueError("invalid expired connection query")
+        with self._lock:
+            now = time.monotonic()
+            expired = {
+                serial for serial, deadline in self._connection_deadlines.items()
+                if deadline <= now
+            }
+            expired.update(
+                self._requests[serial].connection.serial
+                for serial, deadline in self._request_deadlines.items()
+                if deadline <= now
+            )
+            result = []
+            for serial, token in self._entries.items():
+                if serial > after_serial and serial in expired:
+                    result.append(token)
+                    if len(result) == limit:
+                        break
+            return tuple(result)
 
     def pending_requests(
         self, *, connection: AdmissionToken | None = None,

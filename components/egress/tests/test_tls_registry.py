@@ -1326,5 +1326,316 @@ class TLSRequestLifecycleTest(unittest.TestCase):
         self.assertTrue(registry.finish_request(result.handle))
 
 
+class TLSRetirementDeadlineTest(unittest.TestCase):
+    identity = TLSRequestAdmissionTest.identity
+    snapshot = TLSRequestAdmissionTest.snapshot
+    admit = TLSRequestAdmissionTest.admit
+    new_receiver = TLSRequestAdmissionTest.new_receiver
+    commit = TLSRequestAdmissionTest.commit
+    assert_denied = TLSRequestAdmissionTest.assert_denied
+
+    def setUp(self):
+        self.clock_patch = patch.object(registry_module.time, "monotonic", return_value=100.0)
+        self.clock = self.clock_patch.start()
+        self.addCleanup(self.clock_patch.stop)
+
+    def setup_registry(self, *, capacity=4, request_capacity=4, timeout=30):
+        snapshot = self.snapshot(secret="private-old-value")
+        active = self.new_receiver(snapshot)
+        registry = registry_module.BoundConnectionRegistry(
+            capacity=capacity, request_capacity=request_capacity, receiver=active,
+            drain_timeout_seconds=timeout,
+        )
+        registry.activate(snapshot)
+        return registry, active
+
+    def rotate(self, registry, active, epoch=2, **kwargs):
+        snapshot = self.snapshot(epoch=epoch, **kwargs)
+        self.commit(active, snapshot)
+        uncovered = registry.activate(snapshot)
+        return snapshot, uncovered
+
+    def test_timeout_is_strict_and_bounded(self):
+        for timeout in (0, -1, 301, True, 30.0, "30", None, float("nan"), float("inf")):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ValueError, "integer from 1 to 300"):
+                    self.setup_registry(timeout=timeout)
+        for timeout in (1, 30, 300):
+            with self.subTest(timeout=timeout):
+                registry, active = self.setup_registry(timeout=timeout)
+                token = self.admit(registry).token
+                self.rotate(registry, active, host=None)
+                self.clock.return_value = 100 + timeout - 0.01
+                self.assertEqual(registry.expired_connections(), ())
+                self.clock.return_value = 100 + timeout
+                self.assertEqual(registry.expired_connections(), (token,))
+                self.clock.return_value = 100.0
+
+    def test_active_requests_do_not_expire_without_a_cutover(self):
+        registry, _ = self.setup_registry()
+        token = self.admit(registry).token
+        request = registry.acquire_request(token)
+        self.clock.return_value = 10000.0
+        self.assertEqual(registry.expired_connections(), ())
+        self.assertEqual(registry._request_deadlines, {})
+        self.assertEqual(registry._connection_deadlines, {})
+        self.assertEqual(registry.request_count, 1)
+        self.assertTrue(registry.finish_request(request.handle))
+
+    def test_credential_rotation_expires_only_unfinished_old_requests(self):
+        registry, active = self.setup_registry()
+        token = self.admit(registry).token
+        old = registry.acquire_request(token)
+        new_snapshot, uncovered = self.rotate(registry, active, secret="private-new-value")
+        self.assertEqual(uncovered, ())
+        new = registry.acquire_request(token)
+        self.assertEqual(new.action, "allow")
+        self.assertIs(new.snapshot, active.acquire())
+        self.assertEqual(new.snapshot.revision, new_snapshot.revision)
+        self.assertEqual(registry._request_deadlines, {old.handle.serial: 130.0})
+        self.clock.return_value = 129.999
+        self.assertEqual(registry.expired_connections(), ())
+        self.clock.return_value = 130.0
+        self.assertEqual(registry.expired_connections(), (token,))
+        self.assertEqual(registry.expired_connections(), (token,))
+        self.assertEqual(registry.request_count, 2)
+        self.assertEqual(registry.count, 1)
+        self.assertIn(b"private-old-value", old.snapshot.payload)
+        self.assertTrue(registry.finish_request(old.handle))
+        self.assertEqual(registry.expired_connections(), ())
+        self.assertEqual(registry.request_count, 1)
+        self.assertTrue(registry.finish_request(new.handle))
+
+    def test_path_only_and_policy_only_changes_retire_old_requests(self):
+        for change in ({"paths": ("/different/*",)}, {"policy_epoch": 2}):
+            with self.subTest(change=change):
+                registry, active = self.setup_registry()
+                token = self.admit(registry).token
+                request = registry.acquire_request(token)
+                self.rotate(registry, active, **change)
+                self.assertEqual(registry._request_deadlines, {request.handle.serial: 130.0})
+                self.assertEqual(registry._connection_deadlines, {})
+                self.assertEqual(registry.acquire_request(token).action, "allow")
+
+    def test_repeated_rotations_keep_first_deadline_and_deduplicate_connections(self):
+        registry, active = self.setup_registry(request_capacity=8)
+        first, second = [self.admit(registry).token for _ in range(2)]
+        old = [registry.acquire_request(first) for _ in range(2)]
+        self.rotate(registry, active)
+        middle = [registry.acquire_request(token) for token in (first, second)]
+        self.clock.return_value = 120.0
+        self.rotate(registry, active, epoch=3)
+        latest = registry.acquire_request(second)
+        self.assertEqual(registry._request_deadlines, {
+            **{request.handle.serial: 130.0 for request in old},
+            **{request.handle.serial: 150.0 for request in middle},
+        })
+        self.clock.return_value = 130.0
+        self.assertEqual(registry.expired_connections(), (first,))
+        self.assertTrue(registry.finish_request(old[0].handle))
+        self.assertEqual(registry.expired_connections(), (first,))
+        self.assertTrue(registry.finish_request(old[1].handle))
+        self.assertEqual(registry.expired_connections(), ())
+        self.clock.return_value = 150.0
+        self.assertEqual(registry.expired_connections(), (first, second))
+        self.assertNotIn(latest.handle.serial, registry._request_deadlines)
+
+    def test_idle_uncovered_connections_keep_deadline_across_remove_readd_remove(self):
+        registry, active = self.setup_registry()
+        token = self.admit(registry).token
+        _, uncovered = self.rotate(registry, active, host=None)
+        self.assertEqual(uncovered, (token,))
+        self.clock.return_value = 110.0
+        self.rotate(registry, active, epoch=3)
+        fresh = self.admit(registry).token
+        self.clock.return_value = 120.0
+        _, uncovered = self.rotate(registry, active, epoch=4, host=None)
+        self.assertEqual(uncovered, (token, fresh))
+        self.assertEqual(registry._connection_deadlines, {token.serial: 130.0, fresh.serial: 150.0})
+        self.assert_denied(registry, token, "connection_fenced")
+        self.clock.return_value = 130.0
+        self.assertEqual(registry.expired_connections(), (token,))
+        self.assertEqual(registry.request_count, 0)
+
+    def test_finishing_last_request_does_not_clear_uncovered_connection_deadline(self):
+        registry, active = self.setup_registry()
+        token = self.admit(registry).token
+        request = registry.acquire_request(token)
+        self.rotate(registry, active, host=None)
+        self.assertTrue(registry.finish_request(request.handle))
+        self.assertEqual(registry._request_deadlines, {})
+        self.clock.return_value = 130.0
+        self.assertEqual(registry.expired_connections(), (token,))
+        self.assertTrue(registry.release(token))
+        self.assertEqual(registry.expired_connections(), ())
+        self.assertEqual(registry._connection_deadlines, {})
+
+    def test_idempotent_and_rejected_activation_do_not_reschedule(self):
+        registry, active = self.setup_registry()
+        token = self.admit(registry).token
+        request = registry.acquire_request(token)
+        current, _ = self.rotate(registry, active, host=None)
+        self.clock.reset_mock()
+        self.clock.return_value = 120.0
+        registry.activate(current)
+        for rejected in (self.snapshot(), self.snapshot(epoch=3, identity=("other", "subject-a"))):
+            with self.assertRaises(registry_module.RegistryError):
+                registry.activate(rejected)
+        self.clock.assert_not_called()
+        self.assertEqual(registry._connection_deadlines, {token.serial: 130.0})
+        self.assertEqual(registry._request_deadlines, {request.handle.serial: 130.0})
+
+    def test_deactivation_and_receiver_close_preserve_deadlines_and_handles(self):
+        registry, active = self.setup_registry()
+        token = self.admit(registry).token
+        request = registry.acquire_request(token)
+        self.rotate(registry, active)
+        self.clock.return_value = 110.0
+        self.assertEqual(registry.deactivate(), (token,))
+        active.close()
+        self.clock.return_value = 130.0
+        self.assertEqual(registry.expired_connections(), (token,))
+        self.assertEqual(registry.request_count, 1)
+        self.assertIn(b"private-old-value", request.handle.snapshot.payload)
+        self.assertTrue(registry.release(token))
+        self.assertFalse(registry.finish_request(request.handle))
+        self.assertEqual(registry._request_deadlines, {})
+        self.assertEqual(registry._connection_deadlines, {})
+
+    def test_copied_handles_and_tokens_cannot_clear_deadlines(self):
+        registry, active = self.setup_registry()
+        token = self.admit(registry).token
+        request = registry.acquire_request(token)
+        self.rotate(registry, active, host=None)
+        self.assertFalse(registry.finish_request(replace(request.handle)))
+        self.assertFalse(registry.release(replace(token)))
+        self.clock.return_value = 130.0
+        self.assertIs(registry.expired_connections()[0], token)
+        self.assertEqual(registry.request_count, 1)
+        self.assertTrue(registry.release(token))
+        self.assertEqual(registry._request_deadlines, {})
+        self.assertEqual(registry._connection_deadlines, {})
+
+    def test_expiration_never_reclaims_capacity_or_finishes_work(self):
+        registry, active = self.setup_registry(capacity=1, request_capacity=1)
+        token = self.admit(registry).token
+        request = registry.acquire_request(token)
+        self.rotate(registry, active)
+        self.clock.return_value = 1000.0
+        self.assertEqual(registry.expired_connections(), (token,))
+        self.assert_denied(registry, token, "request_registry_exhausted")
+        self.assertEqual(self.admit(registry).reason, "registry_exhausted")
+        self.assertTrue(registry.finish_request(request.handle))
+        self.assertEqual(registry.acquire_request(token).action, "allow")
+
+    def test_expiration_pages_are_bounded_ordered_and_restartable(self):
+        registry, active = self.setup_registry(capacity=130)
+        tokens = [self.admit(registry).token for _ in range(130)]
+        self.rotate(registry, active, host=None)
+        self.clock.return_value = 130.0
+        first = registry.expired_connections()
+        self.assertEqual(first, tuple(tokens[:128]))
+        self.assertEqual(registry.expired_connections(after_serial=first[-1].serial), tuple(tokens[128:]))
+        self.assertEqual(registry.expired_connections(limit=1), (tokens[0],))
+        self.assertTrue(registry.release(tokens[128]))
+        self.assertEqual(registry.expired_connections(after_serial=first[-1].serial), (tokens[129],))
+        self.assertEqual(registry.expired_connections(after_serial=tokens[-1].serial), ())
+        self.assertEqual(registry.expired_connections(limit=1), (tokens[0],))
+        self.assertNotIn("private-old-value", repr(first))
+        self.assertNotIn("api.example.com", repr(first))
+
+    def test_expiration_query_rejects_invalid_bounds(self):
+        registry, _ = self.setup_registry()
+        for kwargs in ({"after_serial": -1}, {"after_serial": True}, {"after_serial": "1"},
+                       {"limit": 0}, {"limit": 129}, {"limit": True}, {"limit": 1.5}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(ValueError, "invalid expired connection query"):
+                    registry.expired_connections(**kwargs)
+
+    def test_admission_racing_cutover_is_retired_only_if_it_pins_old_revision(self):
+        for admission_first in (True, False):
+            with self.subTest(admission_first=admission_first):
+                registry, active = self.setup_registry()
+                token = self.admit(registry).token
+                target = self.snapshot(epoch=2)
+                lock = ObservedLock()
+                registry._lock = lock
+                lock.pause_next_exit = True
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    if admission_first:
+                        first = pool.submit(registry.acquire_request, token)
+                    else:
+                        self.commit(active, target)
+                        first = pool.submit(registry.activate, target)
+                    self.assertTrue(lock.before_unlock.wait(5))
+                    self.clock.return_value = 110.0
+                    lock.attempted.clear()
+                    if admission_first:
+                        self.commit(active, target)
+                        second = pool.submit(registry.activate, target)
+                    else:
+                        second = pool.submit(registry.acquire_request, token)
+                    self.assertTrue(lock.attempted.wait(5))
+                    lock.resume.set()
+                    result = first.result(5) if admission_first else second.result(5)
+                    (second if admission_first else first).result(5)
+                self.assertEqual(result.action, "allow")
+                expected = {result.handle.serial: 140.0} if admission_first else {}
+                self.assertEqual(registry._request_deadlines, expected)
+                self.clock.return_value = 100.0
+
+    def test_expiration_and_terminal_cleanup_are_lock_consistent(self):
+        registry, active = self.setup_registry(capacity=64, request_capacity=64)
+        tokens = [self.admit(registry).token for _ in range(64)]
+        requests = [registry.acquire_request(token) for token in tokens]
+        self.rotate(registry, active)
+        self.clock.return_value = 130.0
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            queries = [pool.submit(registry.expired_connections) for _ in range(32)]
+            cleanup = [pool.submit(registry.finish_request, request.handle) for request in requests[::2]]
+            cleanup += [pool.submit(registry.release, token) for token in tokens[1::2]]
+            for query in queries:
+                page = query.result(5)
+                self.assertEqual(list(page), sorted(page, key=lambda token: token.serial))
+                self.assertTrue(all(any(token is original for original in tokens) for token in page))
+            self.assertTrue(all(result.result(5) for result in cleanup))
+        self.assertEqual(registry.expired_connections(), ())
+        self.assertEqual(registry._request_deadlines, {})
+        self.assertEqual(registry._connection_deadlines, {})
+        self.assertEqual(registry.request_count, 0)
+
+    def test_query_and_finish_serialize_but_returned_target_can_become_stale(self):
+        for query_first in (True, False):
+            with self.subTest(query_first=query_first):
+                self.clock.return_value = 100.0
+                registry, active = self.setup_registry()
+                token = self.admit(registry).token
+                request = registry.acquire_request(token)
+                self.rotate(registry, active)
+                self.clock.return_value = 130.0
+                lock = ObservedLock()
+                registry._lock = lock
+                lock.pause_next_exit = True
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    if query_first:
+                        first = pool.submit(registry.expired_connections)
+                    else:
+                        first = pool.submit(registry.finish_request, request.handle)
+                    self.assertTrue(lock.before_unlock.wait(5))
+                    lock.attempted.clear()
+                    if query_first:
+                        second = pool.submit(registry.finish_request, request.handle)
+                    else:
+                        second = pool.submit(registry.expired_connections)
+                    self.assertTrue(lock.attempted.wait(5))
+                    lock.resume.set()
+                    page = (first if query_first else second).result(5)
+                    self.assertTrue((second if query_first else first).result(5))
+                self.assertEqual(page, (token,) if query_first else ())
+                self.assertEqual(registry.expired_connections(), ())
+                self.assertEqual(registry.request_count, 0)
+                self.assertEqual(registry.count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
