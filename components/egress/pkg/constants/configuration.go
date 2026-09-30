@@ -87,7 +87,12 @@ const (
 	EnvMitmproxyPort             = "OPENSANDBOX_EGRESS_MITMPROXY_PORT"
 	EnvMitmproxyScript           = "OPENSANDBOX_EGRESS_MITMPROXY_SCRIPT"
 	EnvMitmproxyUpstreamTrustDir = "OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_TRUST_DIR"
-	EnvMitmproxySslInsecure      = "OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE"
+	// EnvMitmproxyUpstreamExtraCA: path to a PEM file with one or more extra CA
+	// certificates, passed to mitmproxy ssl_verify_upstream_trusted_ca. Additive
+	// with the system/confdir trust, and applies to every mitmproxy upstream TLS
+	// connection (HTTPS proxy and intercepted origins), not only the proxy hop.
+	EnvMitmproxyUpstreamExtraCA = "OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA"
+	EnvMitmproxySslInsecure     = "OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE"
 	// EnvExperimentalRevisionRuntime enables the internal OSEP-0023
 	// per-mitmdump revision bootstrap path. It is not a public interception mode.
 	EnvExperimentalRevisionRuntime = "OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME"

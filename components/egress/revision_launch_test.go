@@ -253,15 +253,26 @@ func TestPolicyServerRevisionBootstrapSnapshotDistinguishesMissingAndEmpty(t *te
 }
 
 type fakeRevisionProcessSession struct {
-	config         *mitmproxy.RevisionIPCConfig
-	bootstrapErrs  []error
-	reconcile      []*revision.Identity
-	events         *[]string
-	snapshots      []credentialvault.ActiveSnapshot
-	policyEpochs   []int64
-	bootstrapCalls int
-	reconcileCalls int
-	closeCalls     int
+	config                  *mitmproxy.RevisionIPCConfig
+	bootstrapErrs           []error
+	reconcile               []*revision.Identity
+	events                  *[]string
+	snapshots               []credentialvault.ActiveSnapshot
+	policyEpochs            []int64
+	bootstrapCalls          int
+	reconcileCalls          int
+	closeCalls              int
+	updateIdentity          revision.Identity
+	updateErr               error
+	updateContext           context.Context
+	updateSnapshot          credentialvault.ActiveSnapshot
+	updatePolicyEpoch       int64
+	updateCalls             int
+	reconcileUpdateResult   bool
+	reconcileUpdateErr      error
+	reconcileUpdateContext  context.Context
+	reconcileUpdateIdentity revision.Identity
+	reconcileUpdateCalls    int
 }
 
 func (s *fakeRevisionProcessSession) MitmproxyConfig() (*mitmproxy.RevisionIPCConfig, error) {
@@ -297,6 +308,28 @@ func (s *fakeRevisionProcessSession) ReconcileBootstrap(context.Context) (*revis
 		return nil, revision.ErrIndeterminate
 	}
 	return s.reconcile[index], nil
+}
+
+func (s *fakeRevisionProcessSession) Update(
+	ctx context.Context,
+	snapshot credentialvault.ActiveSnapshot,
+	policyEpoch int64,
+) (revision.Identity, error) {
+	s.updateCalls++
+	s.updateContext = ctx
+	s.updateSnapshot = snapshot
+	s.updatePolicyEpoch = policyEpoch
+	return s.updateIdentity, s.updateErr
+}
+
+func (s *fakeRevisionProcessSession) ReconcileUpdate(
+	ctx context.Context,
+	identity revision.Identity,
+) (bool, error) {
+	s.reconcileUpdateCalls++
+	s.reconcileUpdateContext = ctx
+	s.reconcileUpdateIdentity = identity
+	return s.reconcileUpdateResult, s.reconcileUpdateErr
 }
 
 func (s *fakeRevisionProcessSession) Close() error {

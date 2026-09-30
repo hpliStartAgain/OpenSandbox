@@ -14,6 +14,7 @@ Check the [SDK capability matrix](/sdks/#capability-coverage) for language suppo
 - [Lifecycle hooks](/guides/lifecycle-hooks)
 - [Isolation sessions](/guides/isolation-sessions)
 - [Credential Vault](/guides/credential-vault)
+- [Chained upstream proxy](/guides/egress-upstream-proxy)
 - [Secure access](/guides/secure-access)
 - [Secure container runtimes](/guides/secure-container)
 - [Multi-tenancy](/guides/multi-tenancy)

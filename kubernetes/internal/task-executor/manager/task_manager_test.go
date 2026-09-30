@@ -410,6 +410,10 @@ func TestTaskManager_List(t *testing.T) {
 	mgr, _ := setupTestManager(t)
 	ctx := context.Background()
 
+	// Start the manager so task deletion is finalized before t.TempDir cleanup.
+	mgr.Start(ctx)
+	defer mgr.Stop()
+
 	// Initially empty
 	tasks, err := mgr.List(ctx)
 	if err != nil {
@@ -431,7 +435,7 @@ func TestTaskManager_List(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create() failed: %v", err)
 	}
-	defer mgr.Delete(ctx, task.Name)
+	defer cleanupTask(t, mgr, task.Name)
 
 	// List should return 1 task
 	tasks, err = mgr.List(ctx)
@@ -1430,14 +1434,14 @@ func TestTaskManager_CountActiveTasks(t *testing.T) {
 	}
 	defer mgr.Delete(ctx, task1.Name)
 
-	// Wait for task1 to complete
-	time.Sleep(500 * time.Millisecond)
-
-	// Should have 0 active tasks after task1 completes
-	activeCount = activeTaskCount(mgr.(*taskManager))
-	if activeCount != 0 {
-		t.Errorf("Active count after task1 completion = %d, want 0", activeCount)
-	}
+	// Wait for task1 to reach a terminal state. The reconcile loop observes the
+	// exited process asynchronously (once per ReconcileInterval), so poll for the
+	// expected count instead of sleeping a fixed duration: under CI load a
+	// hardcoded 500ms can elapse before the transition lands, spuriously leaving
+	// task1 active and failing both this and the following assertion.
+	require.Eventually(t, func() bool {
+		return activeTaskCount(mgr.(*taskManager)) == 0
+	}, 5*time.Second, 10*time.Millisecond, "task1 should become inactive once it completes")
 
 	// Create a running task
 	task2 := &types.Task{

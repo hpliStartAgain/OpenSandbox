@@ -31,8 +31,10 @@ from opensandbox_server.api.schema import Endpoint, Sandbox, SandboxFilter
 from opensandbox_server.services.constants import (
     ALLOWED_EGRESS_ENV_VARS,
     EGRESS_ENV_PREFIX,
+    EGRESS_UPSTREAM_EXTRA_CA_PATH,
     OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
+    OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA,
     OPENSANDBOX_EGRESS_UPSTREAM_PROXY,
     OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH,
     OPEN_SANDBOX_INGRESS_HEADER,
@@ -300,6 +302,13 @@ def upstream_proxy_egress_env(
     if upstream_proxy.authorization is not None:
         env[OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH] = (
             upstream_proxy.authorization.get_secret_value()
+        )
+    if (
+        upstream_proxy.ca_cert_path is not None
+        or upstream_proxy.ca_secret_name is not None
+    ):
+        env[OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA] = (
+            EGRESS_UPSTREAM_EXTRA_CA_PATH
         )
     return env
 

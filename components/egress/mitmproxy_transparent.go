@@ -39,7 +39,7 @@ type exitEvent struct {
 }
 
 type mitmTransparent struct {
-	mu              sync.Mutex
+	mu              sync.RWMutex
 	running         *mitmproxy.Running
 	revisionSession revisionProcessSession
 	currentGen      uint64 // generation of the mitmdump currently considered live
@@ -119,8 +119,8 @@ func (m *mitmTransparent) closeRevisionSession(gen uint64) {
 }
 
 func (m *mitmTransparent) getCurrentGen() uint64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.currentGen
 }
 

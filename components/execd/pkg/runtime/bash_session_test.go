@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +86,35 @@ func TestBashSession_NonZeroExitEmitsError(t *testing.T) {
 	case <-completeCh:
 		require.Fail(t, "did not expect completion hook on non-zero exit")
 	default:
+	}
+}
+
+func TestBashSession_RemovesScriptFile(t *testing.T) {
+	requireBash(t)
+	tmpDir := t.TempDir()
+	t.Setenv("TMPDIR", tmpDir)
+
+	session := newBashSession("", nil)
+	t.Cleanup(func() { _ = session.close() })
+	require.NoError(t, session.start())
+
+	for _, code := range []string{"exit 0", "exit 3"} {
+		var stdoutLines []string
+		require.NoError(t, session.run(context.Background(), &ExecuteCodeRequest{
+			// List the script first to prove it was created under tmpDir.
+			Code:    `ls "` + tmpDir + `"; ` + code,
+			Timeout: 3 * time.Second,
+			Hooks: ExecuteResultHook{
+				OnExecuteStdout: func(line string) { stdoutLines = append(stdoutLines, line) },
+			},
+		}))
+		require.True(t, slices.ContainsFunc(stdoutLines, func(line string) bool {
+			return strings.HasPrefix(line, "execd_bash_")
+		}), "script file was not created under TMPDIR: %v", stdoutLines)
+
+		leftover, err := filepath.Glob(filepath.Join(tmpDir, "execd_bash_*.sh"))
+		require.NoError(t, err)
+		require.Empty(t, leftover, "script file left behind after %q", code)
 	}
 }
 
@@ -824,4 +854,49 @@ func TestNewBashSessionEnvOverlaysFileAndKeepsBlacklist(t *testing.T) {
 	for _, name := range isolation.ExecdConfigEnvBlacklist() {
 		require.NotContains(t, env, name, "blacklisted execd var %s must not enter the session env", name)
 	}
+}
+
+func TestBashSession_TimeoutKillsChildren(t *testing.T) {
+	requireBash(t)
+	marker := filepath.Join(t.TempDir(), "child.done")
+
+	session := newBashSession("", nil)
+	t.Cleanup(func() { _ = session.close() })
+	require.NoError(t, session.start())
+
+	start := time.Now()
+	err := session.run(context.Background(), &ExecuteCodeRequest{
+		// The subshell inherits stdout, so it keeps the output pipe open
+		// after bash itself is killed.
+		Code:    `(sleep 2; touch "` + marker + `")`,
+		Timeout: 300 * time.Millisecond,
+	})
+	require.ErrorContains(t, err, "timeout")
+	require.Less(t, time.Since(start), 1500*time.Millisecond, "run did not return at the timeout")
+
+	// Give a surviving child time to write the marker.
+	time.Sleep(2500 * time.Millisecond)
+	_, statErr := os.Stat(marker)
+	require.True(t, os.IsNotExist(statErr), "child survived the session run timeout")
+}
+
+// A run that finishes normally must not kill jobs it started in the
+// background; only a timeout or cancel does.
+func TestBashSession_NormalExitKeepsBackgroundJob(t *testing.T) {
+	requireBash(t)
+	marker := filepath.Join(t.TempDir(), "child.done")
+
+	session := newBashSession("", nil)
+	t.Cleanup(func() { _ = session.close() })
+	require.NoError(t, session.start())
+
+	require.NoError(t, session.run(context.Background(), &ExecuteCodeRequest{
+		Code:    `(sleep 1; touch "` + marker + `") >/dev/null 2>&1 &`,
+		Timeout: 10 * time.Second,
+	}))
+
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(marker)
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond, "background job was killed after a normal run")
 }

@@ -48,9 +48,10 @@ To bypass decryption for selected domains, edit the baked-in
 | `OPENSANDBOX_EGRESS_MITMPROXY_PORT` | No | mitmdump listen port; `iptables` redirects `80/443` here | `18081` |
 | `OPENSANDBOX_EGRESS_MITMPROXY_SCRIPT` | No | User mitm addon script paths (comma-separated); each is passed as `-s` and loaded after the system addon in order | Empty |
 | `OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_TRUST_DIR` | No | Trust directory for upstream TLS verification (OpenSSL style); overrides the config.yaml default | `/etc/ssl/certs` |
+| `OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA` | No | Path to a PEM file with one or more extra CA certificates; passed to mitmproxy `ssl_verify_upstream_trusted_ca`. **Additive** with the system/confdir trust — it does not replace `/etc/ssl/certs` — and applies to **every** mitmproxy upstream TLS connection (HTTPS proxy and intercepted origins), not only the proxy hop | Empty |
 | `OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE` | No | Skip upstream TLS verification (`1/true/on`); use when clients connect by IP and SNI is unavailable | Disabled |
 | `OPENSANDBOX_EGRESS_MITMPROXY_EXTRA_PORTS` | No | **Experimental.** Extra destination TCP ports to intercept, appended to the always-on `80,443` (comma-separated, e.g. `8080,8443`). Fails closed at startup on invalid input; total ports (including 80/443) must be ≤ 15. Note: the system addon's credential-binding matcher currently only fires on canonical 80/443 — extras are decrypted and logged but not matched against bindings. | Empty |
-| `OPENSANDBOX_EGRESS_UPSTREAM_PROXY` | No | Chained upstream proxy endpoint (`http://host[:port]` or `https://host[:port]`), with no credentials, query, fragment, or non-root path. Requires `OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true` and `OPENSANDBOX_EGRESS_MODE=dns+nft`; egress startup fails otherwise. Not supported with `OPENSANDBOX_EGRESS_PROFILE=fast-sandbox`. When set, the bundled `upstream_proxy.py` addon is loaded after the system addon and every mitmproxy-handled connection is forwarded through the proxy via `CONNECT`. Fail closed: pass-through flows that cannot be chained are refused and logged with the `credential proxy:` prefix. | Empty (disabled) |
+| `OPENSANDBOX_EGRESS_UPSTREAM_PROXY` | No | Chained upstream proxy endpoint (`http://host[:port]` or `https://host[:port]`), with no credentials, query, fragment, or non-root path. The host must be a literal IP or a dotted domain name: a dotless name expands differently through the Pod resolver's DNS search list than through the egress's direct query, so the containment sets could miss the address actually dialed (startup fails otherwise). Requires `OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true` and — outside the fast-sandbox profile — `OPENSANDBOX_EGRESS_MODE=dns+nft`; egress startup fails otherwise. Under the fast-sandbox profile the endpoint is contained profile-wide (see the fast-sandbox bullet under "Chain Through an Upstream Proxy"). When set, the bundled `upstream_proxy.py` addon is loaded after the system addon and every mitmproxy-handled connection is forwarded through the proxy via `CONNECT`. Fail closed: pass-through flows that cannot be chained are refused and logged with the `credential proxy:` prefix. | Empty (disabled) |
 | `OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH` | No | Complete `Proxy-Authorization` header value sent on the upstream `CONNECT` (e.g. `Basic base64(user:pass)`). Requires `OPENSANDBOX_EGRESS_UPSTREAM_PROXY`; startup fails if set alone. Never logged. | Empty |
 
 Notes:
@@ -69,6 +70,7 @@ This is the single source of truth for:
 - `listen_host` (`127.0.0.1`) — mitm default is `0.0.0.0`
 - `stream_large_bodies` (`1m`) — mitm default is unset (entire body buffered)
 - `ssl_verify_upstream_trusted_confdir` (`/etc/ssl/certs`) — mitm default is unset; overridable per-deployment via env
+- `ssl_verify_upstream_trusted_ca` — unset by default; per-deployment env `OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA` points it at a PEM bundle that **augments** the confdir trust for all upstream TLS verification
 - `connection_strategy` (`lazy`) — mitmproxy 10+ changed the default from `lazy` to `eager`; pinned explicitly to preserve the historical behavior of deferring upstream connections until the full request arrives
 - `ignore_hosts` (`[]`) — matches the mitm default; kept in the file as a discoverable extension point for operators adding TLS pass-through entries
 
@@ -195,30 +197,65 @@ Semantics and limits:
   verification against the proxy host, using the same
   `ssl_verify_upstream_trusted_confdir`/`_trusted_ca` options that verify real
   upstreams (default `/etc/ssl/certs`, overridable via
-  `OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_TRUST_DIR`).
+  `OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_TRUST_DIR`). To trust a private CA for
+  the proxy connection, deliver the PEM via
+  `OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA` — it is additive to the
+  system roots and also applies to intercepted origin TLS.
 - **Fail closed**: connections that cannot be chained — TLS pass-through
   (no-SNI or `ignore_hosts`/`tcp_hosts`/`udp_hosts` matches) and UDP/QUIC
   dials — are refused rather than silently sent direct.
 - **Requires `OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true`**: the chain only
   exists inside the transparent mitmproxy path, so egress startup fails if the
   proxy is configured without transparent mode instead of silently ignoring it.
-- **Unsupported under the fast-sandbox profile**
-  (`OPENSANDBOX_EGRESS_PROFILE=fast-sandbox`): the equivalent infra DNS/nft
-  scoping is not implemented there, so egress startup fails fast rather than
-  running without the proxy.
+- **Supported under the fast-sandbox profile**
+  (`OPENSANDBOX_EGRESS_PROFILE=fast-sandbox`), with containment adapted to its
+  source-IP enforcement model: the proxy endpoint is dropped profile-wide in
+  the shared dispatch chain (forward path, and the input path for intercepted
+  traffic), ahead of the established accept and every per-subject rule, so no
+  subject policy — default-allow included — can CONNECT the proxy directly.
+  The mitmdump dial itself is locally generated Pod traffic and is never
+  policed by the fast-sandbox table (the profile deliberately installs no
+  OUTPUT enforcement), so no accept-side exception is needed. For a hostname
+  endpoint the name is registered as an infrastructure domain on the shared
+  dnsproxy: sandbox lookups resolve without per-subject policy and never feed
+  the dynamic allow sets; DNS-learned addresses seed the drop sets as
+  PERMANENT elements (no kernel timeout): every other rule in the table
+  persists while the egress daemon is down (fail closed), and a kernel
+  timeout would silently lapse the containment during a restart — expiry is
+  owned by the egress instead (the self-resolution loop prunes addresses absent
+  from two successful full-authority refreshes; sandbox DNS learning renews
+  retention, and table rebuilds re-seed from the in-memory
+  mirror). The shared mitmdump resolves the hostname through the fastlet
+  Pod's own resolver (cluster DNS), so the name must be resolvable there —
+  the egress component does not redirect the Pod's own DNS. Because the
+  dnsproxy's forward upstreams (`OPENSANDBOX_EGRESS_DNS_UPSTREAM` or
+  `/etc/resolv.conf`) and the Pod resolver can return different address sets
+  (split-horizon DNS, an operator-configured DNS upstream, or plain
+  rotation), the self-resolution loop queries **both** authorities concurrently and seeds
+  the drop sets with the union: an address only the Pod resolver returns is
+  exactly one a sandbox could CONNECT directly, so containment must cover
+  it. Partial failures are logged and returned addresses are added without
+  pruning. The first seed resolves with bounded retries **before resetting
+  the nft table**; both authorities must complete successfully with a nonempty
+  union. Failure leaves the previous kernel table intact, while success installs
+  the seeded addresses atomically with the reset. DNS and nft application have
+  separate timeouts. Literal proxy IPs are seeded permanently.
 - **Requires `connection_strategy: lazy`** (the shipped default): eager
   connects upstream before any request exists, so no `via` can be applied.
 - **Config validation**: a malformed proxy URL, credentials in the URL, or
   `..._AUTH` without `..._PROXY` fail egress startup; the addon likewise raises
   on load, so mitmdump will not start with an inconsistent config.
 - **Policy interaction (`dns+nft`)**: the proxy endpoint is treated as
-  infrastructure, not sandbox egress. The egress nft chain adds a dedicated
-  accept scoped to `(mitmproxy UID, proxy IP, proxy port)`; the proxy IP is
-  deliberately *not* added to the sandbox allow sets, which are IP-only and
-  would otherwise let sandbox code dial the proxy port directly (e.g. `CONNECT`
-  on 3128) to reach denied destinations. For a hostname endpoint the DNS
-  answer is exempted from sandbox policy evaluation and feeds only the
-  uid-scoped set, so the proxy name stays resolvable under a deny-all policy.
+  infrastructure, not sandbox egress. In the sidecar profile the egress nft
+  chain adds a dedicated accept scoped to `(mitmproxy UID, proxy IP, proxy
+  port)`; the proxy IP is deliberately *not* added to the sandbox allow sets,
+  which are IP-only and would otherwise let sandbox code dial the proxy port
+  directly (e.g. `CONNECT` on 3128) to reach denied destinations. For a
+  hostname endpoint the DNS answer is exempted from sandbox policy evaluation
+  and feeds only the uid-scoped set, so the proxy name stays resolvable under
+  a deny-all policy. The fast-sandbox profile enforces the same properties
+  through its profile-wide endpoint drop and the infra-domain exemption (see
+  the fast-sandbox bullet above).
 - **Auth secrecy**: the auth value is sent only on the upstream `CONNECT` and
   is never logged. Prefer injecting it via the container env or a Secret over
   baking it into an image.

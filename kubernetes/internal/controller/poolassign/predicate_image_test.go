@@ -198,7 +198,7 @@ func TestImagePredicate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := p.predicate(ctx, tt.sbx, tt.pool)
+			got := p.Predicate(ctx, tt.sbx, tt.pool)
 			if got != tt.expect {
 				t.Errorf("imagePredicate.predicate() = %v, want %v", got, tt.expect)
 			}

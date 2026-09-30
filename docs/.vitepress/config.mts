@@ -192,6 +192,10 @@ export default defineConfig({
               text: "Kubernetes Deployment",
               link: "/deployment/",
             },
+            {
+              text: "ACK Deployment",
+              link: "/deployment/ack",
+            },
           ],
         },
       ],
@@ -204,11 +208,16 @@ export default defineConfig({
           items: [
             { text: "Overview", link: "/guides/" },
             { text: "Credential Vault", link: "/guides/credential-vault" },
+            {
+              text: "Chained Upstream Proxy",
+              link: "/guides/egress-upstream-proxy",
+            },
             { text: "Secure Access", link: "/guides/secure-access" },
             { text: "Secure Container", link: "/guides/secure-container" },
             { text: "Multi-Tenancy", link: "/guides/multi-tenancy" },
             { text: "Isolation Sessions", link: "/guides/isolation-sessions" },
             { text: "Pause & Resume", link: "/guides/pause-resume" },
+            { text: "Pod Provision Failure Recovery", link: "/guides/pod-recovery" },
             {
               text: "QEMU VMState Snapshots",
               link: "/guides/qemu-vmstate-snapshots",
@@ -228,7 +237,10 @@ export default defineConfig({
       "/api/": [
         {
           text: "API Reference",
-          items: [{ text: "OpenAPI Specs", link: "/api/" }],
+          items: [
+            { text: "OpenAPI Specs", link: "/api/" },
+            { text: "Implementation Compatibility", link: "/api/implementation-compatibility" },
+          ],
         },
       ],
 

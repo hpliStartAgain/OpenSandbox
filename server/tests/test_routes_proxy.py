@@ -1271,17 +1271,20 @@ def test_proxy_rejects_websocket_upgrade_for_post_and_mixed_case_header(
     assert response.json()["message"] == "Websocket upgrade is not supported yet"
 
 
+@pytest.mark.parametrize("configured_resolve_internal", [True, False])
 def test_proxy_websocket_relays_messages_and_forwards_safe_headers(
     client: TestClient,
     auth_headers: dict,
     monkeypatch,
+    configured_resolve_internal: bool,
 ) -> None:
     class StubService:
         @staticmethod
         def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
-            assert resolve_internal is True
+            assert resolve_internal is configured_resolve_internal
+            assert use_proxy_host is (not configured_resolve_internal)
             return Endpoint(
                 endpoint="10.57.1.91:40109/proxy/44772",
                 headers={
@@ -1292,6 +1295,13 @@ def test_proxy_websocket_relays_messages_and_forwards_safe_headers(
             )
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+    monkeypatch.setattr(
+        proxy_api,
+        "get_config",
+        lambda: SimpleNamespace(
+            proxy=SimpleNamespace(resolve_internal=configured_resolve_internal)
+        ),
+    )
     backend = _FakeBackendWebSocket()
     connector = _FakeWebSocketConnector(backend)
     monkeypatch.setattr(proxy_api.websockets, "connect", connector)

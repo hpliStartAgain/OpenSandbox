@@ -61,6 +61,22 @@ controller:
     # -- Burst for Kubernetes client rate limiter.
     burst: 200
 
+  # -- Image pull stuck pod recovery during initial startup (BatchSandbox).
+  # Rendered into the `feature-flags` ConfigMap in the controller namespace;
+  # the controller hot-reloads it without a restart.
+  podRecovery:
+    # -- How long a pod must stay in ImagePullBackOff/ErrImagePull during initial
+    # startup before the controller replaces it (`pod-recovery-stuck-threshold`).
+    stuckThreshold: "1m"
+    # -- Maximum number of stuck-pod replacements per BatchSandbox generation
+    # (`pod-recovery-max-attempts`).
+    maxAttempts: 3
+    # -- Comma-separated kubelet admission rejection reasons that pod replacement
+    # can recover (`pod-recovery-admission-reasons`). Replaces the built-in set
+    # (NodeNotSchedulable, KubeletNotReady, UnexpectedAdmissionError, Evicted;
+    # OutOf* reasons always apply). Leave empty to use the built-in defaults.
+    admissionReasons: ""
+
   # -- Pause/Resume snapshot configuration
   snapshot:
     # -- Image used for commit operations.
@@ -74,6 +90,8 @@ controller:
     commitJobTimeout: "10m"
     # -- OCI registry prefix used for snapshot images.
     registry: ""
+    # -- Go named-field template for snapshot image URIs. Empty preserves default naming.
+    imageURITemplate: ""
     # -- Use insecure registry mode when pushing snapshot images.
     registryInsecure: false
     # -- Secret name used by commit Jobs to push snapshot images.

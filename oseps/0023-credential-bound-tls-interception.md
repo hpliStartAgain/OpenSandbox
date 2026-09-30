@@ -3,7 +3,7 @@ title: Credential-Bound TLS Interception
 authors:
   - "@hpliStartAgain"
 creation-date: 2026-09-04
-last-updated: 2026-09-26
+last-updated: 2026-09-29
 status: implementing
 ---
 
@@ -868,6 +868,17 @@ active. Other attempts are rejected without transport activity; reconciliation
 errors retain the attempt, and a concurrent update remains blocked without
 transport activity.
 
+The sidecar now has an internal generation-pinned callback that holds the live
+process/session lifecycle read lock for the callback's full duration. This is
+only an ownership primitive: public mutation handlers, Vault Store candidate
+finalization, and connection fences are still not connected to it, so no
+public mutation acknowledgement is live. The callback accepts only the narrow
+update/reconcile session interface and requires a bounded context with a
+deadline canceled when sidecar shutdown begins. Callbacks must pass that same
+context to session operations and return promptly on cancellation; shutdown
+waits for a running callback to release the lifecycle read lock, and the helper
+cannot terminate a callback that ignores cancellation.
+
 `ErrClosed` and `ErrTransportUnavailable`, including a local parent-path fence
 failure after the receiver committed, are terminal session failures rather
 than reconcilable mutation outcomes. They return no attempt identity and never
@@ -920,6 +931,40 @@ lookup to project host coverage and exports a separate request-sample counter.
 It performs no ClientHello lookup and does not enable selective interception;
 opaque connections and failed handshakes are outside its observation set. The
 public interception mode remains unavailable until the later phases pass.
+
+The Python side now also has a pure ClientHello decision foundation. It builds
+an immutable TLS selector view only after strict validation of a real canonical
+revision snapshot, retaining revision metadata and parsed host selectors while
+discarding payload and credential-bearing bindings. Classification follows the
+early identity, ECH, no-SNI, invalid-SNI, static-ignore, snapshot-generation,
+and binding-host order, and reports only closed action/reason values. A bound
+host returns `needs_registry`; this is not a decrypt instruction. This step
+fails malformed ECH/static-selector arguments closed with `reason=invalid_input`
+while preserving early identity, ECH, and no-SNI ordering. It does not connect
+the classifier to the system addon or receiver commit path,
+and does not change Go, public configuration, or live traffic. Selective TLS
+remains disabled.
+
+An unused sidecar-only connection-registry foundation now consumes the pure
+classification result under one lock with bounded admission. It records only
+bound, admitted connections with their generation and decision epoch; capacity
+exhaustion denies new bound admission rather than making it opaque, while
+unbound pass-through consumes no entry. One Registry instance accepts only one
+sidecar generation; a replacement process creates a fresh instance. Deactivation
+denies later non-exempt SNI-bearing decisions and returns existing memberships
+for the future owner to close, but does not close transports itself. Receiver
+publication, host-removal request fences, mitmproxy hooks, fast-sandbox budgets,
+and live traffic remain unwired.
+
+The unused sidecar registry now also reports which still-tracked decrypted
+connections become newly uncovered when a validated decision snapshot is
+activated. It compares the old and new selector coverage of each admitted SNI
+under the same lock as new TLS admissions, so overlapping wildcard and exact
+selectors are evaluated semantically rather than by raw set subtraction.
+Already-uncovered entries are not reported again, but remain tracked until
+released. The returned tokens are only a future fence target: this step does
+not close transports, stop new HTTP requests or streams on old connections,
+couple registry activation to receiver commit, or authorize mutation ACK.
 
 1. **Decision telemetry and red tests**
    - Add fail-closed tests that distinguish authoritative empty from lookup

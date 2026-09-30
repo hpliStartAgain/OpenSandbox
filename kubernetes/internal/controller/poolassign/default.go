@@ -70,10 +70,10 @@ func (a *defaultAssigner) AssignPool(ctx context.Context, sbx *sandboxv1alpha1.B
 	return best.Name, nil
 }
 
-func (a *defaultAssigner) collectRejections(ctx context.Context, sbx *sandboxv1alpha1.BatchSandbox, pool *sandboxv1alpha1.Pool, predicates []predicate) poolRejection {
+func (a *defaultAssigner) collectRejections(ctx context.Context, sbx *sandboxv1alpha1.BatchSandbox, pool *sandboxv1alpha1.Pool, predicates []Predicate) poolRejection {
 	var rejection poolRejection
 	for _, p := range predicates {
-		if !p.predicate(ctx, sbx, pool) {
+		if !p.Predicate(ctx, sbx, pool) {
 			reason := "predicate failed"
 			if pr, ok := p.(predicateWithReason); ok {
 				if detail := pr.Reason(ctx, sbx, pool); detail != "" {

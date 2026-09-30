@@ -105,6 +105,9 @@ mode = "dns"
 # [egress.upstream_proxy]
 # url = "http://proxy.example.com:3128"
 # authorization = "Basic <base64>"
+# Optional: Secret holding an extra upstream CA bundle under the fixed key
+# "ca.crt"; mounted read-only into the egress sidecar only.
+# ca_secret_name = "corp-proxy-ca"
 
 # Renew-on-access. Off by default — see server/README.md.
 [renew_intent]

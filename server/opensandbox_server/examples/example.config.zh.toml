@@ -98,6 +98,9 @@ readiness_timeout_seconds = 30.0
 # [egress.upstream_proxy]
 # url = "http://proxy.example.com:3128"
 # authorization = "Basic <base64>"
+# 可选：Docker 守护进程主机上 PEM CA bundle 的绝对路径，在系统根证书之外追加信任；
+# 仅以只读方式挂载到 egress sidecar。
+# ca_cert_path = "/etc/ssl/private-ca/upstream-proxy-ca.pem"
 
 # 按访问续期。默认关闭 — 见 server/README_zh.md。
 [renew_intent]

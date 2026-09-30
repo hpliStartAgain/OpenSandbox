@@ -144,12 +144,19 @@ environment with bind mounts — reachable through `Sandbox.IsolationCreate`:
 
 ```go
 shareNet := true
+ephemeral := false
 session, err := sbx.IsolationCreate(ctx, opensandbox.CreateIsolatedSessionRequest{
-    Workspace: opensandbox.IsolatedWorkspaceSpec{Path: "/workspace", Mode: "rw"},
-    Profile:   "strict",
+    // Workspace is a pointer; Overlays carries additional independent mounts.
+    Workspace: &opensandbox.IsolatedWorkspaceSpec{Path: "/workspace", Mode: "rw"},
+    Overlays: []opensandbox.IsolatedOverlaySpec{{
+        Path:    "/data/scratch",
+        Mode:    "overlay",
+        Persist: &ephemeral, // tmpfs upper: writes die with the session
+    }},
+    Profile:  "strict",
     // Optional bind mounts (source on host, dest inside the session)
-    Binds:     []opensandbox.BindMount{{Source: "/data", Dest: "/data", ReadOnly: true}},
-    ShareNet:  &shareNet,
+    Binds:    []opensandbox.BindMount{{Source: "/data", Dest: "/data", ReadOnly: true}},
+    ShareNet: &shareNet,
 })
 
 // Foreground run — TimeoutSeconds applies here only; background runs are

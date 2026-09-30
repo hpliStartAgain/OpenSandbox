@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata" // Embed timezone data for snapshot image naming.
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -44,6 +46,7 @@ import (
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/controller"
 	poolassign "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/controller/poolassign"
+	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/telemetry"
 	cryptoutil "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/crypto"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/expectations"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/fieldindex"
@@ -59,6 +62,8 @@ var (
 const (
 	defaultBatchSandboxConcurrency = 32
 	defaultPoolConcurrency         = 16
+	// telemetryShutdownTimeout bounds the final OTLP flush on shutdown.
+	telemetryShutdownTimeout = 5 * time.Second
 )
 
 type ConcurrencyConfig map[string]int
@@ -219,6 +224,9 @@ func main() {
 	var snapshotRegistry string
 	flag.StringVar(&snapshotRegistry, "snapshot-registry", "", "OCI registry for snapshot images (e.g., registry.example.com/snapshots).")
 
+	var snapshotImageURITemplateValue string
+	flag.StringVar(&snapshotImageURITemplateValue, "snapshot-image-uri-template", "", "Go named-field template for snapshot image URIs; empty uses "+controller.DefaultSnapshotImageURITemplate+".")
+
 	var snapshotRegistryInsecure bool
 	flag.BoolVar(&snapshotRegistryInsecure, "snapshot-registry-insecure", false, "Use insecure registry mode when pushing snapshot images.")
 
@@ -252,6 +260,14 @@ func main() {
 	ctrl.SetLogger(logger)
 
 	setupLog.Info("Starting controller", "commitID", commitID, "buildDate", buildDate)
+
+	snapshotImageURITemplate, err := controller.ParseSnapshotImageURITemplate(snapshotImageURITemplateValue)
+	if err != nil {
+		setupLog.Error(err, "invalid snapshot image URI template")
+		os.Exit(1)
+	}
+
+	otelShutdown := setupTelemetry()
 
 	imageCommitterPodTemplate, err := loadImageCommitterPodTemplate(imageCommitterPodTemplateFile)
 	if err != nil {
@@ -444,6 +460,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	featureConfig := controller.NewFeatureConfig()
+	if err := featureConfig.SetupWithManager(mgr, os.Getenv("POD_NAMESPACE")); err != nil {
+		setupLog.Error(err, "failed to setup feature config ConfigMap watch")
+		os.Exit(1)
+	}
+
 	poolAllocator := controller.NewDefaultAllocator(mgr.GetClient())
 	if err := controller.SetupCapacityMetricsWithManager(mgr, poolAllocator); err != nil {
 		setupLog.Error(err, "unable to register capacity metrics")
@@ -457,6 +479,7 @@ func main() {
 		ResumePullSecret:    resumePullSecret,
 		ProfileStore:        profileStore,
 		StatusRVExpectation: expectations.NewResourceVersionExpectation(),
+		FeatureConfig:       featureConfig,
 	}).SetupWithManager(mgr, batchSandboxConcurrency); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "BatchSandbox")
 		os.Exit(1)
@@ -480,6 +503,7 @@ func main() {
 		ContainerdSocketPath:      containerdSocketPath,
 		CommitJobTimeout:          commitJobTimeout,
 		SnapshotRegistry:          snapshotRegistry,
+		SnapshotImageURITemplate:  snapshotImageURITemplate,
 		SnapshotRegistryInsecure:  snapshotRegistryInsecure,
 		SnapshotPushSecret:        snapshotPushSecret,
 		ImageCommitterPullSecret:  imageCommitterPullSecret,
@@ -516,10 +540,35 @@ func main() {
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
+	startErr := mgr.Start(ctrl.SetupSignalHandler())
+	// Final telemetry flush before exit.
+	flushCtx, cancel := context.WithTimeout(context.Background(), telemetryShutdownTimeout)
+	defer cancel()
+	if err := otelShutdown(flushCtx); err != nil {
+		setupLog.Error(err, "failed to flush OpenTelemetry data on shutdown")
+	}
+	if startErr != nil {
+		setupLog.Error(startErr, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// setupTelemetry initializes OTLP export from standard OTEL_* env vars;
+// failures degrade to the no-op provider.
+func setupTelemetry() func(context.Context) error {
+	enabled, shutdown, err := telemetry.Setup(context.Background())
+	if err != nil {
+		setupLog.Error(err, "failed to initialize OpenTelemetry export, continuing without it")
+		return func(context.Context) error { return nil }
+	}
+	if enabled {
+		endpoint := os.Getenv(telemetry.MetricsEndpointEnv)
+		if endpoint == "" {
+			endpoint = os.Getenv(telemetry.EndpointEnv)
+		}
+		setupLog.Info("OpenTelemetry export enabled", "endpoint", telemetry.SanitizeEndpoint(endpoint))
+	}
+	return shutdown
 }
 
 func loadImageCommitterPodTemplate(path string) (*corev1.PodTemplateSpec, error) {

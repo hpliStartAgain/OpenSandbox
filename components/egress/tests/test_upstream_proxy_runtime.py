@@ -30,17 +30,42 @@ from __future__ import annotations
 
 import http.client
 import http.server
+import json
 import os
 import select
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
 
 MITMDUMP = shutil.which("mitmdump")
+
+# Synthetic, non-sensitive credentials: they only prove that the vault-injected
+# business credential and the upstream proxy credential stay separated.
+VAULT_AUTH = "Bearer synthetic-vault-token"
+PROXY_AUTH = "Basic cHJveHktdGVzdDp0b2tlbg=="
+VAULT_PAYLOAD = json.dumps(
+    {
+        "revision": 1,
+        "bindings": [
+            {
+                "name": "compat-api",
+                "match": {
+                    "schemes": ["http"],
+                    "hosts": ["code.example.com"],
+                    "methods": ["GET"],
+                    "paths": ["/v1/secure"],
+                },
+                "headers": [{"name": "Authorization", "value": VAULT_AUTH}],
+            }
+        ],
+        "redactions": [VAULT_AUTH],
+    }
+).encode("utf-8")
 
 
 def _free_port() -> int:
@@ -52,9 +77,13 @@ def _free_port() -> int:
 class _ConnectProxy:
     """Minimal CONNECT proxy: records the CONNECT request, then tunnels bytes."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        routes: dict[tuple[str, int], tuple[str, int]] | None = None,
+    ) -> None:
         self.port = _free_port()
         self.requests: list[dict[str, str]] = []
+        self._routes = routes or {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
@@ -110,9 +139,13 @@ class _ConnectProxy:
                         "proxy-authorization": headers.get(
                             "proxy-authorization", ""
                         ),
+                        "authorization": headers.get("authorization", ""),
                     }
                 )
-            target = socket.create_connection((host.decode(), int(port)), timeout=10)
+            dial_host, dial_port = self._routes.get(
+                (host.decode(), int(port)), (host.decode(), int(port))
+            )
+            target = socket.create_connection((dial_host, dial_port), timeout=10)
             conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
             if rest:
                 target.sendall(rest)
@@ -214,6 +247,7 @@ class _TlsTargetServer:
 class _TargetServer:
     def __init__(self) -> None:
         self.hits = 0
+        self.requests: list[dict[str, object]] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
@@ -248,8 +282,22 @@ class _TargetServer:
                 if not chunk:
                     return
                 data += chunk
+            head = data.split(b"\r\n\r\n", 1)[0]
+            lines = head.split(b"\r\n")
+            headers: dict[str, str] = {}
+            for line in lines[1:]:
+                k, _, v = line.partition(b":")
+                headers[k.strip().lower().decode("latin1")] = (
+                    v.strip().decode("latin1")
+                )
             with self._lock:
                 self.hits += 1
+                self.requests.append(
+                    {
+                        "request-line": lines[0].decode("latin1"),
+                        "headers": headers,
+                    }
+                )
             body = b"upstream-proxy-e2e-ok"
             conn.sendall(
                 b"HTTP/1.1 200 OK\r\ncontent-length: "
@@ -268,10 +316,99 @@ class _TargetServer:
             self._sock.close()
 
 
+class _VaultUnixServer:
+    """Minimal HTTP server on a Unix socket serving the active vault JSON."""
+
+    def __init__(self, socket_path: str) -> None:
+        self.socket_path = socket_path
+        self._sock: socket.socket | None = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._mode = "normal"
+
+    def start(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(self.socket_path)
+        sock.listen(16)
+        self._sock = sock
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        assert self._sock is not None
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn: socket.socket) -> None:
+        try:
+            conn.settimeout(5)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+            with self._lock:
+                mode = self._mode
+            if mode == "server-error":
+                body = b"vault-private-diagnostic"
+                conn.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"content-length: "
+                    + str(len(body)).encode("ascii")
+                    + b"\r\n\r\n"
+                    + body
+                )
+                return
+            if b'\r\nif-none-match: "compat-v1"\r\n' in data.lower():
+                conn.sendall(
+                    b"HTTP/1.1 304 Not Modified\r\n"
+                    b'etag: "compat-v1"\r\n'
+                    b"content-length: 0\r\n\r\n"
+                )
+                return
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b'etag: "compat-v1"\r\n'
+                b"content-type: application/json\r\n"
+                b"content-length: "
+                + str(len(VAULT_PAYLOAD)).encode("ascii")
+                + b"\r\n\r\n"
+                + VAULT_PAYLOAD
+            )
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def set_mode(self, mode: str) -> None:
+        with self._lock:
+            self._mode = mode
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            os.unlink(self.socket_path)
+        except OSError:
+            pass
+        if self._sock is not None:
+            self._sock.close()
+
+
 def _start_mitmdump(
-    port: int, env_extra: dict[str, str], *extra_args: str
+    port: int,
+    env_extra: dict[str, str],
+    *extra_args: str,
+    load_system_addon: bool = False,
 ) -> tuple[subprocess.Popen, list[str]]:
-    script = Path(__file__).parents[1] / "mitmscripts" / "upstream_proxy.py"
+    scripts_dir = Path(__file__).parents[1] / "mitmscripts"
+    script_args: list[str] = []
+    if load_system_addon:
+        script_args.extend(["-s", str(scripts_dir / "system.py")])
+    script_args.extend(["-s", str(scripts_dir / "upstream_proxy.py")])
     proc = subprocess.Popen(
         [
             MITMDUMP,
@@ -279,8 +416,7 @@ def _start_mitmdump(
             "127.0.0.1",
             "--listen-port",
             str(port),
-            "-s",
-            str(script),
+            *script_args,
             "--set",
             "connection_strategy=lazy",
             "--set",
@@ -323,6 +459,18 @@ def _stop(proc: subprocess.Popen) -> None:
         proc.stdout.close()
 
 
+def _proxy_get_host(
+    port: int, url: str, host: str
+) -> tuple[int, bytes]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    try:
+        conn.request("GET", url, headers={"Host": host})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
 def _proxy_get(port: int, target: str) -> tuple[int, bytes]:
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     try:
@@ -337,15 +485,25 @@ def _proxy_get(port: int, target: str) -> tuple[int, bytes]:
 class UpstreamProxyRuntimeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls._proxy = _ConnectProxy()
-        cls._proxy.start()
         cls._target = _TargetServer()
         cls._target.start()
+        # The CONNECT dial is routed: lets tests keep a business FQDN in the
+        # CONNECT authority while dialing the local target.
+        cls._proxy = _ConnectProxy(
+            routes={("code.example.com", 80): ("127.0.0.1", cls._target.port)}
+        )
+        cls._proxy.start()
+        cls._tmp = tempfile.TemporaryDirectory(prefix="egress-upstream-test-")
+        cls._vault_path = str(Path(cls._tmp.name) / "vault.sock")
+        cls._vault = _VaultUnixServer(cls._vault_path)
+        cls._vault.start()
 
     @classmethod
     def tearDownClass(cls) -> None:
+        cls._vault.stop()
         cls._proxy.stop()
         cls._target.stop()
+        cls._tmp.cleanup()
 
     def _target_url(self) -> str:
         return f"http://127.0.0.1:{self._target.port}/"
@@ -377,12 +535,16 @@ class UpstreamProxyRuntimeTest(unittest.TestCase):
         # A hostname proxy endpoint must stay a hostname in server.address
         # while the dial resolves it: the server_connect guard compares
         # address[0] to the configured host, so this only passes if mitmproxy
-        # keeps "localhost" rather than the resolved IP.
+        # keeps the configured name rather than the resolved IP. The endpoint
+        # must be a dotted domain — dotless names (localhost included) are
+        # rejected at load because they resolve differently through resolver
+        # search lists — and it must dial the local relay, so use the public
+        # sslip.io wildcard that maps back to 127.0.0.1.
         port = _free_port()
         proc, log = _start_mitmdump(
             port,
             {
-                "OPENSANDBOX_EGRESS_UPSTREAM_PROXY": f"http://localhost:{self._proxy.port}",
+                "OPENSANDBOX_EGRESS_UPSTREAM_PROXY": f"http://127.0.0.1.sslip.io:{self._proxy.port}",
             },
         )
         try:
@@ -447,7 +609,6 @@ class UpstreamProxyRuntimeTest(unittest.TestCase):
         # TLS intercepted inside a client CONNECT tunnel: the inner flow must
         # still go through the single upstream CONNECT, not a second dial.
         import ssl
-        import tempfile
 
         openssl = shutil.which("openssl")
         if openssl is None:
@@ -458,8 +619,8 @@ class UpstreamProxyRuntimeTest(unittest.TestCase):
                 [
                     openssl, "req", "-x509", "-newkey", "rsa:2048",
                     "-keyout", str(key), "-out", str(cert),
-                    "-days", "1", "-nodes", "-subj", "/CN=localhost",
-                    "-addext", "subjectAltName=IP:127.0.0.1",
+                    "-days", "1", "-nodes", "-subj", "/CN=example.test",
+                    "-addext", "subjectAltName=DNS:example.test",
                 ],
                 capture_output=True,
             )
@@ -474,9 +635,9 @@ class UpstreamProxyRuntimeTest(unittest.TestCase):
                     {
                         "OPENSANDBOX_EGRESS_UPSTREAM_PROXY": f"http://127.0.0.1:{self._proxy.port}",
                     },
-                    # the TLS target is self-signed; we are testing chaining,
-                    # not upstream verification
-                    "--set", "ssl_insecure=true",
+                    # Strict upstream verification: the self-signed target cert
+                    # is trusted only via the extra CA bundle, not ssl_insecure.
+                    "--set", f"ssl_verify_upstream_trusted_ca={cert}",
                 )
                 try:
                     before = len(self._proxy.requests)
@@ -554,6 +715,85 @@ class UpstreamProxyRuntimeTest(unittest.TestCase):
                 f"127.0.0.1:{self._target.port}", new[0]["authority"]
             )
         finally:
+            _stop(proc)
+
+    def test_credential_vault_and_proxy_auth_remain_separated(self) -> None:
+        # system.py (credential vault) runs before upstream_proxy.py: the
+        # vault-injected business Authorization reaches the target, while the
+        # upstream Proxy-Authorization stays on the outer CONNECT only.
+        port = _free_port()
+        proc, log = _start_mitmdump(
+            port,
+            {
+                "OPENSANDBOX_CREDENTIAL_PROXY_SOCKET": self._vault_path,
+                "OPENSANDBOX_EGRESS_UPSTREAM_PROXY": f"http://127.0.0.1:{self._proxy.port}",
+                "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH": PROXY_AUTH,
+            },
+            load_system_addon=True,
+        )
+        try:
+            proxy_before = len(self._proxy.requests)
+            with self._target._lock:
+                target_before = len(self._target.requests)
+            status, body = _proxy_get_host(
+                port, "http://code.example.com/v1/secure", "code.example.com"
+            )
+            self.assertEqual(200, status, log)
+            self.assertEqual(b"upstream-proxy-e2e-ok", body)
+
+            new_connects = self._proxy.requests[proxy_before:]
+            self.assertEqual(1, len(new_connects), log)
+            self.assertEqual("code.example.com:80", new_connects[0]["authority"])
+            self.assertEqual(PROXY_AUTH, new_connects[0]["proxy-authorization"])
+            self.assertEqual("", new_connects[0]["authorization"])
+
+            with self._target._lock:
+                new_requests = self._target.requests[target_before:]
+            self.assertEqual(1, len(new_requests), log)
+            headers = new_requests[0]["headers"]
+            assert isinstance(headers, dict)
+            self.assertEqual(VAULT_AUTH, headers.get("authorization"))
+            self.assertNotIn("proxy-authorization", headers)
+
+            merged = "\n".join(log)
+            self.assertNotIn(VAULT_AUTH, merged)
+            self.assertNotIn(PROXY_AUTH, merged)
+        finally:
+            _stop(proc)
+
+    def test_credential_vault_lookup_failure_stays_fail_closed_before_connect(
+        self,
+    ) -> None:
+        # A vault lookup failure must deny the request in system.py before any
+        # upstream CONNECT is attempted.
+        self._vault.set_mode("server-error")
+        port = _free_port()
+        proc, log = _start_mitmdump(
+            port,
+            {
+                "OPENSANDBOX_CREDENTIAL_PROXY_SOCKET": self._vault_path,
+                "OPENSANDBOX_EGRESS_UPSTREAM_PROXY": f"http://127.0.0.1:{self._proxy.port}",
+            },
+            load_system_addon=True,
+        )
+        try:
+            proxy_before = len(self._proxy.requests)
+            with self._target._lock:
+                target_before = self._target.hits
+            status, body = _proxy_get_host(
+                port, "http://code.example.com/v1/secure", "code.example.com"
+            )
+            self.assertEqual(503, status, log)
+            self.assertEqual(b"credential proxy unavailable\n", body)
+            self.assertEqual(proxy_before, len(self._proxy.requests), log)
+            with self._target._lock:
+                self.assertEqual(target_before, self._target.hits)
+            merged = "\n".join(log)
+            self.assertNotIn("vault-private-diagnostic", merged)
+            self.assertNotIn(VAULT_AUTH, merged)
+            self.assertNotIn(PROXY_AUTH, merged)
+        finally:
+            self._vault.set_mode("normal")
             _stop(proc)
 
 

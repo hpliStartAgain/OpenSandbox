@@ -30,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alibaba/opensandbox/internal/safego"
 	"github.com/google/uuid"
 
 	"github.com/alibaba/opensandbox/execd/pkg/isolation"
@@ -248,6 +249,8 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 		return fmt.Errorf("create script file: %w", err)
 	}
 	scriptPath := scriptFile.Name()
+	// The script embeds the session environment; do not leave it behind.
+	defer os.Remove(scriptPath)
 	if _, err := scriptFile.WriteString(script); err != nil {
 		_ = scriptFile.Close()
 		return fmt.Errorf("write script file: %w", err)
@@ -283,6 +286,9 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 	defer stdoutR.Close()
 	defer s.untrackCurrentProcess()
 	s.trackCurrentProcess(cmd.Process.Pid)
+
+	stopGroupKill := killProcessGroupOnDone(ctx, cmd.Process.Pid)
+	defer stopGroupKill()
 
 	scanner := bufio.NewScanner(stdoutR)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
@@ -378,6 +384,28 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 	}
 
 	return nil
+}
+
+// killProcessGroupOnDone kills pid's process group, as close() does, if ctx is
+// done before stop is called. exec.CommandContext only kills the leader, and
+// children holding the output pipe would keep the run blocked until they exit.
+func killProcessGroupOnDone(ctx context.Context, pid int) (stop func()) {
+	done := make(chan struct{})
+	safego.Go(func() {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			// Re-check done: the run may be returning concurrently, after
+			// which -pid may name a recycled process group.
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+		}
+	})
+	return func() { close(done) }
 }
 
 func buildWrappedScript(command string, env map[string]string, cwd string) string {

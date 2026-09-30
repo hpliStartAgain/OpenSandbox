@@ -48,7 +48,8 @@ version: '3.8'
 
 services:
   opensandbox-server:
-    image: opensandbox/server:latest
+    # Includes configurable proxy resolution for this Compose/bridge topology.
+    image: opensandbox/server:release-1.1.0
     container_name: opensandbox-server
     networks:
       - opensandbox-net

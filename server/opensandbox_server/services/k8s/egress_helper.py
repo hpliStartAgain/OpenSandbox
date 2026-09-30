@@ -26,6 +26,9 @@ from typing import Any, Dict, List, Optional
 from opensandbox_server.services.constants import (
     EGRESS_MODE_ENV,
     EGRESS_RULES_ENV,
+    EGRESS_UPSTREAM_EXTRA_CA_PATH,
+    EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+    EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
     OTEL_EXPORTER_OTLP_ENDPOINT,
     OPEN_SANDBOX_EGRESS_AUTH_HEADER,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
@@ -83,6 +86,7 @@ def apply_egress_to_spec(
     containers: List[Dict[str, Any]],
     egress_settings: Optional[EgressWorkloadSettings] = None,
     sandbox_id: Optional[str] = None,
+    pod_volumes: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """
     Append the egress sidecar to ``containers``. When ``egress.disable_ipv6`` is enabled,
@@ -90,6 +94,9 @@ def apply_egress_to_spec(
 
     ``sandbox_id`` is injected as ``OPENSANDBOX_EGRESS_SANDBOX_ID`` when provided.
     ``egress.otlp_endpoint`` is injected as ``OTEL_EXPORTER_OTLP_ENDPOINT`` when configured.
+    When ``egress_settings.upstream_proxy.ca_secret_name`` is set, the CA Secret is
+    projected onto ``pod_volumes`` (required, to avoid a dangling mount) and
+    mounted read-only into the egress sidecar only.
     """
     if egress_settings is None:
         return
@@ -114,6 +121,27 @@ def apply_egress_to_spec(
         env.append({"name": OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT, "value": "true"})
     if egress_settings.auth_token:
         env.append({"name": OPENSANDBOX_EGRESS_TOKEN, "value": egress_settings.auth_token})
+    upstream_proxy = egress_settings.upstream_proxy
+    ca_secret_name = upstream_proxy.ca_secret_name if upstream_proxy else None
+    if ca_secret_name is not None:
+        if pod_volumes is None:
+            raise ValueError(
+                "pod_volumes is required for upstream proxy CA Secret mounting"
+            )
+        pod_volumes.append(
+            {
+                "name": EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
+                "secret": {
+                    "secretName": ca_secret_name,
+                    "items": [
+                        {
+                            "key": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+                            "path": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+                        }
+                    ],
+                },
+            }
+        )
     if egress_settings.env:
         for name, value in egress_settings.env.items():
             if (
@@ -146,6 +174,15 @@ def apply_egress_to_spec(
             "mountPath": OPENSANDBOX_RUNTIME_MOUNT_PATH,
         }
     ]
+    if ca_secret_name is not None:
+        sidecar["volumeMounts"].append(
+            {
+                "name": EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
+                "mountPath": EGRESS_UPSTREAM_EXTRA_CA_PATH,
+                "subPath": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+                "readOnly": True,
+            }
+        )
     resources = {}
     if egress_settings.resource_requests:
         resources["requests"] = egress_settings.resource_requests

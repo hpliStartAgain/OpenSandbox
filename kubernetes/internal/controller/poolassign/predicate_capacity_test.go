@@ -111,7 +111,7 @@ func TestCapacityPredicate(t *testing.T) {
 				},
 				Status: sandboxv1alpha1.PoolStatus{Allocated: tt.allocated},
 			}
-			got := p.predicate(ctx, sbx, pool)
+			got := p.Predicate(ctx, sbx, pool)
 			if got != tt.expect {
 				t.Errorf("capacityPredicate.predicate() = %v, want %v (poolMax=%d, allocated=%d, replicas=%v)",
 					got, tt.expect, tt.poolMax, tt.allocated, tt.replicas)

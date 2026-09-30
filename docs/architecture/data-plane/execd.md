@@ -1,15 +1,17 @@
 ---
 title: Execd
-description: The daemon inside every OpenSandbox sandbox — one entry point for commands, code execution, terminals, files, and metrics, with layered isolation built in.
+description: The reference daemon for OpenSandbox's in-sandbox execution API — commands, code execution, terminals, files, and metrics, with layered isolation built in.
 ---
 
 # Execd
 
-Execd is the daemon that runs inside every OpenSandbox sandbox. It is the only process clients ever talk to: SDKs, the `osb` CLI, MCP agents, and the lifecycle server all reach your sandbox through its API. You rarely see it — but everything you do with a sandbox, you do through it.
+Execd is the reference daemon for OpenSandbox's in-sandbox execution API. Sandbox SDK command and file operations use this API; sandbox creation and lifecycle management use the separate lifecycle server. Clients can also access workload-specific services through resolved sandbox endpoints, using those services' own protocols and clients.
+
+For example, the [AIO Sandbox example](/examples/aio-sandbox) resolves port `8080` and uses `AioSandboxClient` for the image's shell, file, and browser API. Those requests are not execd command or file operations, even when an execd reverse proxy carries the traffic. See [Implementation compatibility](/api/implementation-compatibility) for the published contracts, current SDK endpoint assumptions, and backend-dependent features.
 
 ![execd overview](../../public/images/execd-overview.svg)
 
-When the platform creates a sandbox it injects execd next to your entrypoint — as a staged binary in Docker, an init container in Kubernetes, or a baked-in part of a Fast Sandbox template image. Execd serves one HTTP API (default port `44772`), authenticated with a shared access token the platform manages for you. The full contract is public: [execd API spec](/api/).
+The reference platform provisions execd next to your entrypoint — as a staged binary in Docker, an init container in Kubernetes, or a baked-in part of a Fast Sandbox template image. Execd serves an HTTP API (default port `44772`); when access-token protection is enabled, clients forward the token supplied by endpoint resolution. The published [execd API spec](https://github.com/opensandbox-group/OpenSandbox/blob/main/specs/execd-api.yaml) describes the execution contract; some reference-implementation extensions, including PTY routes, are not yet covered by it.
 
 Execd also fronts a small reverse proxy (`/proxy/{port}`), so one exposed host port can reach every port inside the sandbox — see [Single-Host Network (Docker)](/architecture/network/single-host-network).
 
@@ -20,9 +22,27 @@ Execd also fronts a small reverse proxy (`/proxy/{port}`), so one exposed host p
 | Command execution | Run any command with live streamed output; foreground or background with status polling and log retrieval |
 | Code execution | Jupyter-backed code contexts and kernels — the foundation of the Code Interpreter SDKs |
 | Interactive terminals | A real terminal (PTY) over WebSocket, shareable with read-only viewers |
-| Files and directories | Upload, download, list, move, remove — the sandbox filesystem is fully scriptable |
+| Files and directories | Upload, download, list, search, move, chmod, remove, in-place content replace — the sandbox filesystem is fully scriptable |
 | Isolated sessions | Run a shell inside a private namespace for untrusted or exploratory work |
 | Metrics | Sandbox CPU and memory as point-in-time snapshots or a live stream |
+
+## API surface
+
+Everything execd exposes lives under one API. When the platform configures an access token, every endpoint below requires it in the `X-EXECD-ACCESS-TOKEN` header — only liveness and readiness are always open. The contract lives in [specs/execd-api.yaml](https://github.com/opensandbox-group/OpenSandbox/blob/main/specs/execd-api.yaml).
+
+![execd request pipeline](../../public/images/execd-request-pipeline.svg)
+
+| Area | Endpoints | Notes |
+|---|---|---|
+| Health | `GET /ping`, `GET /ready` | Liveness and readiness; no token required |
+| Commands | `/command` | Run foreground or background, interrupt, poll status, fetch logs |
+| Shell sessions | `/session` | Persistent stateful shell across calls |
+| Code | `/code`, `/code/contexts` | Contexts and Jupyter-backed execution |
+| Terminals | `/pty` | PTY sessions with a WebSocket attach point |
+| Files | `/files`, `/directories` | The whole filesystem surface |
+| Isolated sessions | `/v1/isolated/*` | Private-namespace shells with their own file operations |
+| Metrics | `/metrics`, `/metrics/watch` | Snapshot and live stream |
+| Reverse proxy | `/proxy/{port}` | Reach any sandbox port through execd |
 
 ## Command execution
 
@@ -54,7 +74,7 @@ The sharing model is deliberate: exactly one **holder** owns the keyboard, and a
 
 ## Files and directories
 
-One API covers the whole filesystem tree: stream files in and out, list and search directories, move and remove paths. The file APIs in every sandbox SDK are a thin wrapper over these endpoints.
+One API covers the whole filesystem tree: stream files in and out, list and search directories, inspect and change permissions, replace file contents, move and remove paths. The file APIs in every sandbox SDK are a thin wrapper over these endpoints.
 
 ## Isolated sessions
 
@@ -75,7 +95,7 @@ Execd applies defense in depth to everything a sandbox runs:
 - **Sandbox boundary** — resource limits, identity, and the isolation runtime (runc container, gVisor, Kata, Firecracker microVM) are chosen at create time (see the [Secure Container guide](/guides/secure-container)).
 - **Hardening floor** — when the operator enables it, every user process is launched through a native launcher that drops capabilities, sets `no_new_privs`, installs a syscall denylist, and confines filesystem writes with Landlock.
 - **Isolated sessions** — the per-execution namespace above, for work that needs its own boundary.
-- **Optional eBPF audit** — records process exec, network connect, and privilege changes, scoped to the sandbox's own cgroup.
+- **Optional eBPF audit** — records process exec, network connect, and privilege changes, scoped to the sandbox's own cgroup. Ships as a separate `execd-ebpf` build variant, not in the default image.
 
 Each layer reports its state — active, degraded, or unsupported — so clients can verify what is actually enforced rather than assume. One boundary to keep in mind: execd's lifecycle hooks (setup commands the platform configures) run as trusted code inside the sandbox; they are convenience, not a security control.
 
@@ -85,7 +105,9 @@ Execd can act as the sandbox's init process. It reaps orphaned children, forward
 
 ## A fresh identity per allocation
 
-Sandboxes can be pre-warmed in pools and reused across allocations. Execd makes this safe: the platform delivers a per-allocation binding — sandbox ID, environment, access token, lifecycle hooks — at assignment time, and execd applies it atomically before the API opens. Environment variables, tokens, and telemetry attribution never leak between the sandbox that came before and yours.
+Sandboxes can be pre-warmed in pools and reused across allocations. Execd makes this safe: the platform delivers a per-allocation binding — sandbox ID, environment, access token, lifecycle hooks — at assignment time, and execd applies it atomically before the API opens. While a warm sandbox waits for its binding (and until startup completes), every business endpoint answers `503`; only `GET /ping` and `GET /ready` respond. Environment variables, tokens, and telemetry attribution never leak between the sandbox that came before and yours.
+
+![execd allocation binding flow](../../public/images/execd-binding-flow.svg)
 
 ## Observability
 

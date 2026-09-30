@@ -15,6 +15,7 @@
 package mitmproxy
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -278,4 +279,21 @@ func TestCredentialProxyMessageRejectsNonProxyLines(t *testing.T) {
 	require.False(t, ok)
 	_, ok = credentialProxyMessage("")
 	require.False(t, ok)
+}
+
+func TestBuildMitmdumpArgsTrustDirAndExtraCABothSet(t *testing.T) {
+	t.Setenv("OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_TRUST_DIR", "/etc/ssl/upstream")
+	t.Setenv("OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA", "/etc/ssl/certs/opensandbox-upstream-extra-ca.pem")
+	args := buildMitmdumpArgs(Config{ListenPort: 18081})
+	joined := strings.Join(args, "\x00")
+	require.Contains(t, joined, "--set\x00ssl_verify_upstream_trusted_confdir=/etc/ssl/upstream")
+	require.Contains(t, joined, "--set\x00ssl_verify_upstream_trusted_ca=/etc/ssl/certs/opensandbox-upstream-extra-ca.pem")
+}
+
+func TestBuildMitmdumpArgsExtraCAWhitespaceOnlyOmitted(t *testing.T) {
+	t.Setenv("OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA", "   ")
+	args := buildMitmdumpArgs(Config{ListenPort: 18081})
+	for _, a := range args {
+		require.NotContains(t, a, "ssl_verify_upstream_trusted_ca")
+	}
 }

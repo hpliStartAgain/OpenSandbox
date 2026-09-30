@@ -241,7 +241,7 @@ Configures the **egress sidecar** image and enforcement mode. The server only at
 | `readiness_timeout_seconds` | float | `30.0` | **Docker only.** Maximum time to wait for the egress sidecar health endpoint to become ready. Must be greater than `0`. |
 | `requests` | map string → string \| omitted | `null` | **Kubernetes only.** Resource requests for the generated egress sidecar. |
 | `limits` | map string → string \| omitted | `null` | **Kubernetes only.** Resource limits for the generated egress sidecar. |
-| `upstream_proxy` | table \| omitted | `null` | `[egress.upstream_proxy]` sub-table (`url`, optional `authorization`) chaining mitmproxy-handled egress through an upstream HTTP(S) CONNECT proxy. Requires `mode = "dns+nft"`. See [Chained upstream proxy](#chained-upstream-proxy). |
+| `upstream_proxy` | table \| omitted | `null` | `[egress.upstream_proxy]` sub-table (`url`, optional `authorization`, Docker-only `ca_cert_path`, Kubernetes-only `ca_secret_name`) chaining mitmproxy-handled egress through an upstream HTTP(S) CONNECT proxy. Requires `mode = "dns+nft"`. See [Chained upstream proxy](#chained-upstream-proxy). |
 
 ```toml
 [egress]
@@ -275,6 +275,11 @@ mode = "dns+nft"
 url = "http://proxy.example.com:3128"
 # Optional: complete Proxy-Authorization header value for the upstream CONNECT.
 # authorization = "Basic <base64>"
+# Optional: extra CA bundle trusted in addition to the system roots.
+# Docker: absolute PEM path on the Docker daemon host.
+# ca_cert_path = "/etc/ssl/private-ca/upstream-proxy-ca.pem"
+# Kubernetes: Secret holding the bundle under the fixed key "ca.crt".
+# ca_secret_name = "corp-proxy-ca"
 ```
 
 When configured, the server injects `OPENSANDBOX_EGRESS_UPSTREAM_PROXY` (and `OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH` when `authorization` is set) into every egress sidecar, chaining all mitmproxy-handled egress through the proxy. Notes:
@@ -288,8 +293,14 @@ When configured, the server injects `OPENSANDBOX_EGRESS_UPSTREAM_PROXY` (and `OP
 - `url` must be `http://host[:port]` or `https://host[:port]` (IPv6 literals allowed); credentials in the URL, query, fragment, and non-root paths are rejected at config load, as are control characters and characters outside the URL host charset (e.g. `\`, space, `|`). `%` is allowed only inside a bracketed IPv6 zone ID. Use `authorization` for credentials.
 - `authorization` is injected as a literal env var into the sidecar — visible via `docker inspect` and the Pod spec, same as `OPENSANDBOX_EGRESS_TOKEN`. Protect the config file.
 - Config changes apply to **newly created** sandboxes only; existing sidecars are unaffected.
-- For an `https://` proxy, the proxy certificate is verified against the egress image's system trust store — a private CA currently requires a custom egress image.
+- `ca_cert_path` (**Docker only**) is an absolute POSIX path on the Docker daemon host (which may be remote — it is not checked locally) pointing to a PEM bundle with one or more CA certificates; the file is bind-mounted read-only into the egress sidecar only. `:` is rejected because it collides with bind syntax.
+- `ca_secret_name` (**Kubernetes only**) names a Secret holding the PEM bundle under the fixed key `ca.crt`; the Secret is projected as a Pod volume and mounted read-only into the egress sidecar only (other containers never see it).
+- The CA fields are runtime-specific: setting `ca_secret_name` with `runtime.type = "docker"`, or `ca_cert_path` with `runtime.type = "kubernetes"`, fails at config load rather than being silently ignored.
+- A missing Secret/key, unreadable path, or invalid PEM fails closed through runtime/sidecar behavior (the Pod volume or Docker bind fails to set up, or mitmproxy rejects the file) — traffic is never silently chained with reduced verification.
+- The extra CA **augments** the system trust store — it does not replace `/etc/ssl/certs` — and applies globally to **all** mitmproxy upstream TLS verification (the HTTPS proxy connection and intercepted origins), not only the proxy hop.
+- Without a CA field, an `https://` proxy's certificate is verified against the egress image's system trust store, so a private CA needs one of the fields above (or a custom egress image).
 - Data-plane behavior (fail-closed direct-dial guard, UID+IP+port-scoped nft reachability, infra DNS for hostname endpoints) is documented in [`components/egress/docs/mitmproxy-transparent.md`](../components/egress/docs/mitmproxy-transparent.md#6-chain-through-an-upstream-proxy-corporateforward-egress).
+- For runtime compatibility, rotation, verification, and troubleshooting, see [Chained Upstream Proxy Operations](../docs/guides/egress-upstream-proxy.md).
 
 ### IPv6 and egress
 

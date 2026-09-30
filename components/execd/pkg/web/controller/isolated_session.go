@@ -86,10 +86,18 @@ func (c *IsolatedSessionController) Create() {
 		})
 	}
 
+	overlays := make([]runtime.IsolatedOverlayOptions, 0, len(req.Overlays)+1)
+	for _, ov := range req.EffectiveOverlays() {
+		overlays = append(overlays, runtime.IsolatedOverlayOptions{
+			Path:    ov.Path,
+			Mode:    ov.Mode,
+			Persist: ov.Persist,
+		})
+	}
+
 	opts := &runtime.IsolatedSessionOptions{
 		Profile:            req.Profile,
-		WorkspacePath:      req.Workspace.Path,
-		WorkspaceMode:      req.Workspace.Mode,
+		Overlays:           overlays,
 		ExtraWritable:      req.ExtraWritable,
 		Binds:              binds,
 		ShareNet:           req.ShareNet,
@@ -127,6 +135,7 @@ func classifyIsolatedCreateError(err error) (int, model.ErrorCode) {
 		strings.Contains(err.Error(), "unknown isolation profile") ||
 		strings.Contains(err.Error(), "must be an existing path") ||
 		strings.Contains(err.Error(), "must be an absolute path") ||
+		strings.Contains(err.Error(), "duplicate overlay path") ||
 		strings.Contains(err.Error(), "source is required") {
 		return http.StatusBadRequest, model.ErrorCodeRuntimeError
 	}
@@ -164,10 +173,22 @@ func (c *IsolatedSessionController) Get() {
 		Gid:           state.Gid,
 		UidMode:       state.UidMode,
 	}
-	if state.WorkspacePath != "" {
-		resp.Workspace = &model.WorkspaceSpec{
-			Path: state.WorkspacePath,
-			Mode: state.WorkspaceMode,
+	if len(state.Overlays) > 0 {
+		resp.Overlays = make([]model.OverlaySpec, 0, len(state.Overlays))
+		for _, ov := range state.Overlays {
+			spec := model.OverlaySpec{Path: ov.Path, Mode: ov.Mode}
+			if ov.Persist != nil {
+				persist := *ov.Persist
+				spec.Persist = &persist
+			}
+			resp.Overlays = append(resp.Overlays, spec)
+		}
+		// The legacy workspace echo applies to single-overlay sessions only.
+		if len(state.Overlays) == 1 {
+			resp.Workspace = &model.WorkspaceSpec{
+				Path: state.Overlays[0].Path,
+				Mode: state.Overlays[0].Mode,
+			}
 		}
 	}
 	if len(state.Binds) > 0 {

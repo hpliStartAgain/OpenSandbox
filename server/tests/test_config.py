@@ -1479,6 +1479,237 @@ def test_load_config_rejects_upstream_proxy_without_dns_nft(
         config_module.load_config(config_path)
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/etc/ssl/certs/upstream-ca.pem",
+        " /opt/ca/proxy.pem ",
+        "/var/lib/ca.pem",
+    ],
+)
+def test_egress_upstream_proxy_ca_cert_path_valid(path):
+    cfg = EgressUpstreamProxyConfig(
+        url="http://proxy.local:3128", ca_cert_path=path
+    )
+    assert cfg.ca_cert_path == path.strip()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "   ",
+        "relative/ca.pem",
+        "./ca.pem",
+        "ca.pem",
+        "C:\\ca\\proxy.pem",
+        "/has:colon/ca.pem",
+        "/bad/\x00ca.pem",
+    ],
+)
+def test_egress_upstream_proxy_ca_cert_path_invalid(path):
+    with pytest.raises(ValidationError):
+        EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128", ca_cert_path=path
+        )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "corp-proxy-ca",
+        " proxy-ca.ns1 ",
+        "a",
+        "ca-bundle.example.org",
+        "ca-" + "b" * 60,
+    ],
+)
+def test_egress_upstream_proxy_ca_secret_name_valid(name):
+    cfg = EgressUpstreamProxyConfig(
+        url="http://proxy.local:3128", ca_secret_name=name
+    )
+    assert cfg.ca_secret_name == name.strip()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        "   ",
+        "UPPER_CASE",
+        "has_underscore",
+        "-leading-dash",
+        "trailing-dash-",
+        "a..b",
+        "a" * 64,
+        "a" * 254,
+    ],
+)
+def test_egress_upstream_proxy_ca_secret_name_invalid(name):
+    with pytest.raises(ValidationError):
+        EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128", ca_secret_name=name
+        )
+
+
+def test_egress_upstream_proxy_ca_fields_default_to_none():
+    cfg = EgressUpstreamProxyConfig(url="http://proxy.local:3128")
+    assert cfg.ca_cert_path is None
+    assert cfg.ca_secret_name is None
+
+
+def test_load_config_with_egress_upstream_proxy_ca_cert_path_docker(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "https://proxy.local:8443"
+            ca_cert_path = "/etc/ssl/private-ca/upstream.pem"
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.egress is not None
+    assert loaded.egress.upstream_proxy is not None
+    assert (
+        loaded.egress.upstream_proxy.ca_cert_path
+        == "/etc/ssl/private-ca/upstream.pem"
+    )
+
+
+def test_load_config_with_egress_upstream_proxy_ca_secret_name_kubernetes(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "kubernetes"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "https://proxy.local:8443"
+            ca_secret_name = "corp-proxy-ca"
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.egress is not None
+    assert loaded.egress.upstream_proxy is not None
+    assert loaded.egress.upstream_proxy.ca_secret_name == "corp-proxy-ca"
+
+
+def test_load_config_rejects_ca_secret_name_on_docker(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "https://proxy.local:8443"
+            ca_secret_name = "corp-proxy-ca"
+            """
+        )
+    )
+
+    with pytest.raises(
+        ValidationError, match="ca_secret_name requires runtime.type"
+    ):
+        config_module.load_config(config_path)
+
+
+def test_load_config_rejects_ca_cert_path_on_kubernetes(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "kubernetes"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "https://proxy.local:8443"
+            ca_cert_path = "/etc/ssl/private-ca/upstream.pem"
+            """
+        )
+    )
+
+    with pytest.raises(
+        ValidationError, match="ca_cert_path requires runtime.type"
+    ):
+        config_module.load_config(config_path)
+
+
+def test_upstream_proxy_egress_env_emits_extra_ca_only_when_ca_source_set():
+    from opensandbox_server.services.helpers import (
+        upstream_proxy_egress_env,
+    )
+
+    no_ca = upstream_proxy_egress_env(
+        EgressUpstreamProxyConfig(url="http://proxy.local:3128")
+    )
+    assert "OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA" not in no_ca
+
+    with_path = upstream_proxy_egress_env(
+        EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128",
+            ca_cert_path="/etc/ssl/certs/ca.pem",
+        )
+    )
+    assert (
+        with_path["OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA"]
+        == "/etc/ssl/certs/opensandbox-upstream-extra-ca.pem"
+    )
+
+    with_secret = upstream_proxy_egress_env(
+        EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128",
+            ca_secret_name="corp-proxy-ca",
+        )
+    )
+    assert (
+        with_secret["OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA"]
+        == "/etc/ssl/certs/opensandbox-upstream-extra-ca.pem"
+    )
+
+
 def test_log_config_defaults():
     cfg = LogConfig()
     assert cfg.level == "INFO"

@@ -243,6 +243,9 @@ func buildMitmdumpArgs(cfg Config) []string {
 	if trustDir := strings.TrimSpace(os.Getenv(constants.EnvMitmproxyUpstreamTrustDir)); trustDir != "" {
 		args = append(args, "--set", "ssl_verify_upstream_trusted_confdir="+trustDir)
 	}
+	if extraCA := strings.TrimSpace(os.Getenv(constants.EnvMitmproxyUpstreamExtraCA)); extraCA != "" {
+		args = append(args, "--set", "ssl_verify_upstream_trusted_ca="+extraCA)
+	}
 
 	if constants.IsTruthy(os.Getenv(constants.EnvMitmproxySslInsecure)) {
 		args = append(args, "--set", "ssl_insecure=true")

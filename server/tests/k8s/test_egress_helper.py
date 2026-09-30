@@ -28,12 +28,16 @@ from opensandbox_server.config import (
 )
 from opensandbox_server.services.constants import (
     EGRESS_MODE_ENV,
+    EGRESS_UPSTREAM_EXTRA_CA_PATH,
+    EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+    EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
     EGRESS_RULES_ENV,
     OTEL_EXPORTER_OTLP_ENDPOINT,
     OPENSANDBOX_EGRESS_UPSTREAM_PROXY,
     OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH,
     OPEN_SANDBOX_EGRESS_AUTH_HEADER,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
+    OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA,
     OPENSANDBOX_EGRESS_SANDBOX_ID,
     OPENSANDBOX_EGRESS_TOKEN,
     OPENSANDBOX_RUNTIME_MOUNT_PATH,
@@ -653,6 +657,129 @@ class TestApplyEgressToSpec:
         assert OPENSANDBOX_EGRESS_UPSTREAM_PROXY not in env_names
         assert OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH not in env_names
 
+    def test_upstream_proxy_ca_secret_mounts_only_on_egress(self):
+        containers: list = [{"name": "sandbox", "env": [], "volumeMounts": []}]
+        pod_volumes: list = []
+        network_policy = NetworkPolicy(
+            default_action="deny",
+            egress=[NetworkRule(action="allow", target="example.com")],
+        )
+
+        apply_egress_to_spec(
+            containers,
+            _egress_settings(
+                network_policy,
+                upstream_proxy=EgressUpstreamProxyConfig(
+                    url="https://proxy.local:8443",
+                    ca_secret_name="corp-proxy-ca",
+                ),
+            ),
+            pod_volumes=pod_volumes,
+        )
+
+        assert {
+            "name": EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
+            "secret": {
+                "secretName": "corp-proxy-ca",
+                "items": [
+                    {
+                        "key": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+                        "path": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+                    }
+                ],
+            },
+        } in pod_volumes
+
+        sidecar = next(c for c in containers if c["name"] == "egress")
+        assert {
+            "name": EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
+            "mountPath": EGRESS_UPSTREAM_EXTRA_CA_PATH,
+            "subPath": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+            "readOnly": True,
+        } in sidecar["volumeMounts"]
+        env_by_name = {e["name"]: e["value"] for e in sidecar["env"]}
+        assert (
+            env_by_name[OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA]
+            == EGRESS_UPSTREAM_EXTRA_CA_PATH
+        )
+
+        main = next(c for c in containers if c["name"] == "sandbox")
+        assert EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME not in {
+            m["name"] for m in main.get("volumeMounts", [])
+        }
+
+    def test_upstream_proxy_ca_secret_preserves_runtime_mount(self):
+        containers: list = [{"name": "sandbox", "env": [], "volumeMounts": []}]
+        pod_volumes: list = []
+        network_policy = NetworkPolicy(
+            default_action="deny",
+            egress=[NetworkRule(action="allow", target="example.com")],
+        )
+
+        apply_egress_to_spec(
+            containers,
+            _egress_settings(
+                network_policy,
+                upstream_proxy=EgressUpstreamProxyConfig(
+                    url="https://proxy.local:8443",
+                    ca_secret_name="corp-proxy-ca",
+                ),
+            ),
+            pod_volumes=pod_volumes,
+        )
+
+        sidecar = next(c for c in containers if c["name"] == "egress")
+        assert {
+            "name": OPENSANDBOX_RUNTIME_VOLUME_NAME,
+            "mountPath": OPENSANDBOX_RUNTIME_MOUNT_PATH,
+        } in sidecar["volumeMounts"]
+
+    def test_upstream_proxy_ca_secret_requires_pod_volumes(self):
+        containers: list = []
+        network_policy = NetworkPolicy(
+            default_action="deny",
+            egress=[NetworkRule(action="allow", target="example.com")],
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="pod_volumes is required for upstream proxy CA Secret",
+        ):
+            apply_egress_to_spec(
+                containers,
+                _egress_settings(
+                    network_policy,
+                    upstream_proxy=EgressUpstreamProxyConfig(
+                        url="https://proxy.local:8443",
+                        ca_secret_name="corp-proxy-ca",
+                    ),
+                ),
+            )
+
+    def test_upstream_proxy_ca_cert_path_sets_extra_ca_env(self):
+        containers: list = []
+        network_policy = NetworkPolicy(
+            default_action="deny",
+            egress=[NetworkRule(action="allow", target="example.com")],
+        )
+
+        apply_egress_to_spec(
+            containers,
+            _egress_settings(
+                network_policy,
+                upstream_proxy=EgressUpstreamProxyConfig(
+                    url="http://proxy.local:3128",
+                    ca_cert_path="/etc/ssl/private-ca/upstream.pem",
+                ),
+            ),
+        )
+
+        env_by_name = {e["name"]: e["value"] for e in containers[0]["env"]}
+        assert (
+            env_by_name[OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA]
+            == EGRESS_UPSTREAM_EXTRA_CA_PATH
+        )
+
 
 class TestPrepExecdInitForEgress:
     @staticmethod
@@ -776,6 +903,27 @@ class TestSplitEgressEnv:
             split_egress_env(
                 {"OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH": "Basic abc"}
             )
+
+    def test_rejects_disallowed_upstream_extra_ca(self):
+        """The extra CA env is admin-only and must not be request-settable."""
+        with pytest.raises(ValueError, match="not allowed"):
+            split_egress_env(
+                {
+                    "OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA": (
+                        "/tmp/evil.pem"
+                    )
+                }
+            )
+
+    def test_extra_ca_env_not_in_allowed_egress_env_vars(self):
+        from opensandbox_server.services.constants import (
+            ALLOWED_EGRESS_ENV_VARS,
+        )
+
+        assert (
+            OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA
+            not in ALLOWED_EGRESS_ENV_VARS
+        )
 
     def test_allows_mitmproxy_transparent(self):
         env = {"OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT": "true"}
