@@ -209,7 +209,7 @@ def _revision_configuration() -> tuple[str, str, str, str, int] | None:
 
 
 def load(_loader: Any) -> None:
-    """Start one generation-fenced receiver when the launcher enables it."""
+    """Start one admission-disabled joint owner when the launcher enables it."""
     global _revision_receiver, _revision_server
     if _revision_receiver is not None or _revision_server is not None:
         _fatal_revision_runtime()
@@ -219,13 +219,12 @@ def load(_loader: Any) -> None:
     socket_path, token, control, subject, limit = configuration
     receiver = server = None
     try:
-        from decision_snapshot import validate
-        from revision_ipc import Receiver, Server
+        from revision_ipc import Server
+        from revision_publication import InstallationReceiver
 
-        receiver = Receiver(
+        receiver = InstallationReceiver(
             control,
             subject,
-            validate,
             max_snapshot_bytes=limit,
         )
         server = Server(

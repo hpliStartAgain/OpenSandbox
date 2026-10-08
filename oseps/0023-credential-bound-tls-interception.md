@@ -1039,7 +1039,7 @@ targets, potentially interrupting newer requests sharing the same transport.
 There is still no live timer, transport closure or HTTP/2 GOAWAY owner, or
 public mutation ACK integration.
 
-An unused internal `RevisionPublisher` now exclusively owns a fresh Receiver
+An internal `RevisionPublisher` now exclusively owns a fresh Receiver
 and TLS Registry for one generation. Prepare validates the bounded immutable
 bytes and compiles their credential-free selector view outside both state locks,
 then stages both under the existing Registry -> Receiver lock order. Concurrent
@@ -1065,9 +1065,24 @@ Independent Receiver mutations and Registry activation/deactivation are rejected
 for this owned pair; standalone instances keep their existing APIs. Readback
 remains metadata-only, and commit returns newly uncovered connection tokens for
 a future drain owner, not a public mutation ACK. `RevisionPublisher` is not a
-Receiver and is deliberately not accepted by the current exact-type IPC server.
-No IPC wiring, system-addon hook, live timer, transport closure, HTTP/2 GOAWAY,
-public configuration or selective TLS activation is added by this foundation.
+Receiver and is not accepted directly by the exact-type IPC server.
+
+An internal `InstallationReceiver` now adapts a fresh Publisher to the existing
+authenticated IPC and experimental sidecar addon lifecycle. It exposes only the
+Receiver-shaped install/readback API and permanently disables connection
+admission before the owner escapes construction. No connection memberships or
+request handles can be created through this owner, so commit and close have no
+transport obligations to discard. Standalone Receiver and Publisher APIs remain
+available with their existing behavior. Commit returns the exact requested
+revision metadata, even if another commit installs a successor before the reply;
+active readback resolves a lost acknowledgement. Both active views are fenced
+on startup failure or addon shutdown.
+
+This backend confirms coherent installation only, never transport drain or a
+public mutation ACK. It adds no TLS/request hooks, live timer, transport closure,
+HTTP/2 GOAWAY, public configuration or selective TLS activation. The experimental
+gate still blocks public Vault writes; a future transport-aware owner must
+consume Publisher obligations before enabling live admissions.
 
 1. **Decision telemetry and red tests**
    - Add fail-closed tests that distinguish authoritative empty from lookup

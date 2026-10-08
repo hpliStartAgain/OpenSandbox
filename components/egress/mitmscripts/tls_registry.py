@@ -31,7 +31,7 @@ from revision_receiver import Receiver, Revision, Snapshot
 from tls_decision import Generation, Reason, TLSSelectorView, classify, compile_view
 
 RegistryAction = Literal["deny", "passthrough", "decrypt"]
-RegistryReason = Reason | Literal["registry_exhausted"]
+RegistryReason = Reason | Literal["registry_exhausted", "admission_disabled"]
 RequestReason = Literal[
     "admitted",
     "invalid_token",
@@ -141,6 +141,8 @@ class BoundConnectionRegistry:
         self._generation: Generation | None = None
         self._closed = False
         self._publication_owned = False
+        # Installation-only IPC owners set this once before exposing the pair.
+        self._admission_disabled = False
         self._entries: dict[int, AdmissionToken] = {}
         self._request_fenced: set[int] = set()
         self._next_serial = 0
@@ -257,6 +259,8 @@ class BoundConnectionRegistry:
     ) -> AdmissionResult:
         """Recheck the active epoch and capacity in one critical section."""
         with self._lock:
+            if self._admission_disabled:
+                return AdmissionResult("deny", "admission_disabled")
             result = classify(
                 identity=identity,
                 sni=sni,

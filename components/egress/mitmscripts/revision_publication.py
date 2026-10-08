@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unused, sidecar-only joint revision publication for OSEP-0023.
+"""Sidecar-only joint revision publication for OSEP-0023.
 
-This owner is deliberately not a Receiver and cannot be used by the current IPC
-server. It owns no live hooks, transport drain, timer or public mutation ACK.
+InstallationReceiver adapts this owner to IPC with admissions disabled for its
+entire lifetime. Neither owner supplies live hooks, drain or public mutation ACK.
 """
 
 from __future__ import annotations
@@ -151,3 +151,48 @@ class RevisionPublisher:
             registry._view = None
             self._pending_view = None
             return tokens
+
+
+class InstallationReceiver:
+    """Receiver-shaped IPC backend with no connection or request admission.
+
+    Exclusively owns a fresh Publisher and never exposes its Registry. The
+    admission guard is permanent for this instance and installed before it can
+    escape construction. Therefore commit and close have no transport obligations
+    to return. Their completion proves coherent installation/fencing only, never
+    transport drain or public Vault mutation completion. Live traffic integration
+    must use a different owner that consumes Publisher transport obligations.
+    """
+
+    def __init__(
+        self, control_generation: str, subject_generation: str, *,
+        max_snapshot_bytes: int,
+    ) -> None:
+        publisher = RevisionPublisher(
+            control_generation, subject_generation,
+            max_snapshot_bytes=max_snapshot_bytes, capacity=1, request_capacity=1,
+        )
+        # These unused capacities are not a live-traffic sizing recommendation.
+        # Guard before exposing the owner, including through this adapter.
+        publisher.registry._admission_disabled = True
+        self._publisher = publisher
+
+    def prepare(self, revision: Revision, payload: bytes) -> Revision:
+        return self._publisher.prepare(revision, payload)
+
+    def commit(self, revision: Revision) -> Revision:
+        self._publisher.commit(revision)
+        # Do not read back: another commit may already have installed a successor.
+        return revision
+
+    def abort(self, revision: Revision) -> Revision:
+        return self._publisher.abort(revision)
+
+    def readback(self) -> Revision | None:
+        return self._publisher.readback()
+
+    def acquire(self) -> Snapshot | None:
+        return self._publisher.acquire()
+
+    def close(self) -> None:
+        self._publisher.close()

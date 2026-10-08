@@ -54,6 +54,12 @@ or restart receives a fresh authenticated process session and must acknowledge
 the current in-memory Vault snapshot (or the authoritative initial empty state)
 before health becomes ready. The default is off.
 
+The authenticated IPC backend jointly installs the immutable snapshot and its
+credential-free TLS selector view. Its connection and request admission remain
+disabled for the process lifetime, so install acknowledgements and active-revision
+readback confirm coherent state only. They do not report transport drain or
+completion of a public Vault mutation. Shutdown fences both views together.
+
 This gate does **not** enable credential-bound TLS selection. Existing traffic
 still uses intercept-all behavior and the conditional active-Vault lookup;
 connection fencing, Fast Sandbox, and the public `interceptionMode` contract are
