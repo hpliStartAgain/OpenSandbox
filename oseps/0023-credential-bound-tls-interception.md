@@ -1103,6 +1103,17 @@ restart path from reading recovery state before cleanup. Session-close failure
 never reports success or restores readiness. IPC reconciliation is bounded by
 the context; existing process stop/reap does not promise a hard cleanup deadline.
 
+The owner integration tests run the real Go Store, ProcessSession, coordinator
+and Unix client against a Python subprocess using the production authenticated
+IPC endpoint and installation-only publisher. Response-boundary faults cover
+lost prepare/commit replies, withheld then failed readback, deadline cleanup,
+and stale local finalization, followed by fresh-session bootstrap from public
+Store state. The test child is actually signaled and reaped through the owner's
+stop seam; this does not exercise the production mitmdump launcher,
+`GracefulShutdown`, restart watcher, TLS hooks, or transport draining. These tests
+require Python 3 and permission to create Unix sockets; Egress CI supplies
+Python before running Go tests. Socket setup failures fail rather than skip.
+
 This owner is not wired into public HTTP handlers. Public Vault writes remain
 blocked by the experimental gate, policy mutations do not yet participate in
 revision installation, and installation confirmation is not transport drain or
