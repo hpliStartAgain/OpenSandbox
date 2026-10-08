@@ -84,7 +84,7 @@ func (s *policyServer) mutateRevisionVault(
 	}
 	digest := sha256.Sum256(payload)
 	session := m.revisionSession
-	recover := func() (credentialvault.State, error) {
+	detach := func() (credentialvault.State, error) {
 		s.mitmGate.SetReady(false)
 		running := m.running
 		m.running, m.revisionSession = nil, nil
@@ -98,7 +98,7 @@ func (s *policyServer) mutateRevisionVault(
 	}
 	config, err := session.MitmproxyConfig()
 	if err != nil || config == nil {
-		return recover()
+		return detach()
 	}
 	matches := func(id revision.Identity) bool {
 		return config.ControlGeneration != "" && config.SubjectGeneration != "" &&
@@ -114,14 +114,14 @@ func (s *policyServer) mutateRevisionVault(
 		if errors.Is(err, revision.ErrPrepareRejected) {
 			return empty, revision.ErrPrepareRejected
 		}
-		return recover()
+		return detach()
 	}
 	if !matches(attempt) {
-		return recover()
+		return detach()
 	}
 	for err != nil {
 		if ctx.Err() != nil {
-			return recover()
+			return detach()
 		}
 		var committed bool
 		committed, err = session.ReconcileUpdate(ctx, attempt)
@@ -132,7 +132,7 @@ func (s *policyServer) mutateRevisionVault(
 			break
 		}
 		if errors.Is(err, revision.ErrClosed) || errors.Is(err, revision.ErrTransportUnavailable) || errors.Is(err, revision.ErrInvalid) {
-			return recover()
+			return detach()
 		}
 		// Do not spin on unavailable readback or send Update again. Reconcile only
 		// this exact attempt until confirmation or the caller's bounded deadline.
@@ -140,13 +140,13 @@ func (s *policyServer) mutateRevisionVault(
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return recover()
+			return detach()
 		case <-timer.C:
 		}
 	}
 	state, err := s.credentialVault.CommitCandidate(candidate)
 	if err != nil {
-		return recover()
+		return detach()
 	}
 	return state, nil
 }
