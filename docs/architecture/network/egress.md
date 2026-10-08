@@ -65,7 +65,11 @@ still uses intercept-all behavior and the conditional active-Vault lookup;
 connection fencing, Fast Sandbox, and the public `interceptionMode` contract are
 not wired to the revision protocol yet. To prevent the acknowledged bootstrap
 snapshot from diverging from the in-memory Vault, `POST`, `PATCH`, and `DELETE`
-on `/credential-vault` return `503` while this internal gate is enabled.
+on `/credential-vault` return `503` while this internal gate is enabled. An
+internal Go transaction owner now coordinates candidate installation and local
+Vault finalization, including fail-closed cleanup of the exact process generation
+on unresolved outcomes. It is not connected to these HTTP handlers and does not
+change the gate or provide transport-drain acknowledgement.
 :::
 
 **Trust is delivered, not disabled.** The sidecar exports its CA, and the sandbox bootstrap installs it into the system, NSS, and JDK trust stores on a best-effort basis — clients keep certificate verification on (`curl` without `-k`), and traffic stays encrypted end-to-end from the sandbox's point of view. Images that run Chromium-family browsers should ship the native `certutil` package so the per-user NSS store can be updated.

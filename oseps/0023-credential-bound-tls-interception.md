@@ -1084,6 +1084,31 @@ HTTP/2 GOAWAY, public configuration or selective TLS activation. The experimenta
 gate still blocks public Vault writes; a future transport-aware owner must
 consume Publisher obligations before enabling live admissions.
 
+An internal Go Vault mutation owner now composes candidate preparation/rendering,
+exact process-session Update/Reconcile, and local Store finalization under the
+shared policy/Vault barrier and an exclusive live-generation lease. It requires
+a deadline context that its future caller must cancel on sidecar shutdown. The
+owner sends each candidate once, reconciles only the exact attempt, and checks
+the complete returned identity against the pinned generation, rendered digest,
+Vault revision and bootstrap-reserved policy epoch zero before finalization.
+Confirmed success finalizes even if cancellation arrives with the confirmation;
+an exact confirmed abort discards without replacing the live generation.
+
+An unresolved deadline, terminal session failure, inconsistent acknowledgement
+or failed local finalization after acknowledgement fences readiness and detaches
+the exact child/session. Both locks remain held while that child is stopped and
+reaped, the session is closed, and the unpublished candidate is discarded. This
+prevents shutdown from claiming the same child twice and prevents the existing
+restart path from reading recovery state before cleanup. Session-close failure
+never reports success or restores readiness. IPC reconciliation is bounded by
+the context; existing process stop/reap does not promise a hard cleanup deadline.
+
+This owner is not wired into public HTTP handlers. Public Vault writes remain
+blocked by the experimental gate, policy mutations do not yet participate in
+revision installation, and installation confirmation is not transport drain or
+public mutation completion. Selective TLS, live admissions and request hooks
+remain disabled for the installation-only backend.
+
 1. **Decision telemetry and red tests**
    - Add fail-closed tests that distinguish authoritative empty from lookup
      failure.
