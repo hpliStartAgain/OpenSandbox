@@ -103,6 +103,11 @@ errors, model output, prompts, or credentials.
 configuration. SDK readiness and application prerequisites precede Agent creation.
 A failed requested connection has no creation or local fallback.
 
+The optional `preflightTimeoutSeconds` defaults to 10 seconds and must be positive
+and finite. Its local deadline is rounded up to milliseconds and must not exceed
+2,147,483,647 ms (2,147,483.647 seconds), the Node timer limit. Larger values are
+rejected before any SDK create or connect call; they are not silently capped.
+
 At shutdown the example first disposes the Agent/Context, then performs the
 explicit `DSH_CLEANUP` operation. `close` releases the local SDK handle and leaves
 the remote sandbox alive; reconnect later with `connect`, the same sandbox ID,

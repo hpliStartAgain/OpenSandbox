@@ -10,6 +10,7 @@ import { SdkTransport } from './sdk-transport.js';
 
 // Reserved creation tag: FastPath persists metadata as DNS-label keys.
 const CREATION_REQUEST_METADATA_KEY = 'dsh-binding-request';
+const MAX_TIMER_MILLIS = 2_147_483_647;
 
 const PRECHECK = [
   'set -eu',
@@ -17,7 +18,7 @@ const PRECHECK = [
   'command -v bash >/dev/null',
   'command -v python3 >/dev/null',
   // These are prerequisites for the bundled helper, not a helper protocol success claim.
-  "python3 -c 'import os,sys,json,hashlib,fcntl,tempfile,stat; sys.exit(0 if sys.version_info.major == 3 and os.path.isdir(os.getcwd()) and os.access(os.getcwd(), os.R_OK | os.W_OK | os.X_OK) else 1)'",
+  "python3 -c 'import os,sys,json,hashlib,fcntl,tempfile,stat; sys.exit(0 if sys.version_info >= (3, 8) and os.path.isdir(os.getcwd()) and os.access(os.getcwd(), os.R_OK | os.W_OK | os.X_OK) else 1)'",
 ].join('; ');
 
 class ManagedBinding implements BoundSandbox {
@@ -132,7 +133,7 @@ async function preflight(sandbox: Sandbox, cwd: string, timeoutSeconds: number, 
     }, abort.signal);
     const result = await Promise.race([execution, interrupted]);
     if (!result.complete || result.error || result.exitCode !== 0) {
-      throw new BindingError('binding_open_failed', 'Linux, Python 3, bash, cwd or helper prerequisites failed.');
+      throw new BindingError('binding_open_failed', 'Linux, Python 3.8+, bash, cwd or helper prerequisites failed.');
     }
   } finally {
     clearTimeout(deadline);
@@ -149,6 +150,9 @@ export function createBindingOpener(sdk: SdkFacade): (options: OpenOptions) => P
     const readyTimeoutSeconds = positive(options.readyTimeoutSeconds ?? 30, 'readyTimeoutSeconds');
     const pollingIntervalMillis = positive(options.healthCheckPollingInterval ?? 200, 'healthCheckPollingInterval');
     const preflightTimeoutSeconds = positive(options.preflightTimeoutSeconds ?? 10, 'preflightTimeoutSeconds');
+    if (Math.ceil(preflightTimeoutSeconds * 1000) > MAX_TIMER_MILLIS) {
+      throw new BindingError('invalid_options', 'preflightTimeoutSeconds must not exceed 2147483.647 seconds.');
+    }
     if (options.signal?.aborted) throw new BindingError('aborted', 'Sandbox opening was cancelled before launch.');
     const { kind, sessionId, remoteCwd, preflightTimeoutSeconds: _, ...sdkOptions } = options;
     const correlationId = randomUUID();
