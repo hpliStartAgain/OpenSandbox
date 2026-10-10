@@ -231,6 +231,15 @@ class Docker:
         return json.loads(self.run(*args).stdout)
 
 
+def normalize_capabilities(values):
+    """Docker inspect may spell Linux capability names with one CAP_ prefix."""
+    if values is None:
+        return []
+    require(isinstance(values, list) and all(isinstance(value, str) for value in values),
+            "invalid Docker capability list")
+    return [value.removeprefix("CAP_") for value in values]
+
+
 def validate_observer(data, namespace):
     require(data.get("netns") == namespace,
             f"fence observer ran in wrong namespace: expected {namespace}, observed {data.get('netns')}")
@@ -277,7 +286,8 @@ class Runtime:
             host = info["HostConfig"]
             require(info["Config"]["Entrypoint"] == ENTRYPOINT, "real image entrypoint must be used")
             require(not host["Privileged"] and host["NetworkMode"] == "none" and not host["PidMode"]
-                    and host["CapAdd"] == ["NET_ADMIN"] and host["CapDrop"] == ["NET_RAW"],
+                    and normalize_capabilities(host["CapAdd"]) == ["NET_ADMIN"]
+                    and normalize_capabilities(host["CapDrop"]) == ["NET_RAW"],
                     "sidecar namespace/capability contract changed")
             require(not info["Mounts"], "runtime test must not depend on private state mounts")
             self.docker.run("start", self.name)
@@ -329,8 +339,8 @@ class Runtime:
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,mode=1777", "--entrypoint", "python3", self.image, "-u", "-c", WORKLOAD)
         info = self.docker.json("inspect", self.workload)[0]
         host = info["HostConfig"]
-        require(info["Config"]["User"] == "1000:1000" and host["CapDrop"] == ["ALL"]
-                and not host["CapAdd"] and not host["Privileged"] and not host["PidMode"],
+        require(info["Config"]["User"] == "1000:1000" and normalize_capabilities(host["CapDrop"]) == ["ALL"]
+                and not normalize_capabilities(host["CapAdd"]) and not host["Privileged"] and not host["PidMode"],
                 "workload must have no capabilities or shared PID namespace")
         require(not any(m["Type"] == "volume" for m in info["Mounts"]), "workload must not mount private state")
         self.docker.run("start", self.workload)

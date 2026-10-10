@@ -129,21 +129,83 @@ class RunnerTests(unittest.TestCase):
                     docker.run("info")
 
     def test_real_entrypoint_without_lifecycle_volume_or_fault_tag(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            docker = runner.Docker(Path(tmp))
-            runtime = runner.Runtime(docker, "ordinary-image")
-            info = {"HostConfig": {"Privileged": False, "NetworkMode": "none", "PidMode": "",
-                                   "CapAdd": ["NET_ADMIN"], "CapDrop": ["NET_RAW"]},
-                    "Config": {"Entrypoint": runner.ENTRYPOINT}, "Mounts": []}
-            with patch.object(docker, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run, \
-                    patch.object(docker, "json", return_value=[info]), patch.object(runtime, "wait"):
-                runtime.__enter__()
-                create = run.call_args_list[0].args
-            self.assertEqual(create[0], "create")
-            self.assertEqual(create[-1], "ordinary-image")
-            self.assertIn("OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME=true", create)
-            for flag in ("--entrypoint", "--privileged", "--mount", "--volume", "--pid"):
-                self.assertNotIn(flag, create)
+        # The CAP_ spelling is copied from the real inspect artifact of
+        # CI run 38037931490 / job 114175101240, which failed before bootstrap.
+        for prefix in ("", "CAP_"):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as tmp:
+                docker = runner.Docker(Path(tmp))
+                runtime = runner.Runtime(docker, "ordinary-image")
+                info = {"HostConfig": {"Privileged": False, "NetworkMode": "none", "PidMode": "",
+                                       "CapAdd": [prefix + "NET_ADMIN"], "CapDrop": [prefix + "NET_RAW"]},
+                        "Config": {"Entrypoint": runner.ENTRYPOINT}, "Mounts": []}
+                with patch.object(docker, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run, \
+                        patch.object(docker, "json", return_value=[info]), patch.object(runtime, "wait") as wait:
+                    runtime.__enter__()
+                    create = run.call_args_list[0].args
+                    wait.assert_called_once()
+                self.assertEqual(create[0], "create")
+                self.assertEqual(create[-1], "ordinary-image")
+                self.assertEqual(create[create.index("--cap-add") + 1], "NET_ADMIN")
+                self.assertEqual(create[create.index("--cap-drop") + 1], "NET_RAW")
+                self.assertIn("OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME=true", create)
+                for flag in ("--entrypoint", "--privileged", "--mount", "--volume", "--pid"):
+                    self.assertNotIn(flag, create)
+
+    def test_capability_normalization_only_removes_one_exact_prefix(self):
+        self.assertEqual(runner.normalize_capabilities(None), [])
+        self.assertEqual(runner.normalize_capabilities([]), [])
+        self.assertEqual(runner.normalize_capabilities(["NET_ADMIN", "CAP_NET_RAW", "CAP_ALL"]),
+                         ["NET_ADMIN", "NET_RAW", "ALL"])
+        self.assertEqual(runner.normalize_capabilities(["CAP_CAP_NET_ADMIN", "cap_net_admin"]),
+                         ["CAP_NET_ADMIN", "cap_net_admin"])
+        for invalid in ("CAP_NET_ADMIN", 0, {}, [None]):
+            with self.subTest(invalid=invalid), self.assertRaises(runner.Failure):
+                runner.normalize_capabilities(invalid)
+
+    def test_sidecar_extra_capabilities_missing_drop_and_namespace_changes_rejected(self):
+        base = {"Privileged": False, "NetworkMode": "none", "PidMode": "",
+                "CapAdd": ["CAP_NET_ADMIN"], "CapDrop": ["CAP_NET_RAW"]}
+        changes = [{"CapAdd": ["CAP_NET_ADMIN", "CAP_SYS_PTRACE"]}, {"CapAdd": []},
+                   {"CapAdd": ["CAP_CAP_NET_ADMIN"]}, {"CapAdd": ["NET_ADMIN", "CAP_NET_ADMIN"]},
+                   {"CapDrop": None}, {"CapDrop": []}, {"CapDrop": ["CAP_NET_ADMIN"]},
+                   {"CapDrop": ["CAP_NET_RAW", "CAP_SYS_PTRACE"]}, {"Privileged": True},
+                   {"NetworkMode": "host"}, {"PidMode": "host"}]
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                docker = runner.Docker(Path(tmp))
+                runtime = runner.Runtime(docker, "ordinary-image")
+                info = {"HostConfig": {**base, **change}, "Config": {"Entrypoint": runner.ENTRYPOINT}, "Mounts": []}
+                with patch.object(docker, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                        patch.object(docker, "json", return_value=[info]), patch.object(runtime, "wait") as wait:
+                    with self.assertRaisesRegex(runner.Failure, "namespace/capability contract changed"):
+                        runtime.__enter__()
+                    wait.assert_not_called()
+
+    def test_workload_all_prefixes_preserve_exact_capability_contract(self):
+        base = {"Privileged": False, "PidMode": "", "CapAdd": None, "CapDrop": ["ALL"]}
+        cases = [({}, True), ({"CapDrop": ["CAP_ALL"], "CapAdd": []}, True),
+                 ({"CapDrop": ["CAP_CAP_ALL"]}, False), ({"CapDrop": []}, False),
+                 ({"CapDrop": ["ALL", "CAP_NET_RAW"]}, False),
+                 ({"CapAdd": ["CAP_SYS_PTRACE"]}, False), ({"Privileged": True}, False),
+                 ({"PidMode": "host"}, False)]
+        for change, accepted in cases:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                docker = runner.Docker(Path(tmp))
+                runtime = runner.Runtime(docker, "ordinary-image")
+                info = {"HostConfig": {**base, **change}, "Config": {"User": "1000:1000"}, "Mounts": []}
+                control = {"uid": 1000, "cap_eff": "0", "netns": "net:[100]", "established": True}
+                with patch.object(docker, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run, \
+                        patch.object(docker, "json", return_value=[info]), patch.object(runtime, "wait"), \
+                        patch.object(runtime, "control", return_value=control), \
+                        patch.object(runtime, "snapshot", return_value={"netns": "net:[100]"}):
+                    if accepted:
+                        runtime.start_workload()
+                        create = run.call_args_list[0].args
+                        self.assertEqual(create[create.index("--cap-drop") + 1], "ALL")
+                        self.assertNotIn("--cap-add", create)
+                    else:
+                        with self.assertRaisesRegex(runner.Failure, "workload must have no capabilities"):
+                            runtime.start_workload()
 
     def test_observer_must_prove_actual_namespace_before_fence(self):
         self.assertTrue(runner.validate_observer({"netns": "net:[100]", "ruleset": fence()}, "net:[100]"))
