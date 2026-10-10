@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/credentialvault"
@@ -26,11 +27,17 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/revision"
 )
 
-// mutateRevisionVault is an internal, HTTP-unwired installation transaction.
-// It does not provide transport drain acknowledgements or policy epoch updates.
+// mutateRevisionVault is the live Vault mutation transaction for the
+// experimental revision runtime. It installs a rendered candidate snapshot on
+// the receiver, reconciles an indeterminate outcome to its exact attempt, and
+// finalizes the public Store only after the exact identity is confirmed. It
+// does not provide transport drain acknowledgements or policy epoch updates;
+// connection draining is owned by the addon's decision registry deadlines.
 // prepare must only prepare a candidate from the supplied Store and policy; it
 // must not publish state or reenter policy/lifecycle methods. The caller must
-// supply a deadline context canceled when sidecar shutdown begins.
+// supply a deadline context canceled when sidecar shutdown begins. A prepare
+// failure is sanitized to the fixed public error vocabulary so client-facing
+// status codes survive without exposing arbitrary prepare error text.
 //
 // Lock order is policy barrier -> exclusive process lease. Both stay held from
 // candidate preparation through local finalization or terminal cleanup. Unlike
@@ -69,10 +76,13 @@ func (s *policyServer) mutateRevisionVault(
 		return empty, revision.ErrTransportUnavailable
 	}
 	candidate, err := prepare(s.credentialVault, s.effectivePolicy())
-	if err != nil || candidate == nil {
+	if err != nil {
 		if candidate != nil {
 			candidate.Discard()
 		}
+		return empty, sanitizePrepareError(err)
+	}
+	if candidate == nil {
 		return empty, revision.ErrInvalid
 	}
 	defer candidate.Discard()
@@ -154,4 +164,25 @@ func (s *policyServer) mutateRevisionVault(
 		return detach()
 	}
 	return state, nil
+}
+
+// errRevisionExpectedRevision carries the optimistic-concurrency conflict in
+// the fixed public vocabulary; the numeric detail never crosses this boundary.
+var errRevisionExpectedRevision = errors.New("expectedRevision does not match the current revision")
+
+// sanitizePrepareError maps a prepare failure onto the fixed public error
+// vocabulary. Arbitrary prepare error text never crosses this boundary, so
+// a leaking prepare callback cannot disclose rendered data; only the
+// client-facing status classes (not-found, exists, revision conflict) survive.
+func sanitizePrepareError(err error) error {
+	switch {
+	case errors.Is(err, credentialvault.ErrNotFound):
+		return credentialvault.ErrNotFound
+	case errors.Is(err, credentialvault.ErrExists):
+		return credentialvault.ErrExists
+	case strings.Contains(err.Error(), "expectedRevision"):
+		return errRevisionExpectedRevision
+	default:
+		return revision.ErrInvalid
+	}
 }

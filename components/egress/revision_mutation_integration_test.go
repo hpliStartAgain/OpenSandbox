@@ -155,12 +155,21 @@ func revisionIntegrationServer(t *testing.T) *policyServer {
 
 func revisionIntegrationLaunch(t *testing.T, s *policyServer) (*mitmTransparent, *revisionIPCChild, *mitmproxy.RevisionIPCConfig) {
 	t.Helper()
+	return revisionIntegrationLaunchConfig(t, s, func(*revisionruntime.ProcessSessionConfig) {})
+}
+
+func revisionIntegrationLaunchConfig(
+	t *testing.T, s *policyServer, adjust func(*revisionruntime.ProcessSessionConfig),
+) (*mitmTransparent, *revisionIPCChild, *mitmproxy.RevisionIPCConfig) {
+	t.Helper()
 	parent, err := os.MkdirTemp("/tmp", "osri-owner-")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(parent)) })
+	sessionConfig := revisionruntime.ProcessSessionConfig{ParentDir: parent, UID: os.Getuid(), GID: os.Getgid(), SubjectGeneration: "integration-subject", MaxSnapshotBytes: 65536}
+	adjust(&sessionConfig)
 	var child *revisionIPCChild
 	owner := &revisionLaunchOwner{
-		config: revisionruntime.ProcessSessionConfig{ParentDir: parent, UID: os.Getuid(), GID: os.Getgid(), SubjectGeneration: "integration-subject", MaxSnapshotBytes: 65536},
+		config: sessionConfig,
 		newSession: func(config revisionruntime.ProcessSessionConfig) (revisionProcessSession, error) {
 			session, err := newRevisionProcessSession(config)
 			if err == nil {
@@ -211,6 +220,13 @@ func integrationVaultRequest(secret string) credentialvault.CreateRequest {
 
 func assertRevisionChildSnapshot(t *testing.T, child *revisionIPCChild, snapshot credentialvault.ActiveSnapshot) revisionChildReport {
 	t.Helper()
+	return assertRevisionChildSnapshotAdmission(t, child, snapshot, true)
+}
+
+func assertRevisionChildSnapshotAdmission(
+	t *testing.T, child *revisionIPCChild, snapshot credentialvault.ActiveSnapshot, admissionDisabled bool,
+) revisionChildReport {
+	t.Helper()
 	report := child.exchange(t, map[string]string{"command": "inspect"})
 	payload, err := credentialvault.MarshalDecisionSnapshot(snapshot, 0)
 	require.NoError(t, err)
@@ -221,7 +237,7 @@ func assertRevisionChildSnapshot(t *testing.T, child *revisionIPCChild, snapshot
 	require.Equal(t, report.Digest, report.Active.Digest)
 	require.Equal(t, snapshot.Revision, report.Active.VaultRevision)
 	require.Zero(t, report.Active.PolicyEpoch)
-	require.True(t, report.AdmissionDisabled)
+	require.Equal(t, admissionDisabled, report.AdmissionDisabled)
 	return report
 }
 
@@ -480,5 +496,43 @@ func TestRevisionIPCChildStopReapsProcess(t *testing.T) {
 			}
 			require.Equal(t, expected, status.Signal())
 		})
+	}
+}
+
+func TestRevisionVaultMutationIPCChildLiveAdmission(t *testing.T) {
+	s := revisionIntegrationServer(t)
+	m, child, config := revisionIntegrationLaunchConfig(t, s, func(cfg *revisionruntime.ProcessSessionConfig) {
+		cfg.LiveAdmission = true
+		cfg.TLSCapacity = 64
+		cfg.RequestCapacity = 256
+		cfg.DrainTimeoutSeconds = 1
+	})
+	// The live receiver is admission-enabled end to end: the launcher bundle
+	// reaches the child, which must select the live joint publication owner.
+	require.True(t, config.LiveAdmission)
+	require.Equal(t, 64, config.TLSCapacity)
+	require.Equal(t, 256, config.RequestCapacity)
+	require.Equal(t, 1, config.DrainTimeoutSeconds)
+	assertRevisionChildSnapshotAdmission(t, child, credentialvault.ActiveSnapshot{}, false)
+
+	for index, step := range []string{"create", "delete", "recreate"} {
+		_, err := s.mutateRevisionVault(mutationContext(t), m, func(store *credentialvault.Store, pol *policy.NetworkPolicy) (*credentialvault.MutationCandidate, error) {
+			if step == "delete" {
+				return store.PrepareDelete()
+			}
+			return store.PrepareCreate(integrationVaultRequest("private-live-secret"), pol)
+		})
+		require.NoError(t, err)
+		snapshot, err := s.credentialVault.ActiveSnapshot()
+		if step == "delete" {
+			require.ErrorIs(t, err, credentialvault.ErrNotFound)
+		} else {
+			require.NoError(t, err)
+		}
+		report := assertRevisionChildSnapshotAdmission(t, child, snapshot, false)
+		require.Equal(t, index+2, report.Counts.Prepare)
+		require.Equal(t, index+2, report.Counts.Commit)
+		require.Equal(t, int64(index+2), report.Active.DecisionEpoch)
+		require.False(t, s.mitmGate.MitmPending())
 	}
 }

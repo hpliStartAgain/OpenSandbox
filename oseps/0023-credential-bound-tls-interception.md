@@ -1328,6 +1328,32 @@ publication, rollback/crash durability, public mutation acknowledgement, or
 TLS/request/fast-sandbox activation. A later effect owner must establish those
 boundaries before wiring the candidate into public mutations.
 
+The live sidecar credential-bound loop is now wired for the Docker sidecar
+experiment (canonical HTTPS/443, exact hostnames, inline credentials, HTTP/1.1
+keepalive). The launcher hands the mitmdump child the live admission bundle
+(decrypted-connection capacity, admitted-request capacity, drain timeout)
+alongside the revision session; the addon then builds a `LiveReceiver` whose
+registry admits real connections instead of the installation-only receiver.
+`tls_clienthello` classifies visible SNI against the installed immutable
+snapshot: an unbound, invalid or ECH-hidden name and a no-SNI ClientHello pass
+through opaquely, a bound host is decrypted only with a registry admission, and
+every deny outcome (bootstrapping, generation mismatch, invalid SNI, exhausted
+registry) closes the connection instead of decrypting or tunneling unknown
+state. A decrypted connection without an admission is rejected at
+`requestheaders`, where each request acquires a revision-pinned snapshot, the
+request authority must equal the connection SNI, and the rendered bindings
+drive the existing binding/path/method match, injection and redaction path.
+Public `POST`/`PATCH`/`DELETE /credential-vault` now run the Go mutation
+transaction under the shared policy/Vault barrier: the candidate is installed
+and acknowledged on the receiver before the Store is finalized, a stale
+`expectedRevision` conflicts, an indeterminate or failed outcome detaches
+readiness instead of publishing, and prepare failures cross the boundary only
+as fixed public error classes. Removed hosts fence new requests on tracked
+connections immediately and the drain timeout force-closes the transport at
+expiry, so remove/re-add cannot revive a retired connection. HTTP/2,
+fast-sandbox subjects, dynamic policy, always-rule reload, and cross-process
+recovery remain out of scope for this slice.
+
 1. **Decision telemetry and red tests**
    - Add fail-closed tests that distinguish authoritative empty from lookup
      failure.

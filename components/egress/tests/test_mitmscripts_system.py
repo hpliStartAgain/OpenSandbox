@@ -1194,7 +1194,10 @@ class SystemAddonRedactionTest(unittest.TestCase):
         self.assertEqual("[REDACTED]", flow.response.headers.get("x-token-echo"))
         self.assertEqual("upstream body includes secret-token", flow.response.body)
         self.assertFalse(flow.response.set_text_called)
-        self.assertFalse(hasattr(system, "response"))
+        # The response hook exists only to release live request handles; in the
+        # legacy path it is a no-op and never touches response content.
+        system.response(flow)
+        self.assertEqual("upstream body includes secret-token", flow.response.body)
 
     def test_responseheaders_uses_injected_flow_redactions(self) -> None:
         system = _load_system_module()
