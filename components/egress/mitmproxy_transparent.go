@@ -210,12 +210,22 @@ func waitMitmRetry(ctx context.Context, shutdown <-chan struct{}, delay time.Dur
 
 func (m *mitmTransparent) recordExit(gen uint64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var failedOwner *policyServer
 	if m.launchGen == gen {
 		m.launchExited = true
 	}
 	if m.currentGen == gen && m.revisionOwner != nil && m.revisionOwner.server != nil {
 		m.revisionOwner.server.mitmGate.SetReady(false)
+		if !m.stopping && m.revisionOwner.server.quarantine != nil {
+			failedOwner = m.revisionOwner.server
+		}
+	}
+	m.mu.Unlock()
+	// Never acquire the policy barrier while holding the lifecycle lock.
+	if failedOwner != nil {
+		failedOwner.mu.Lock()
+		failedOwner.requireRevisionRecoveryLocked(revisionRecoveryUnknown)
+		failedOwner.mu.Unlock()
 	}
 }
 
@@ -289,7 +299,13 @@ func (m *mitmTransparent) launchAndListen(ctx context.Context, deps mitmLaunchDe
 		return nil, err
 	}
 	waitAddr := fmt.Sprintf("127.0.0.1:%d", m.cfg.ListenPort)
-	if err := deps.listen(launchCtx, waitAddr, 15*time.Second); err != nil {
+	var listenErr error
+	if m.revisionOwner != nil && m.revisionOwner.server != nil && m.revisionOwner.server.quarantine != nil {
+		listenErr = mitmproxy.WaitOwnedListenContext(launchCtx, result.running, m.cfg.ListenPort, 15*time.Second)
+	} else {
+		listenErr = deps.listen(launchCtx, waitAddr, 15*time.Second)
+	}
+	if err := listenErr; err != nil {
 		m.cleanupLaunch(result)
 		return nil, fmt.Errorf("wait listen %s: %w", waitAddr, err)
 	}

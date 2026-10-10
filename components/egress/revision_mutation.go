@@ -114,6 +114,15 @@ func (s *policyServer) mutateRevisionVault(
 	if err := ctx.Err(); err != nil {
 		return empty, err
 	}
+	if err := s.beginQuarantineTransitionLocked("vault"); err != nil {
+		return empty, err
+	}
+	completed := false
+	defer func() {
+		if s.quarantine != nil && !completed {
+			s.requireRevisionRecoveryLocked(revisionRecoveryExternalEffectsUnknown)
+		}
+	}()
 	attempt, err := session.Update(ctx, snapshot, 0)
 	if err != nil && !errors.Is(err, revision.ErrIndeterminate) {
 		if errors.Is(err, revision.ErrPrepareRejected) {
@@ -153,5 +162,9 @@ func (s *policyServer) mutateRevisionVault(
 	if err != nil {
 		return detach()
 	}
+	if err := s.finishQuarantineTransitionLocked(); err != nil {
+		return empty, err
+	}
+	completed = true
 	return state, nil
 }

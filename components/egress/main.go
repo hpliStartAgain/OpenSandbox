@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -44,6 +45,20 @@ import (
 )
 
 func main() {
+	if handled, err := mitmproxy.HandleOwnedListenHelper(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if handled, err := runQuarantineCommand(); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "experimental lifecycle guard:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	version.EchoVersion("OpenSandbox Egress")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -51,6 +66,14 @@ func main() {
 
 	ctx = withLogger(ctx)
 	defer log.Logger.Sync()
+
+	quarantineOwner, err := beginSidecarQuarantine()
+	if err != nil {
+		log.Fatalf("experimental quarantine startup: %v", err)
+	}
+	if quarantineOwner != nil {
+		defer quarantineOwner.journal.Close()
+	}
 
 	// Validate the chained upstream proxy env before profile dispatch: a
 	// configured proxy without transparent mitmproxy (and, outside
@@ -180,7 +203,7 @@ func main() {
 
 	httpAddr := envOrDefault(constants.EnvEgressHTTPAddr, constants.DefaultEgressServerAddr)
 	mitmGate := mitmproxy.NewHealthGate()
-	policySrv, policyHandler, err := startPolicyServer(proxy, nftMgr, mode, httpAddr, os.Getenv(constants.EnvEgressToken), allowIPs, os.Getenv(constants.EnvEgressPolicyFile), alwaysDeny, alwaysAllow, mitmGate)
+	policySrv, policyHandler, err := startPolicyServer(proxy, nftMgr, mode, httpAddr, os.Getenv(constants.EnvEgressToken), allowIPs, os.Getenv(constants.EnvEgressPolicyFile), alwaysDeny, alwaysAllow, mitmGate, quarantineOwner)
 	if err != nil {
 		log.Fatalf("failed to start policy server: %v", err)
 	}
@@ -196,12 +219,15 @@ func main() {
 	if mitm != nil {
 		mitm.watchMitmproxy(ctx, mitmGate)
 	}
+	if quarantineOwner != nil {
+		policyHandler.startAlwaysRuleReloadJob()
+	}
 
 	if err := startup.RunPost(ctx); err != nil {
 		log.Errorf("startup hooks (post) error: %v", err)
 	}
 
-	waitForShutdown(ctx, proxy, policySrv, exemptDst, nftMgr, mitm, blockedBroadcaster)
+	waitForShutdown(ctx, proxy, policySrv, exemptDst, nftMgr, mitm, blockedBroadcaster, policyHandler)
 }
 
 func withLogger(ctx context.Context) context.Context {

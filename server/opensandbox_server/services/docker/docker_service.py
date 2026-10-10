@@ -116,6 +116,10 @@ from opensandbox_server.services.docker.ossfs_mixin import OSSFSMixin
 from opensandbox_server.services.sandbox_service import SandboxService
 from opensandbox_server.services.runtime_resolver import SecureRuntimeResolver
 from opensandbox_server.services.snapshot_restore import resolve_sandbox_image_from_request
+from opensandbox_server.services.egress_quarantine import (
+    QUARANTINE_LABEL,
+    reject_quarantine_lifecycle,
+)
 from opensandbox_server.services.validators import (
     calculate_expiration_or_raise,
     ensure_entrypoint,
@@ -652,6 +656,18 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 },
             ) from e
 
+        try:
+            self._validate_egress_quarantine(
+                has_network_policy=request.network_policy is not None,
+                credential_proxy_enabled=bool(request.credential_proxy and request.credential_proxy.enabled),
+                extra_env=egress_env,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": SandboxErrorCodes.INVALID_PARAMETER, "message": str(exc)},
+            ) from exc
+
         sandbox_id, created_at, expires_at = self._prepare_creation_context(request)
         pvc_inspect_cache, auto_created_volumes = self._validate_volumes(request)
         loop = asyncio.get_running_loop()
@@ -734,6 +750,12 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         credential_proxy_enabled = bool(
             request.credential_proxy and request.credential_proxy.enabled
         )
+        if self._validate_egress_quarantine(
+            has_network_policy=request.network_policy is not None,
+            credential_proxy_enabled=credential_proxy_enabled,
+            extra_env=egress_env,
+        ):
+            labels[QUARANTINE_LABEL] = "true"
 
         if credential_proxy_enabled and egress_env.get(OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE):
             raise ValueError(
@@ -996,6 +1018,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     logger.warning(
                         f"Failed to cleanup egress sidecar for sandbox {sandbox_id}: {cleanup_exc}"
                     )
+                self._cleanup_egress_quarantine_volumes(sandbox_id)
             self._release_ossfs_mounts(ossfs_mount_keys)
             self._cleanup_managed_volumes(sandbox_id, auto_created_volumes or [])
             raise
@@ -1153,6 +1176,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
 
     def pause_sandbox(self, sandbox_id: str) -> None:
         container = self._get_container_by_sandbox_id(sandbox_id)
+        reject_quarantine_lifecycle(container, "Pause")
         state = container.attrs.get("State", {})
         if not state.get("Running", False) or state.get("Paused", False):
             raise HTTPException(
@@ -1247,6 +1271,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
 
     def resume_sandbox(self, sandbox_id: str) -> None:
         container = self._get_container_by_sandbox_id(sandbox_id)
+        reject_quarantine_lifecycle(container, "Resume")
         state = container.attrs.get("State", {})
         if not state.get("Paused", False):
             raise HTTPException(

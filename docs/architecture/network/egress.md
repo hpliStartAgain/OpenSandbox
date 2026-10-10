@@ -73,14 +73,16 @@ change the gate or provide transport-drain acknowledgement.
 
 The experimental lifecycle also keeps an authoritative policy base and a
 private bootstrap ticket under the shared policy/Vault barrier. Initial startup
-and automatic child restart use the same final check: the captured policy base,
+and the revision layer's child-restart path use the same final check: the captured policy base,
 Store and Vault mutation identity must still be current, the exact child/session
 must still belong to the pending attempt, and recovery must not be required.
 Snapshot installation or listener availability alone cannot make health ready.
 Policy or always-rule publication, including replacement with identical rules,
 and Vault changes invalidate an older capture. A rejected attempt stops and reaps
-only its own child before closing its session; a clean restart can capture fresh
-state and recover. Initial startup also retries a stale publication with a fresh
+only its own child before closing its session. Without a durable quarantine
+owner, a clean restart can capture fresh state and recover. The Docker durable
+quarantine lifecycle below instead quarantines child exits and refuses automatic
+recovery. Initial startup also retries a stale publication with a fresh
 capture, up to three total launch attempts, so an immediate always-rule reload
 can settle without forcing the sidecar to exit. Redirect and CA preparation run
 once. Other startup errors, cancellation, shutdown, and recovery-required state
@@ -160,8 +162,8 @@ not clear recovery. Temporary files are cleaned up on ordinary error returns;
 a process crash may leave a temporary file for operator inspection.
 
 This protocol does not make policy files and nft state one crash-consistent
-transaction. It provides no durable recovery journal, kernel rollback or packet
-fence. Existing open file descriptors continue to see the previous inode; readers
+transaction. The file primitive alone provides no kernel rollback or packet
+fence; the experimental lifecycle guard described below owns those boundaries. Existing open file descriptors continue to see the previous inode; readers
 must reopen the policy path to observe replacements. Default deployments with the
 experimental gate off, including DNS-only mode, retain legacy in-place persistence.
 Fast Sandbox does not use this sidecar policy-file store.
@@ -176,8 +178,10 @@ prove that the kernel stayed unchanged. The existing single missing-table
 fallback remains bounded; if both attempts fail, both diagnostics are retained
 and an `Unknown` first attempt cannot be downgraded by an `Unchanged` retry.
 
-An experimental runtime apply that is `Unchanged` preserves the previous policy
-base and DNS/TCP tracking without adding recovery or freezing a healthy Manager.
+At the Manager layer, an apply that is `Unchanged` preserves the previous policy
+base and DNS/TCP tracking without freezing a healthy Manager. The lifecycle
+quarantine owner uses the stricter terminal-failure rule described below once
+it has written an operation intent, even for a later `Unchanged` result.
 When the policy file was already saved, this requires successful durable restore
 of its exact previous bytes, metadata, or absence. Any restore failure requires
 recovery, including a failure classified as leaving the *new* file unchanged.
@@ -215,12 +219,11 @@ connections are not necessarily disconnected by the freeze.
 
 There is no unfreeze operation. Explicit shutdown `RemoveEnforcement` can still
 delete the nft table, whether cleanup succeeds or fails, and never clears the
-Manager's frozen state. This does not provide a packet fence: existing rules,
-leased addresses and established connections may still allow traffic, and
-teardown may remove enforcement. The freeze does not survive process restart,
-roll back unknown external effects, or add a hard shutdown deadline. Legacy
-sidecar and Fast Sandbox behavior are unchanged; dns-only recovery keeps its
-existing readiness behavior without requiring an nft Manager.
+Manager's frozen state. The Manager freeze alone is not a packet fence: existing rules and established
+connections may still allow traffic. The experimental lifecycle owner therefore
+uses a separate quarantine table that this teardown cannot remove. Neither
+mechanism rolls back unknown effects or adds a hard shutdown deadline. Legacy
+sidecar and Fast Sandbox behavior remain unchanged when the experiment is off.
 
 Kernel write-admission validation uses
 `TestNftQuiescenceAfterCommittedStaticError` in a separate Linux network
@@ -239,12 +242,114 @@ missing prerequisites fail enabled tests. Ordinary
 Go tests skip kernel validation when that variable is unset, so their success
 does not establish kernel behavior or packet isolation.
 
-This state is in memory only. Readiness is not a network-traffic fence, and this
-increment provides no atomic policy-file/nft rollback, dynamic DNS-state recovery
-or whole-process crash durability. Restarting the entire sidecar loses the latch
-and is not a verified safe recovery procedure. Active policy epochs remain zero;
-legacy policy success responses are not revision transaction acknowledgements.
+The readiness and Manager state remain process-local. Durable quarantine adds
+a separate restart boundary below; it does not replay policy, Vault or dynamic
+DNS state. Active policy epochs remain zero; legacy policy success responses
+are not revision transaction acknowledgements.
 :::
+
+### Experimental durable quarantine (Docker only)
+
+The administrator can set `OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME=true`
+on the lifecycle server process. It is not an allowed sandbox request environment
+variable. Eligible Docker sandboxes must have a network policy, `dns+nft`
+enforcement and transparent MITM. A request without a network policy does not
+activate the experiment. Other runtimes are rejected while the server gate is
+on. Pause, resume and snapshots of protected sandboxes are rejected; no recovery
+contract exists for those operations.
+
+The supported deployment keeps the existing two-container topology: the workload
+joins the egress sidecar's network namespace. There is no separate namespace
+anchor. A Go process restart within that same namespace and a whole sidecar
+container restart therefore have different isolation guarantees.
+
+Before starting the sidecar, the trusted Docker owner allocates a unique,
+host-backed named volume, mounts it only at
+`/var/lib/opensandbox-egress/quarantine` in a network-disabled provisioning helper,
+and creates an exclusive initial record bound to a random incarnation. The
+helper uses the same egress image, drops all capabilities, and exits before the
+sidecar starts. It does not prefill a network namespace binding: its own namespace
+is not the workload's target. The workload receives neither this volume nor the
+identity.
+The shared `/opt/opensandbox` volume and temporary revision IPC directory are
+not trusted recovery storage. Do not attach the private volume to a workload,
+use tmpfs, copy a fresh record between sandboxes, reuse a previous incarnation's
+volume, or manually provision a live namespace. Supported storage is local ext4,
+XFS, Btrfs or durable-backed overlay;
+filesystem synchronization is required and is not a multi-resource transaction.
+
+At the first `fresh` → `guarded` transition, the real sidecar durably binds the
+record to the host boot ID and the device/inode identity of its network namespace.
+This binding is immutable. The supervisor's experimental prestart hook confirms
+the independent `inet opensandbox_quarantine` table in that target before
+consuming the one-use fresh record or removing stale redirect rules. The worker
+verifies the binding, confirms the fence again and consumes the guarded record
+before startup effects. Missing, corrupt, mismatched, unsupported, unwritable or
+previously consumed records refuse worker startup. Missing credentials or a new
+directory never imply an authoritative empty Vault.
+
+A later Go process restart can confirm full-IP quarantine only while it remains
+in the recorded network namespace. Its consumed record prevents automatic worker
+recovery. A whole sidecar container restart may instead create a different
+namespace, even when the Docker container ID is unchanged, while the old workload
+still occupies the original namespace. On a binding mismatch, the original
+target's isolation is `QuarantineUnknown` and rebuilding is required. The guard
+refuses redirect cleanup and worker startup. A fence installed in a replacement
+namespace must never be reported as isolation of the original workload.
+
+The old workload is not recoverable under this contract. The operator must
+destroy the old sandbox and use trusted creation for a new one; the program does
+not automatically destroy it. Replaying state, editing the record or restarting
+repeatedly is not recovery. There is no reset API.
+
+The binding does not use a PID, so PID reuse is irrelevant. A changed boot ID is
+conservatively rejected. Namespace device/inode values are not permanent
+identifiers across namespace lifetimes, including possible inode reuse within
+one boot. The trusted unique incarnation and never-reused private volume remain
+required; the namespace tuple alone cannot establish first creation or authorize
+reuse.
+
+Within the verified target namespace, the fence drops IPv4 and IPv6 at input,
+output and forward hooks, including
+loopback, existing TCP, new connections, UDP, marked traffic, the MITM UID,
+DNS and upstream-proxy exceptions. Business traffic, health/control HTTP and
+execd IP connections become unreachable. `QuarantineConfirmed` means both the
+immutable namespace binding and exact kernel fence readback matched the target;
+`QuarantineUnknown` means isolation of that target could not be established.
+Neither process exit nor a 503 response proves isolation.
+Readiness, writer quiescence and packet isolation are independent states.
+This does not protect against workloads with NET_ADMIN/NET_RAW or other
+privileges that bypass the supported inet path, or against L2/offloaded paths.
+It does not promise zero leakage between an unfenced process death and guard
+detection. Fence installation failure has no external workload-kill fallback.
+
+A default-bridge probe on Docker 29.1.3 with runc 1.4.0 observed that a whole
+sidecar container restart removed the old workload namespace's `eth0` and routes.
+New TCP connections to a separate peer on the same default bridge were
+unreachable, and an existing connection to that peer timed out; loopback remained
+reachable. No Internet destination was tested. This is a result for that
+tested runtime and topology, not a full-IP quarantine guarantee or evidence that
+other runtimes isolate the old namespace safely. The remaining real-image CI
+validation is pending.
+
+Policy, always-rule and internal Vault changes write durable intent before
+confirming the fence and beginning dangerous effects. The owner durably records
+completion before removing and confirming absence of the fence; readiness is
+published last, with versioned tickets preventing a concurrent child exit from
+reviving old readiness. Once intent starts, any unresolved failure is terminal,
+even when a lower-level effect is classified `Unchanged`. No digest is used as
+an authoritative policy or Vault source. Initial listener verification reads
+kernel socket ownership for the exact mitmdump child without a loopback-packet
+exception. A child exit enters quarantine rather than automatically restarting.
+
+Normal shutdown first quarantines and then cleans ordinary enforcement and
+redirects. Old-generation cleanup, policy replacement and `RemoveEnforcement`
+never delete the quarantine table or lifecycle intent. If the target binding or
+isolation cannot be confirmed, shutdown refuses redirect cleanup. Destroy both
+old containers and ensure the protected namespace is gone before downgrading the
+image or reclaiming its private volume. Restarting only the sidecar does not
+establish that boundary. The experimental gate off retains legacy
+prestart cleanup and restart behavior.
 
 **Trust is delivered, not disabled.** The sidecar exports its CA, and the sandbox bootstrap installs it into the system, NSS, and JDK trust stores on a best-effort basis — clients keep certificate verification on (`curl` without `-k`), and traffic stays encrypted end-to-end from the sandbox's point of view. Images that run Chromium-family browsers should ship the native `certutil` package so the per-user NSS store can be updated.
 

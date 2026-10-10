@@ -3,7 +3,7 @@ title: Credential-Bound TLS Interception
 authors:
   - "@hpliStartAgain"
 creation-date: 2026-09-04
-last-updated: 2026-10-09
+last-updated: 2026-10-10
 status: implementing
 ---
 
@@ -1148,8 +1148,9 @@ cancellation, shutdown and exact pending child/session generation before
 transferring ownership and setting health ready. Successful installation and
 listener availability alone do not permit publication. Rejected attempts retain
 their own resources for exact child stop/reap followed by session close; an old
-exit notification cannot detach a newer generation. A clean child crash still
-allows a fresh capture and automatic restart.
+exit notification cannot detach a newer generation. Without a durable quarantine owner a clean child crash still allows a fresh
+capture and automatic restart. The Docker experimental lifecycle owner instead
+contains child exits and refuses automatic recovery.
 
 Experimental policy and always-rule paths invalidate in-flight bootstrap tickets
 before attempting external effects, then replace the authoritative base on
@@ -1161,7 +1162,8 @@ failures before effects do not. Once latched, health remains not-ready, internal
 policy candidate preparation and Vault mutation ownership reject work, and
 ordinary child restart or successful IPC readback cannot clear it. Shutdown and
 teardown remain available. There is no reset API; the first recovery reason is
-sticky only within the same Go process incarnation.
+held in memory; the durable lifecycle record additionally prevents subsequent
+processes from reopening the namespace automatically.
 
 For the ordinary sidecar's experimental revision runtime, recovery also
 synchronously quiesces the same nft Manager. A terminal static-apply error with
@@ -1212,9 +1214,9 @@ do not freeze the Manager. Legacy sidecar, Fast Sandbox and dns-only behavior
 keep their existing boundaries.
 
 Explicit shutdown `RemoveEnforcement` remains a table-deletion exception and
-does not unfreeze the Manager, even after failed cleanup. There is no reset or
-unfreeze API, packet fence, durable frozen state, rollback of unknown effects,
-or new hard shutdown deadline. Deterministic owner tests use real Manager write
+does not unfreeze the Manager, even after failed cleanup. There is no reset or unfreeze API, rollback of unknown effects, or new hard
+shutdown deadline. The Docker lifecycle guard now owns a separate packet fence
+and durable quarantine record; Manager table cleanup cannot delete either. Deterministic owner tests use real Manager write
 admission and injected effect failures to cover recovery sources and health
 while an admitted writer drains; these tests do not establish kernel behavior.
 
@@ -1245,12 +1247,73 @@ failure, not evidence that stale-publication assertions ran. The child stop seam
 signals and reaps a real subprocess; it does not exercise the production
 mitmdump launcher, listener, `GracefulShutdown`, TLS or transport drain.
 
-The latch is neither a network fence nor durable recovery intent. This increment
-does not provide atomic policy-file/nft rollback, restore dynamic DNS state, or
-survive a whole Go/sidecar crash. Restarting the entire sidecar loses the latch
-and is not a proven safe recovery procedure. External effects transactions,
-durable intent, active policy epochs, public mutation ACKs, selective TLS,
-request hooks, live admissions and Fast Sandbox integration remain future work.
+The latch alone is neither a network fence nor durable recovery intent. The
+Docker experimental lifecycle guard now provisions an exclusive sidecar-only
+volume and unique incarnation through a trusted one-shot helper. The supported
+topology remains two containers, with the workload joining the sidecar's network
+namespace; there is no namespace anchor. The helper does not bind its own
+namespace into the fresh record. At the first `fresh` → `guarded` transition,
+the real sidecar binds the host boot ID and network namespace device/inode
+identity immutably. Prestart confirms an independent whole-namespace IPv4/IPv6
+quarantine table in that target before redirect cleanup. The worker verifies the
+binding and consumes the guarded record before startup effects. Missing records,
+invalid identities, consumed records and uncertain state refuse worker startup;
+there is no automatic replay or public reset.
+
+Only a Go restart in the same bound namespace can confirm full-IP quarantine of
+the original workload. A whole sidecar container restart can replace its network
+namespace without changing the container ID; the workload may still occupy the
+old namespace. A binding mismatch leaves the original target
+`QuarantineUnknown` and requires rebuilding, while refusing redirect cleanup
+and worker startup. A fence in a replacement namespace is not evidence of
+isolation of the old target. The operator must destroy the old sandbox and use
+trusted creation for a new one; the program does not automatically destroy the
+old workload or attempt to recover it.
+
+The binding contains no PID, so PID reuse does not affect it. Boot-ID changes
+are conservatively rejected. Namespace device/inode values are not permanent
+identities across namespace lifetimes, and inode reuse within a boot remains
+possible. Trusted unique incarnations and never-reused private volumes are
+therefore still required. A matching namespace tuple alone is neither
+first-create authority nor permission to reuse an incarnation. Readiness,
+writer quiescence and confirmed/unknown packet isolation remain separate facts.
+
+Live policy/always-rule/internal Vault effects require durable intent and a
+confirmed fence; durable completion precedes confirmed fence removal and final
+readiness. Once intent starts an unresolved failure is terminal even if a
+lower-level effect reports Unchanged. Initial listener readiness uses exact
+child kernel socket ownership because loopback is also isolated. A versioned
+health ticket prevents stale readiness restoration. Shutdown preserves the
+quarantine table and record and refuses redirect cleanup if the target binding
+or isolation cannot be confirmed. Destruction of both old containers and the
+protected namespace is the final disposal point; restarting only the sidecar
+does not establish it.
+
+Confirmed isolation in the bound target interrupts business and management IP
+communication, including
+health and execd. No exception is made for marks, MITM UID, established traffic,
+DNS or upstream proxy. This assumes no workload NET_ADMIN/NET_RAW, L2/offloaded
+bypass, or hostile privileged namespace writer. An unfenced Go SIGKILL has a
+detection window before prestart; failed fence installation reports Unknown,
+not a fictitious workload stop. File fsync is not a cross-resource transaction.
+The journal is not an authoritative credential/policy snapshot and cannot be
+used to replay one. See [the operational deployment contract](../docs/architecture/network/egress.md#experimental-durable-quarantine-docker-only).
+
+A default-bridge probe on Docker 29.1.3 with runc 1.4.0 observed removal of the old
+workload namespace's `eth0` and routes after a whole sidecar container restart.
+New TCP connections to a separate peer on the same default bridge were
+unreachable, and an existing connection to that peer timed out; loopback remained
+reachable. No Internet destination was tested. This limited observation
+does not prove full-IP quarantine or isolation safety on other runtimes. The
+remaining real-image CI validation is pending.
+
+Atomic policy-file/nft rollback, dynamic DNS-state restoration, automatic
+recovery, active policy epochs, public mutation ACKs, selective TLS, request
+hooks, live admissions, Fast Sandbox, Pod replacement and pause/resume recovery
+remain future work. The supported Go-restart outcome within the original
+namespace is durable quarantine, not restored service. A whole-container
+namespace replacement requires operator destruction and recreation, with the
+original target's isolation reported as unknown.
 
 Preparation revalidates every Vault binding, including HTTP-only bindings, and
 adds a conservative ordered whole-selector coverage proof for wildcard hosts.

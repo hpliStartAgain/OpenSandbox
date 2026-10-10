@@ -28,7 +28,8 @@ import socket
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, cast
+from uuid import uuid4
 
 from requests.exceptions import RequestException
 from docker.errors import DockerException, NotFound as DockerNotFound
@@ -47,6 +48,8 @@ from opensandbox_server.services.constants import (
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
     SANDBOX_EMBEDDING_PROXY_PORT_LABEL,
     SANDBOX_HTTP_PORT_LABEL,
+    SANDBOX_ID_LABEL,
+    SANDBOX_MANAGED_VOLUMES_LABEL,
     SandboxErrorCodes,
 )
 from opensandbox_server.services.docker.port_allocator import (
@@ -58,11 +61,23 @@ from opensandbox_server.services.endpoint_auth import (
     merge_endpoint_headers,
 )
 from opensandbox_server.services.helpers import upstream_proxy_egress_env
+from opensandbox_server.services.egress_quarantine import (
+    EXPERIMENTAL_REVISION_RUNTIME_ENV,
+    QUARANTINE_DIRECTORY,
+    QUARANTINE_ID_ENV,
+    QUARANTINE_LABEL,
+    QUARANTINE_OWNER_LABEL,
+    QUARANTINE_VOLUME_PREFIX,
+    experimental_revision_runtime_enabled,
+)
 from opensandbox_server.services.validators import (
     ensure_credential_proxy_configured,
     ensure_egress_configured,
     ensure_egress_runtime_compatible,
 )
+
+if TYPE_CHECKING:
+    from opensandbox_server.services.docker.docker_service import DockerSandboxService
 
 logger = logging.getLogger(__name__)
 
@@ -444,6 +459,96 @@ class DockerNetworkingMixin:
         # The shared runtime volume can outlive a successfully removed app.
         # Removal is best effort and still checks the server-managed label.
         self._cleanup_managed_volumes(sandbox_id, [f"opensandbox-runtime-{sandbox_id}"])
+        self._cleanup_egress_quarantine_volumes(sandbox_id)
+
+    def _cleanup_egress_quarantine_volumes(self, sandbox_id: str) -> None:
+        owner = cast("DockerSandboxService", self)
+        try:
+            # A failed create/delete may leave either namespace participant alive.
+            # Retain durable provenance until both containers are confirmed gone.
+            for owner_label in (SANDBOX_ID_LABEL, EGRESS_SIDECAR_LABEL):
+                if owner.docker_client.containers.list(
+                    all=True, filters={"label": f"{owner_label}={sandbox_id}"}
+                ):
+                    return
+            volumes = owner.docker_client.volumes.list(
+                filters={"label": f"{QUARANTINE_OWNER_LABEL}={sandbox_id}"}
+            )
+            names = [volume.name for volume in volumes]
+            owner._cleanup_managed_volumes(sandbox_id, names)
+        except (DockerException, RequestException) as exc:
+            logger.warning(f"sandbox={sandbox_id} | failed to clean up egress quarantine volume: {exc}")
+
+    def _validate_egress_quarantine(
+        self,
+        *,
+        has_network_policy: bool,
+        credential_proxy_enabled: bool,
+        extra_env: Optional[Dict[str, Optional[str]]],
+    ) -> bool:
+        if not experimental_revision_runtime_enabled() or not has_network_policy:
+            return False
+        transparent = credential_proxy_enabled or (
+            (extra_env or {}).get(OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT) or ""
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        egress = cast("DockerSandboxService", self).app_config.egress
+        if not egress or egress.mode != "dns+nft" or not transparent:
+            raise ValueError("Experimental egress quarantine requires dns+nft and transparent MITM.")
+        return True
+
+    def _provision_egress_quarantine(self, sandbox_id: str, image: str) -> tuple[str, str]:
+        """Provision once outside the sidecar's restart path, then remove the helper."""
+        owner = cast("DockerSandboxService", self)
+        incarnation = uuid4().hex
+        volume_name = f"{QUARANTINE_VOLUME_PREFIX}{sandbox_id}-{incarnation}"
+        helper = None
+        helper_creation_attempted = False
+        try:
+            owner.docker_client.volumes.create(
+                name=volume_name,
+                labels={
+                    SANDBOX_MANAGED_VOLUMES_LABEL: "server",
+                    QUARANTINE_OWNER_LABEL: sandbox_id,
+                },
+            )
+            helper_creation_attempted = True
+            helper = owner.docker_client.containers.create(
+                image=image,
+                name=f"sandbox-egress-provision-{sandbox_id}-{incarnation}",
+                entrypoint=["/opt/opensandbox-egress/egress"],
+                command=["--provision-quarantine"],
+                environment={QUARANTINE_ID_ENV: incarnation},
+                network_mode="none",
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges:true"],
+                user="0:0",
+                read_only=True,
+                # Docker accepts "no"; its bundled type stub omits that value.
+                restart_policy=cast(Any, {"Name": "no"}),
+                volumes={volume_name: {"bind": QUARANTINE_DIRECTORY, "mode": "rw"}},
+                labels={EGRESS_SIDECAR_LABEL: sandbox_id},
+            )
+            helper.start()
+            result = helper.wait(timeout=30)
+            if result.get("StatusCode") != 0:
+                raise RuntimeError("Egress quarantine provisioning failed.")
+            # The privileged first-create invocation must not survive to be restarted.
+            helper.remove(force=True)
+            helper = None
+            return volume_name, incarnation
+        except Exception:
+            helper_removed = helper is None and not helper_creation_attempted
+            if helper is not None:
+                try:
+                    helper.remove(force=True)
+                    helper_removed = True
+                except DockerNotFound:
+                    helper_removed = True
+                except (DockerException, RequestException) as exc:
+                    logger.warning(f"sandbox={sandbox_id} | failed to remove quarantine helper: {exc}")
+            if helper_removed:
+                owner._cleanup_managed_volumes(sandbox_id, [volume_name])
+            raise
 
     def _start_egress_sidecar(
         self,
@@ -458,6 +563,15 @@ class DockerNetworkingMixin:
         credential_proxy_enabled: bool = False,
         extra_env: Optional[Dict[str, Optional[str]]] = None,
     ):
+        quarantine_enabled = self._validate_egress_quarantine(
+            has_network_policy=True,
+            credential_proxy_enabled=credential_proxy_enabled,
+            extra_env=extra_env,
+        )
+        if quarantine_enabled and egress_api_host_port is None:
+            raise ValueError("Experimental egress quarantine requires the initial readiness probe.")
+        if extra_env and {EXPERIMENTAL_REVISION_RUNTIME_ENV, QUARANTINE_ID_ENV} & extra_env.keys():
+            raise ValueError("Egress quarantine configuration is server-owned.")
         sidecar_name = f"sandbox-egress-{sandbox_id}"
         sidecar_labels = {
             EGRESS_SIDECAR_LABEL: sandbox_id,
@@ -537,12 +651,23 @@ class DockerNetworkingMixin:
             return self.docker_client.api.create_host_config(**sidecar_host_config_kwargs)
 
         include_ipv6_sysctls = self.app_config.egress.disable_ipv6
-        sidecar_host_config = build_sidecar_host_config(include_ipv6_sysctls=include_ipv6_sysctls)
-
         sidecar_container = None
         sidecar_container_id: Optional[str] = None
+        sidecar_creation_attempted = False
+        quarantine_volume_name: Optional[str] = None
         try:
+            if quarantine_enabled:
+                quarantine_volume_name, incarnation = self._provision_egress_quarantine(sandbox_id, egress_image)
+                sidecar_env.extend([
+                    f"{EXPERIMENTAL_REVISION_RUNTIME_ENV}=true",
+                    f"{QUARANTINE_ID_ENV}={incarnation}",
+                ])
+                sidecar_labels[QUARANTINE_LABEL] = "true"
+                sidecar_binds.append(f"{quarantine_volume_name}:{QUARANTINE_DIRECTORY}:rw")
+                base_sidecar_host_config_kwargs["binds"] = sidecar_binds
+            sidecar_host_config = build_sidecar_host_config(include_ipv6_sysctls=include_ipv6_sysctls)
             try:
+                sidecar_creation_attempted = True
                 with self._docker_operation("create egress sidecar", sandbox_id):
                     sidecar_resp = self.docker_client.api.create_container(
                         image=egress_image,
@@ -598,11 +723,15 @@ class DockerNetworkingMixin:
                 )
             return sidecar_container
         except Exception as exc:
+            sidecar_removed = not sidecar_creation_attempted
             if sidecar_container is not None:
                 try:
                     with self._docker_operation("cleanup egress sidecar", sandbox_id):
                         sidecar_container.remove(force=True)
-                except DockerException as cleanup_exc:
+                    sidecar_removed = True
+                except DockerNotFound:
+                    sidecar_removed = True
+                except (DockerException, RequestException) as cleanup_exc:
                     logger.warning(
                         f"Failed to cleanup egress sidecar for sandbox {sandbox_id}: {cleanup_exc}"
                     )
@@ -610,10 +739,17 @@ class DockerNetworkingMixin:
                 try:
                     with self._docker_operation("cleanup egress sidecar (API)", sandbox_id):
                         self.docker_client.api.remove_container(sidecar_container_id, force=True)
-                except DockerException as cleanup_exc:
+                    sidecar_removed = True
+                except DockerNotFound:
+                    sidecar_removed = True
+                except (DockerException, RequestException) as cleanup_exc:
                     logger.warning(
                         f"Failed to cleanup egress sidecar for sandbox {sandbox_id}: {cleanup_exc}"
                     )
+            if quarantine_volume_name and sidecar_removed:
+                cast("DockerSandboxService", self)._cleanup_managed_volumes(
+                    sandbox_id, [quarantine_volume_name],
+                )
             if isinstance(exc, HTTPException):
                 raise exc
             raise HTTPException(

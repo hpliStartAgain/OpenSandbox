@@ -35,9 +35,20 @@ const (
 	defaultMitmShutdownTimeout   = 5 * time.Second
 )
 
-func waitForShutdown(ctx context.Context, proxy *dnsproxy.Proxy, policySrv *http.Server, exemptDst []netip.Addr, applier nftApplier, mitm *mitmTransparent, broadcaster *events.Broadcaster) {
+func waitForShutdown(ctx context.Context, proxy *dnsproxy.Proxy, policySrv *http.Server, exemptDst []netip.Addr, applier nftApplier, mitm *mitmTransparent, broadcaster *events.Broadcaster, owners ...*policyServer) {
 	<-ctx.Done()
 	log.Infof("received shutdown signal; beginning graceful shutdown")
+	if len(owners) > 0 && owners[0] != nil && owners[0].quarantine != nil {
+		owner := owners[0]
+		owner.mu.Lock()
+		owner.requireRevisionRecoveryLocked(revisionRecoveryUnknown)
+		confirmed := packetQuarantineState(owner.quarantine.state.Load()) == quarantineConfirmed
+		owner.mu.Unlock()
+		if !confirmed {
+			log.Errorf("shutdown cleanup refused: QuarantineUnknown")
+			return
+		}
+	}
 
 	// Keep DNS and enforcement alive while accepted notifications finish.
 	if broadcaster != nil {

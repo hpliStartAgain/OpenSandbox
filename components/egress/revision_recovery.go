@@ -176,6 +176,9 @@ func (s *policyServer) requireRevisionRecoveryLocked(reason revisionRecoveryReas
 	if s.nft != nil {
 		s.nft.Quiesce()
 	}
+	if s.quarantine != nil {
+		_ = s.quarantine.contain()
+	}
 }
 
 func (s *policyServer) captureRevisionBootstrap(ctx context.Context) (credentialvault.ActiveSnapshot, int64, *revisionBootstrapTicket, error) {
@@ -269,9 +272,18 @@ func publishRevisionReady(ctx context.Context, m *mitmTransparent, result *revis
 	if m.launchExited {
 		return revision.ErrTransportUnavailable
 	}
+	if s.quarantine != nil {
+		quarantineCheckpoint("after-effects")
+	}
+	if err := s.finishQuarantineTransitionLocked(); err != nil {
+		return err
+	}
 	m.running, m.revisionSession, m.currentGen = result.running, result.session, result.generation
 	m.pending, m.launchGen = nil, 0
 	result.running, result.session = nil, nil
+	if s.quarantine != nil {
+		quarantineCheckpoint("before-ready")
+	}
 	s.mitmGate.SetReady(true)
 	return nil
 }
