@@ -30,7 +30,6 @@ from fastapi import HTTPException, status
 from requests.exceptions import ConnectTimeout, ReadTimeout
 
 from opensandbox_server.services.constants import SANDBOX_ID_LABEL, SandboxErrorCodes
-from opensandbox_server.services.egress_quarantine import reject_quarantine_lifecycle
 from opensandbox_server.services.snapshot_models import SnapshotState
 from opensandbox_server.services.snapshot_runtime import SnapshotRuntimeStatus
 
@@ -62,8 +61,7 @@ class DockerSnapshotRuntime:
         *,
         namespace: str | None = None,
     ) -> None:
-        container = self._get_container_by_sandbox_id(sandbox_id)
-        reject_quarantine_lifecycle(container, "Snapshot")
+        return None
 
     def create_snapshot(
         self,
@@ -161,7 +159,6 @@ class DockerSnapshotRuntime:
 
         try:
             container = self._get_container_by_sandbox_id(sandbox_id)
-            reject_quarantine_lifecycle(container, "Snapshot")
             container.commit(
                 repository=SNAPSHOT_IMAGE_REPOSITORY,
                 tag=snapshot_id,

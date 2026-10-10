@@ -1,3 +1,5 @@
+//go:build !linux
+
 // Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +14,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package mitmproxy
+package quarantine
 
-const guardedListenHelperArg = "--opensandbox-internal-owned-listener"
+import "errors"
+
+// NamespaceTarget is unsupported outside Linux.
+type NamespaceTarget struct{}
+
+func namespaceUnsupported() error { return errors.New("network namespace pinning requires Linux") }
+
+func PinNamespace() (*NamespaceTarget, error) { return nil, namespaceUnsupported() }
+func (*NamespaceTarget) Check() error         { return namespaceUnsupported() }
+func (*NamespaceTarget) Close() error         { return namespaceUnsupported() }

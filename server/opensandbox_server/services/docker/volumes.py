@@ -35,7 +35,6 @@ from opensandbox_server.services.constants import (
     SandboxErrorCodes,
 )
 from opensandbox_server.services.docker.windows_profile import WINDOWS_OEM_VOLUME_PREFIX
-from opensandbox_server.services.egress_quarantine import QUARANTINE_VOLUME_PREFIX
 from opensandbox_server.services.validators import (
     ensure_valid_host_path,
     ensure_volumes_valid,
@@ -174,14 +173,6 @@ class DockerVolumesMixin:
                 fails, or subPath constraints are violated.
         """
         volume_name = volume.pvc.claim_name
-        if volume_name.startswith(QUARANTINE_VOLUME_PREFIX):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "code": SandboxErrorCodes.INVALID_PARAMETER,
-                    "message": "Egress quarantine volumes cannot be mounted into sandbox workloads.",
-                },
-            )
         auto_created = False
         try:
             vol_info = self.docker_client.api.inspect_volume(volume_name)

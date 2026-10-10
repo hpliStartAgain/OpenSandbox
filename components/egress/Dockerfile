@@ -123,10 +123,7 @@ RUN chown mitmproxy:mitmproxy /var/lib/mitmproxy/.mitmproxy/config.yaml \
 # All egress runtime artifacts live under one directory to keep paths grouped.
 COPY --from=builder /out/egress /opt/opensandbox-egress/egress
 COPY --from=builder /out/opensandbox-supervisor /opt/opensandbox-egress/supervisor
-# Experimental pre-start first confirms the independent quarantine table and
-# consumes a lifecycle-provisioned sidecar-only journal. A restart refuses
-# replay and leaves quarantine installed. Legacy pre-start: reap any mitmdump
-# left over from a previous crashed
+# Pre-start hook: reap any mitmdump left over from a previous crashed
 # egress, and remove stale DNS-redirect iptables rules + opensandbox_dns_redirect
 # nft tables left pointing at a dead proxy. The `inet opensandbox` policy table
 # is intentionally NOT touched — the nftables manager prepends its own delete
@@ -146,9 +143,7 @@ RUN chmod -R a+rX /var/egress/mitmscripts
 # Supervisor wraps the egress binary: restarts on crash with backoff and
 # forwards SIGTERM gracefully. The cleanup hook runs only as pre-start; the
 # next egress process re-installs all redirect rules itself after startup,
-# so there is nothing to run on post-exit. Experimental restart attempts first
-# confirm quarantine and then refuse an already-consumed journal; they do not
-# automatically restore service or delete the quarantine table.
+# so there is nothing to run on post-exit.
 # Expects OPENSANDBOX_NETWORK_POLICY env at runtime.
 ENTRYPOINT ["/opt/opensandbox-egress/supervisor", \
             "--pre-start=/opt/opensandbox-egress/cleanup.sh", \

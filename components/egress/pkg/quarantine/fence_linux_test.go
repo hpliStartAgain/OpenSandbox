@@ -77,14 +77,13 @@ func TestQuarantineFenceKernelFaults(t *testing.T) {
 		return
 	}
 	f := NewFence()
-	require.NoError(t, f.Remove(ctx), "removing an initially missing table must be atomic and idempotent")
 	require.NoError(t, f.Ensure(ctx))
 	require.NoError(t, f.Ensure(ctx), "replacing an existing fence must be atomic and idempotent")
-	require.NoError(t, f.Remove(ctx))
+	cleanupKernelFence(t, ctx)
 	injected := errors.New("injected result loss")
 	for _, after := range []bool{false, true} {
 		t.Run(fmt.Sprintf("ensure-after-apply=%v", after), func(t *testing.T) {
-			require.NoError(t, NewFence().Remove(ctx))
+			cleanupKernelFence(t, ctx)
 			f := &Fence{run: func(ctx context.Context, script string, args ...string) ([]byte, error) {
 				if script != "" && !after {
 					return nil, injected
@@ -106,56 +105,41 @@ func TestQuarantineFenceKernelFaults(t *testing.T) {
 			require.Equal(t, after, present)
 		})
 	}
-	for _, after := range []bool{false, true} {
-		t.Run(fmt.Sprintf("remove-after-delete=%v", after), func(t *testing.T) {
-			require.NoError(t, NewFence().Ensure(ctx))
-			f := &Fence{run: func(ctx context.Context, script string, args ...string) ([]byte, error) {
-				if script != "" && !after {
-					return nil, injected
-				}
-				out, err := runFenceNft(ctx, script, args...)
-				if script != "" && err == nil {
-					return out, injected
-				}
-				return out, err
-			}}
-			err := f.Remove(ctx)
-			if after {
-				require.NoError(t, err)
-			} else {
-				require.Error(t, err)
+	t.Run("readback-failure", func(t *testing.T) {
+		require.NoError(t, NewFence().Ensure(ctx))
+		f := &Fence{run: func(ctx context.Context, script string, args ...string) ([]byte, error) {
+			if script == "" {
+				return nil, injected
 			}
-			present, err := NewFence().read(ctx)
-			require.NoError(t, err)
-			require.Equal(t, !after, present)
-		})
-	}
-	for _, remove := range []bool{false, true} {
-		t.Run(fmt.Sprintf("readback-failure-remove=%v", remove), func(t *testing.T) {
-			require.NoError(t, NewFence().Ensure(ctx))
-			f := &Fence{run: func(ctx context.Context, script string, args ...string) ([]byte, error) {
-				if script == "" {
-					return nil, injected
-				}
-				return runFenceNft(ctx, script, args...)
-			}}
-			if remove {
-				require.ErrorIs(t, f.Remove(ctx), injected)
-			} else {
-				require.ErrorIs(t, f.Ensure(ctx), injected)
-			}
-			present, err := NewFence().read(ctx)
-			require.NoError(t, err)
-			require.Equal(t, !remove, present)
-		})
-	}
+			return runFenceNft(ctx, script, args...)
+		}}
+		require.ErrorIs(t, f.Ensure(ctx), injected)
+		present, err := NewFence().read(ctx)
+		require.NoError(t, err)
+		require.True(t, present)
+	})
 	require.NoError(t, NewFence().Ensure(ctx))
 	_, err := runFenceNft(ctx, "add table inet opensandbox_quarantine { flags dormant; }\n", "-f", "-")
 	require.NoError(t, err)
 	_, err = NewFence().read(ctx)
 	require.Error(t, err, "a disabled table must never be accepted")
 	require.NoError(t, NewFence().Ensure(ctx), "must replace a disabled table")
-	require.NoError(t, NewFence().Remove(ctx))
+	cleanupKernelFence(t, ctx)
+}
+
+// cleanupKernelFence only releases this test's isolated namespace resources.
+// It is deliberately test-only: the runtime has no unfence/recovery operation.
+func cleanupKernelFence(t *testing.T, ctx context.Context) {
+	t.Helper()
+	present, err := NewFence().read(ctx)
+	require.NoError(t, err)
+	if present {
+		_, err = runFenceNft(ctx, "delete table inet opensandbox_quarantine\n", "-f", "-")
+		require.NoError(t, err)
+	}
+	present, err = NewFence().read(ctx)
+	require.NoError(t, err)
+	require.False(t, present, "test namespace cleanup left its quarantine table")
 }
 
 // The traffic matrix exercises all three hooks using veth-connected peers and
@@ -305,11 +289,7 @@ func TestQuarantineFenceKernelTraffic(t *testing.T) {
 	for _, flow := range flows {
 		require.EqualValues(t, 1, flow.server.call(t, fencePeerRequest{Op: "count", ID: flow.listener}).Count, flow.name)
 	}
-	require.NoError(t, fence.Remove(ctx))
-	for _, flow := range flows {
-		require.Empty(t, flow.client.call(t, fencePeerRequest{Op: "dial", ID: flow.name + "-recovered", Network: flow.network, Address: flow.address, Mark: flow.mark}).Error, flow.name)
-		require.Empty(t, flow.client.call(t, fencePeerRequest{Op: "exchange", ID: flow.name + "-recovered", Payload: "after"}).Error, flow.name)
-	}
+	cleanupKernelFence(t, ctx)
 	t.Logf("verified %d IPv4/IPv6 TCP/UDP flows: existing and new traffic, input/output/forward, loopback, mark=0x1, MITM UID and scoped upstream proxy", len(flows))
 }
 

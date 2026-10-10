@@ -37,7 +37,7 @@ const (
 //
 // This boundary assumes the workload cannot modify the namespace's network
 // administration or use raw/L2 or offloaded paths to bypass these inet hooks.
-// The owner must serialize lifecycle state with Ensure and Remove. A successful
+// The owner must serialize lifecycle state with Ensure. A successful
 // operation reports a verified kernel snapshot, not protection from another
 // privileged writer modifying the table afterward.
 type Fence struct {
@@ -70,25 +70,6 @@ func (f *Fence) Ensure(ctx context.Context) error {
 	return fmt.Errorf("packet quarantine installation is unconfirmed: %w", errors.Join(applyErr, readErr))
 }
 
-// Remove atomically deletes the fence and confirms that the kernel no longer
-// contains it. Callers must not publish normal service until this succeeds.
-func (f *Fence) Remove(ctx context.Context) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	_, removeErr := f.run(ctx, fenceRemoveScript, "-f", "-")
-	present, readErr := f.read(ctx)
-	if readErr == nil && !present {
-		return nil
-	}
-	if readErr == nil {
-		readErr = errors.New("quarantine table is still present")
-	}
-	return fmt.Errorf("packet quarantine removal is unconfirmed: %w", errors.Join(removeErr, readErr))
-}
-
 // "add" is idempotent for an existing table. The whole input is one nft
 // transaction, including add/delete/recreate, so missing and existing tables
 // need neither a racy preliminary lookup nor stderr-based missing-table guesses.
@@ -111,10 +92,6 @@ table inet opensandbox_quarantine {
         drop
     }
 }
-`
-
-const fenceRemoveScript = `add table inet opensandbox_quarantine
-delete table inet opensandbox_quarantine
 `
 
 func runFenceNft(ctx context.Context, script string, args ...string) ([]byte, error) {

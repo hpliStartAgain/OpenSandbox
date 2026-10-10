@@ -15,7 +15,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,52 +70,4 @@ exit 0
 func writeExecutable(t *testing.T, path string, content string) {
 	t.Helper()
 	require.NoError(t, os.WriteFile(path, []byte(strings.TrimLeft(content, "\n")), 0o755))
-}
-
-func TestExperimentalCleanupRequiresGuardBeforeAnyEffect(t *testing.T) {
-	for _, truth := range []string{"1", "true", " tRuE ", "yes", "y", "ON", "  \ntrue\n  ", "\u00a0true\u00a0"} {
-		for _, success := range []bool{false, true} {
-			t.Run(truth+fmt.Sprint(success), func(t *testing.T) {
-				dir := t.TempDir()
-				trace := filepath.Join(dir, "trace")
-				guard := filepath.Join(dir, "guard")
-				writeExecutable(t, filepath.Join(dir, "tr"), "#!/bin/sh\nexit 1\n")
-				status := "1"
-				if success {
-					status = "0"
-				} else {
-					writeExecutable(t, filepath.Join(dir, "sed"), "#!/bin/sh\nexit 1\n")
-				}
-				writeExecutable(t, guard, "#!/bin/sh\necho guard >> "+trace+"\nexit "+status+"\n")
-				for _, name := range []string{"nft", "iptables", "ip6tables", "pkill", "sleep"} {
-					writeExecutable(t, filepath.Join(dir, name), "#!/bin/sh\necho "+name+" >> "+trace+"\nexit 0\n")
-				}
-				source, err := os.ReadFile("scripts/cleanup.sh")
-				require.NoError(t, err)
-				// The production path is fixed; only this disposable fixture substitutes a guard.
-				fixture := strings.ReplaceAll(string(source), "/opt/opensandbox-egress/egress", guard)
-				script := filepath.Join(dir, "cleanup.sh")
-				require.NoError(t, os.WriteFile(script, []byte(fixture), 0700))
-				cmd := exec.Command("sh", script)
-				cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME="+truth)
-				output, err := cmd.CombinedOutput()
-				if success {
-					require.NoError(t, err, string(output))
-				} else {
-					require.Error(t, err)
-				}
-				raw, err := os.ReadFile(trace)
-				require.NoError(t, err)
-				lines := strings.Fields(string(raw))
-				require.Equal(t, "guard", lines[0])
-				if !success {
-					require.Equal(t, []string{"guard"}, lines)
-				} else {
-					require.Contains(t, lines, "nft")
-					require.Contains(t, lines, "pkill")
-				}
-				require.NotContains(t, fixture, "delete table inet opensandbox_quarantine")
-			})
-		}
-	}
 }

@@ -60,18 +60,6 @@ jobs:
         run: |
           go test ./...
 
-      - name: Verify guarded child listener test discovery
-        working-directory: components/egress
-        shell: bash
-        run: |
-          set -euo pipefail
-          name=TestWaitOwnedListenContextExactChild
-          go test ./pkg/mitmproxy -list "^${name}$" | grep -Fx "$name"
-          go test ./pkg/mitmproxy -run "^${name}$" -count=1 -v | tee /tmp/quarantine-listener.log
-          ! grep -q -- '--- SKIP:' /tmp/quarantine-listener.log
-          grep -Fx "=== RUN   $name" /tmp/quarantine-listener.log
-          grep -E "^--- PASS: ${name} \([0-9.]+s\)$" /tmp/quarantine-listener.log
-
       - name: Test privileged regression runners
         working-directory: components/egress
         run: python -m unittest discover -v -s scripts -p "test_*.py"
@@ -115,27 +103,9 @@ jobs:
             TestQuarantineFenceKernelTraffic \
             TestQuarantineFenceKernelFaults
 
-      - name: Run privileged quarantine journal regressions
-        working-directory: components/egress
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get install -y e2fsprogs
-          binary="$(mktemp /tmp/quarantine-journal.XXXXXX)"
-          log="$(mktemp /tmp/quarantine-journal-log.XXXXXX)"
-          trap 'rm -f "$binary" "$log"' EXIT
-          go test -c -o "$binary" ./pkg/quarantine
-          "$binary" -test.list '^TestJournalPrivilegedMounts$' | grep -Fx TestJournalPrivilegedMounts
-          sudo env OPENSANDBOX_RUN_JOURNAL_MOUNT_TESTS=1 \
-            "$binary" -test.run '^TestJournalPrivilegedMounts$' -test.v -test.timeout=5m | tee "$log"
-          ! grep -q -- '--- SKIP:' "$log"
-          grep -Fx '=== RUN   TestJournalPrivilegedMounts' "$log"
-          grep -E '^--- PASS: TestJournalPrivilegedMounts \([0-9.]+s\)$' "$log"
-
-      - name: Run real quarantine image restart regressions
+      - name: Run real runtime recovery quarantine image regression
         run: |
           docker build -f components/egress/Dockerfile \
-            --build-arg GOFLAGS=-tags=egress_quarantine_faults \
             -t opensandbox-egress:quarantine-ci .
           python components/egress/scripts/test_quarantine_image.py \
             --image opensandbox-egress:quarantine-ci --artifacts /tmp/quarantine-image-evidence
@@ -217,7 +187,7 @@ jobs:
           go-version: '1.25.9'
 
       - name: Install nftables
-        run: sudo apt-get update && sudo apt-get install -y nftables iproute2 util-linux
+        run: sudo apt-get update && sudo apt-get install -y nftables
 
       - name: Install mitmproxy (MITM smoke phase, mirrors the egress image)
         run: |

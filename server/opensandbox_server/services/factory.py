@@ -28,7 +28,6 @@ from opensandbox_server.services.k8s import KubernetesSandboxService
 from opensandbox_server.services.fast_sandbox import FastSandboxService
 from opensandbox_server.services.sandbox_service import SandboxService
 from opensandbox_server.services.composite_service import CompositeSandboxService
-from opensandbox_server.services.egress_quarantine import experimental_revision_runtime_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +51,6 @@ def create_sandbox_service(
     """
     active_config = config or get_config()
     selected_type = (service_type or active_config.runtime.type).lower()
-
-    if experimental_revision_runtime_enabled() and selected_type != "docker":
-        raise ValueError(
-            "Experimental egress quarantine requires the Docker runtime; "
-            "Kubernetes and Fast Sandbox are unsupported."
-        )
 
     logger.info(f"Creating sandbox service with type: {selected_type}")
 

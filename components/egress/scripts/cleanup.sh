@@ -34,16 +34,12 @@
 #     nftables manager already prepends `delete table inet opensandbox` to
 #     its ruleset script, so ApplyStatic is idempotent.
 #
-# Legacy contract: this script MUST NOT exit non-zero. Experimental revision
-# mode instead confirms independent quarantine before any cleanup; failure
-# prevents supervisor from starting another worker.
-# Legacy: A misbehaving cleanup
+# Hard contract: this script MUST NOT exit non-zero. A misbehaving cleanup
 # hook is worse than a stray mitmdump; supervisor would treat the hook
 # failure as a launch attempt and trip its crashloop budget faster.
 
 # Intentionally no `set -e`. `set -u` for typo safety on env names only.
 set -u
-
 
 log() { printf '[egress-cleanup] %s\n' "$*" >&2; }
 
@@ -103,16 +99,6 @@ kill_stray_mitmdump() {
 
 main() {
   log "starting (worker_exit_code=${WORKER_EXIT_CODE:-?} signal=${WORKER_SIGNAL:-?} attempt=${WORKER_ATTEMPT:-?})"
-  # Parse the gate in the trusted binary, not a shell normalization pipeline.
-  # A failed utility or Unicode/newline whitespace must never bypass guarding.
-  # The default unset legacy gate does not need the helper. Explicit false
-  # values are a no-op in the helper, using the same parser as the worker.
-  if [ -n "${OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME:-}" ]; then
-    if ! /opt/opensandbox-egress/egress --guard-quarantine; then
-      log "quarantine guard failed; cleanup and worker launch refused"
-      exit 1
-    fi
-  fi
   remove_stale_dns_redirect_nft
   remove_stale_iptables
   kill_stray_mitmdump
@@ -121,10 +107,6 @@ main() {
 }
 
 # Trap unexpected interpreter errors so we still exit 0.
-if [ -n "${OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME:-}" ]; then
-  trap 'exit 1' HUP INT TERM
-else
-  trap 'log "cleanup hit shell error on line $LINENO; exiting 0 anyway"; exit 0' HUP INT TERM
-fi
+trap 'log "cleanup hit shell error on line $LINENO; exiting 0 anyway"; exit 0' HUP INT TERM
 main "$@" || true
 exit 0

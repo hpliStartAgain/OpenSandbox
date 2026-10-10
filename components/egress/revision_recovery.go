@@ -272,18 +272,9 @@ func publishRevisionReady(ctx context.Context, m *mitmTransparent, result *revis
 	if m.launchExited {
 		return revision.ErrTransportUnavailable
 	}
-	if s.quarantine != nil {
-		quarantineCheckpoint("after-effects")
-	}
-	if err := s.finishQuarantineTransitionLocked(); err != nil {
-		return err
-	}
 	m.running, m.revisionSession, m.currentGen = result.running, result.session, result.generation
 	m.pending, m.launchGen = nil, 0
 	result.running, result.session = nil, nil
-	if s.quarantine != nil {
-		quarantineCheckpoint("before-ready")
-	}
 	s.mitmGate.SetReady(true)
 	return nil
 }

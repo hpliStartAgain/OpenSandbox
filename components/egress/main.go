@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -45,20 +44,6 @@ import (
 )
 
 func main() {
-	if handled, err := mitmproxy.HandleOwnedListenHelper(os.Args[1:]); handled {
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
-	if handled, err := runQuarantineCommand(); handled {
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "experimental lifecycle guard:", err)
-			os.Exit(1)
-		}
-		return
-	}
 	version.EchoVersion("OpenSandbox Egress")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -66,14 +51,6 @@ func main() {
 
 	ctx = withLogger(ctx)
 	defer log.Logger.Sync()
-
-	quarantineOwner, err := beginSidecarQuarantine()
-	if err != nil {
-		log.Fatalf("experimental quarantine startup: %v", err)
-	}
-	if quarantineOwner != nil {
-		defer quarantineOwner.journal.Close()
-	}
 
 	// Validate the chained upstream proxy env before profile dispatch: a
 	// configured proxy without transparent mitmproxy (and, outside
@@ -91,6 +68,14 @@ func main() {
 	if profile == constants.ProfileFastSandbox {
 		runFastSandboxProfile(ctx, upstreamSpec)
 		return
+	}
+
+	quarantineOwner, err := newRevisionQuarantine()
+	if err != nil {
+		log.Fatalf("experimental runtime containment: %v", err)
+	}
+	if quarantineOwner != nil {
+		defer quarantineOwner.target.Close()
 	}
 
 	// Reject unsupported experimental storage before policy loading or network
@@ -218,9 +203,6 @@ func main() {
 	}
 	if mitm != nil {
 		mitm.watchMitmproxy(ctx, mitmGate)
-	}
-	if quarantineOwner != nil {
-		policyHandler.startAlwaysRuleReloadJob()
 	}
 
 	if err := startup.RunPost(ctx); err != nil {

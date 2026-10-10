@@ -171,9 +171,7 @@ func startPolicyServer(
 		}
 		return nil, nil, err
 	case <-time.After(200 * time.Millisecond):
-		if handler.quarantine == nil {
-			handler.startAlwaysRuleReloadJob()
-		}
+		handler.startAlwaysRuleReloadJob()
 		safego.Go(func() {
 			if err := <-errCh; err != nil {
 				log.Errorf("policy server error: %v", err)
@@ -202,8 +200,6 @@ type policyServer struct {
 	credentialVault           *credentialvault.Store
 	revisionRecovery          *revisionRecoveryState
 	quarantine                *revisionQuarantine
-	quarantineReadyTicket     uint64
-	quarantineWasReady        bool
 	atomicPolicyFile          atomicPolicyFileStore
 	mitmGate                  *mitmproxy.HealthGate
 	credentialVaultRequireTLS bool
@@ -704,16 +700,6 @@ func (s *policyServer) commitPolicy(ctx context.Context, w http.ResponseWriter, 
 		pol = frozen.user
 		alwaysDeny, alwaysAllow = frozen.alwaysDeny, frozen.alwaysAllow
 	}
-	if err := s.beginQuarantineTransitionLocked("policy"); err != nil {
-		http.Error(w, "revision quarantine unavailable", http.StatusServiceUnavailable)
-		return false
-	}
-	completed := false
-	defer func() {
-		if s.quarantine != nil && !completed {
-			s.requireRevisionRecoveryLocked(revisionRecoveryExternalEffectsUnknown)
-		}
-	}()
 	restore, persistErr := s.persistPolicyChangeLocked(pol)
 	if persistErr != nil {
 		logEgressUpdateFailedError(fmt.Sprintf("persist policy: %v", persistErr))
@@ -750,11 +736,6 @@ func (s *policyServer) commitPolicy(ctx context.Context, w http.ResponseWriter, 
 		s.revisionRecovery.current = stagedBase
 		s.invalidateRevisionBootstrapLocked()
 	}
-	if err := s.finishQuarantineTransitionLocked(); err != nil {
-		http.Error(w, "revision quarantine unavailable", http.StatusServiceUnavailable)
-		return false
-	}
-	completed = true
 	return true
 }
 
@@ -811,12 +792,6 @@ func (s *policyServer) reloadAlwaysRules() (bool, error) {
 	if err := s.revisionRecovery.recoveryErrorLocked(); err != nil {
 		return false, err
 	}
-	transitionStarted, completed := false, false
-	defer func() {
-		if s.quarantine != nil && transitionStarted && !completed {
-			s.requireRevisionRecoveryLocked(revisionRecoveryExternalEffectsUnknown)
-		}
-	}()
 	var stagedBase *effectivePolicyBase
 	var stagedAllow []policy.EgressRule
 	deny, _, changed, err := s.alwaysLoader.RefreshIfDueWithApply(time.Now(), func(deny, allow []policy.EgressRule) error {
@@ -839,10 +814,6 @@ func (s *policyServer) reloadAlwaysRules() (bool, error) {
 			frozen := cloneEffectivePolicyInputs(stagedBase.inputs)
 			current = frozen.user
 			deny, stagedAllow = frozen.alwaysDeny, frozen.alwaysAllow
-		}
-		transitionStarted = true
-		if err := s.beginQuarantineTransitionLocked("always-rules"); err != nil {
-			return err
 		}
 		if s.nft == nil {
 			return nil
@@ -875,10 +846,6 @@ func (s *policyServer) reloadAlwaysRules() (bool, error) {
 		s.revisionRecovery.current = stagedBase
 		s.invalidateRevisionBootstrapLocked()
 	}
-	if err := s.finishQuarantineTransitionLocked(); err != nil {
-		return false, err
-	}
-	completed = true
 	return true, nil
 }
 

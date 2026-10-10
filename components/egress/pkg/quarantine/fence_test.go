@@ -85,48 +85,6 @@ func TestFenceEnsureRequiresReadback(t *testing.T) {
 	}
 }
 
-func TestFenceRemoveRequiresReadback(t *testing.T) {
-	failed := errors.New("injected delete failure")
-	for _, tc := range []struct {
-		name              string
-		writeErr, readErr error
-		readback          []byte
-		wantErr           bool
-	}{
-		{"deleted", nil, nil, absentFenceJSON, false},
-		{"already-absent", failed, nil, absentFenceJSON, false},
-		{"failed-before-delete", failed, nil, fenceJSON(), true},
-		{"failed-after-delete", failed, nil, absentFenceJSON, false},
-		{"successful-command-without-delete", nil, nil, fenceJSON(), true},
-		{"readback-failure", nil, failed, absentFenceJSON, true},
-		{"readback-invalid", nil, nil, []byte(`{}`), true},
-		{"readback-incomplete-table", nil, nil, []byte(`{"nftables":[{"table":{"family":"inet","name":"opensandbox_quarantine"}}]}`), true},
-		{"stderr-not-absence", errors.New("No such file or directory"), failed, nil, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			calls := 0
-			f := &Fence{run: func(_ context.Context, script string, args ...string) ([]byte, error) {
-				calls++
-				if calls == 1 {
-					require.Equal(t, fenceRemoveScript, script)
-					require.Equal(t, []string{"-f", "-"}, args)
-					return nil, tc.writeErr
-				}
-				require.Empty(t, script)
-				require.Equal(t, []string{"-j", "list", "ruleset", "inet"}, args)
-				return tc.readback, tc.readErr
-			}}
-			err := f.Remove(context.Background())
-			if tc.wantErr {
-				require.ErrorContains(t, err, "removal is unconfirmed")
-			} else {
-				require.NoError(t, err)
-			}
-			require.Equal(t, 2, calls)
-		})
-	}
-}
-
 func TestFenceReadbackStrict(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -196,42 +154,33 @@ func TestFenceReadbackStrict(t *testing.T) {
 }
 
 func TestFenceCancellationAndSerialization(t *testing.T) {
-	for _, remove := range []bool{false, true} {
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		f := &Fence{run: func(context.Context, string, ...string) ([]byte, error) {
-			t.Fatal("canceled operation submitted nft")
-			return nil, nil
-		}}
-		if remove {
-			require.ErrorIs(t, f.Remove(ctx), context.Canceled)
-		} else {
-			require.ErrorIs(t, f.Ensure(ctx), context.Canceled)
-		}
-	}
 	ctx, cancel := context.WithCancel(context.Background())
-	f := &Fence{run: func(_ context.Context, script string, _ ...string) ([]byte, error) {
+	cancel()
+	f := &Fence{run: func(context.Context, string, ...string) ([]byte, error) {
+		t.Fatal("canceled operation submitted nft")
+		return nil, nil
+	}}
+	require.ErrorIs(t, f.Ensure(ctx), context.Canceled)
+	ctx, cancel = context.WithCancel(context.Background())
+	f = &Fence{run: func(_ context.Context, script string, _ ...string) ([]byte, error) {
 		if script != "" {
 			cancel()
 		}
 		return fenceJSON(), nil
 	}}
 	require.ErrorIs(t, f.Ensure(ctx), context.Canceled)
-	started, release := make(chan struct{}), make(chan struct{})
+	started, release, queued := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var sequence []string
 	f = &Fence{run: func(_ context.Context, script string, _ ...string) ([]byte, error) {
 		if script == fenceInstallScript {
 			sequence = append(sequence, "ensure")
-			close(started)
-			<-release
-		} else if script == fenceRemoveScript {
-			sequence = append(sequence, "remove")
+			if len(sequence) == 1 {
+				close(started)
+				<-release
+			}
 		} else {
 			sequence = append(sequence, "read")
-			if len(sequence) == 2 {
-				return fenceJSON(), nil
-			}
-			return absentFenceJSON, nil
+			return fenceJSON(), nil
 		}
 		return nil, nil
 	}}
@@ -239,29 +188,27 @@ func TestFenceCancellationAndSerialization(t *testing.T) {
 	wg.Add(2)
 	go func() { defer wg.Done(); require.NoError(t, f.Ensure(context.Background())) }()
 	<-started
-	go func() { defer wg.Done(); require.NoError(t, f.Remove(context.Background())) }()
+	go func() { defer wg.Done(); close(queued); require.NoError(t, f.Ensure(context.Background())) }()
+	<-queued
 	close(release)
 	wg.Wait()
-	require.Equal(t, []string{"ensure", "read", "remove", "read"}, sequence)
+	require.Equal(t, []string{"ensure", "read", "ensure", "read"}, sequence)
 }
 
-func TestFenceScriptsAreIndependentAtomicBatches(t *testing.T) {
-	require.True(t, strings.HasPrefix(fenceInstallScript, fenceRemoveScript))
-	for _, script := range []string{fenceInstallScript, fenceRemoveScript} {
-		require.NotContains(t, script, "flush ruleset")
-		require.NotContains(t, script, "table inet opensandbox\n")
-		for _, exception := range []string{"accept", "ct state", "meta mark", "skuid", "lo\"", "redirect"} {
-			require.NotContains(t, script, exception)
-		}
+func TestFenceScriptIsAnIndependentAtomicBatch(t *testing.T) {
+	require.True(t, strings.HasPrefix(fenceInstallScript, "add table inet opensandbox_quarantine\ndelete table inet opensandbox_quarantine\n"))
+	require.NotContains(t, fenceInstallScript, "flush ruleset")
+	require.NotContains(t, fenceInstallScript, "table inet opensandbox\n")
+	for _, exception := range []string{"accept", "ct state", "meta mark", "skuid", "lo\"", "redirect"} {
+		require.NotContains(t, fenceInstallScript, exception)
 	}
 	for _, hook := range []string{"input", "output", "forward"} {
 		require.Contains(t, fenceInstallScript, "type filter hook "+hook+" priority -450; policy drop;")
 	}
 }
 
-func TestFenceMissingBinaryCannotProveIsolationOrAbsence(t *testing.T) {
+func TestFenceMissingBinaryCannotProveIsolation(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	fence := NewFence()
 	require.ErrorContains(t, fence.Ensure(context.Background()), "installation is unconfirmed")
-	require.ErrorContains(t, fence.Remove(context.Background()), "removal is unconfirmed")
 }

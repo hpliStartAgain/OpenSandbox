@@ -94,8 +94,7 @@ const (
 	EnvMitmproxyUpstreamExtraCA = "OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA"
 	EnvMitmproxySslInsecure     = "OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE"
 	// EnvExperimentalRevisionRuntime enables the internal OSEP-0023
-	// revision bootstrap and Docker durable-quarantine lifecycle contract.
-	// It requires private provisioned state; it is not a public interception mode.
+	// per-mitmdump revision bootstrap path. It is not a public interception mode.
 	EnvExperimentalRevisionRuntime = "OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME"
 	// EnvMitmproxyExtraPorts (EXPERIMENTAL): extra TCP dports to intercept,
 	// appended to the always-on 80,443. Comma-separated. May change or be
