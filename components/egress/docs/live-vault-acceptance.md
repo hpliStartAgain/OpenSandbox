@@ -114,11 +114,11 @@ for local reproduction:
   pins the origin addresses and allows them statically instead of relying on
   DNS-learned dynamic entries. Kubernetes deployments resolve through a
   non-loopback cluster DNS and keep the dynamic path.
-- The local run used an image assembled from the candidate's own binaries and
-  scripts on top of runtime layers built from the byte-identical
-  `components/egress/Dockerfile` at an earlier commit, because the local Debian
-  mirror could not finish the `apt-get` layer within the build timeout. CI
-  builds the image from source.
+- The local run built the image from source with the ordinary Dockerfile. The
+  two optional build knobs added for restricted build networks were used
+  (`--build-arg GOPROXY=<mirror>` and `--build-arg APT_MIRROR=<mirror>`); both
+  default to empty, leaving upstream CI builds on `proxy.golang.org` and
+  `deb.debian.org`. CI builds the image the same way and runs the same script.
 
 ## Evidence hygiene
 
