@@ -883,10 +883,13 @@ cannot terminate a callback that ignores cancellation.
 failure after the receiver committed, are terminal session failures rather
 than reconcilable mutation outcomes. They return no attempt identity and never
 authorize candidate finalization. The future owner must stop the exact child,
-close the session, discard the unpublished candidate, and start a fresh session
-from the prior public state. This primitive does not connect public mutation
-handlers, finalize the Vault store, or install connection fences; selective
-TLS decisions remain disabled.
+close the session, discard the unpublished candidate, and latch sticky
+unknown-outcome recovery — the external effects cannot be confirmed, so the
+same sidecar must never bootstrap a fresh session from the possibly-stale
+prior public state; recovery requires replacing the sidecar. This primitive
+does not connect public mutation handlers, finalize the Vault store, or
+install connection fences; selective TLS decisions remain disabled. (This is
+the current implementation-owner behavior; the proposal itself is unchanged.)
 
 The Go Vault store can now prepare unpublished create, patch, and delete
 candidates. A candidate freezes its rendered `ActiveSnapshot` before commit,
@@ -1335,14 +1338,22 @@ keepalive). The launcher hands the mitmdump child the live admission bundle
 alongside the revision session; the addon then builds a `LiveReceiver` whose
 registry admits real connections instead of the installation-only receiver.
 `tls_clienthello` classifies visible SNI against the installed immutable
-snapshot: an unbound, invalid or ECH-hidden name and a no-SNI ClientHello pass
-through opaquely, a bound host is decrypted only with a registry admission, and
-every deny outcome (bootstrapping, generation mismatch, invalid SNI, exhausted
+snapshot: an unbound or no-SNI ClientHello passes through opaquely, as does an
+ECH-hidden connection detected from the actual `encrypted_client_hello`
+extension (0xfe0d) in the parsed extension list; a bound host is decrypted
+only with a registry admission, and every deny outcome (bootstrapping,
+generation mismatch, invalid SNI, malformed ClientHello data, exhausted
 registry) closes the connection instead of decrypting or tunneling unknown
 state. A decrypted connection without an admission is rejected at
-`requestheaders`, where each request acquires a revision-pinned snapshot, the
-request authority must equal the connection SNI, and the rendered bindings
-drive the existing binding/path/method match, injection and redaction path.
+`requestheaders`, where each request acquires a revision-pinned snapshot,
+the strict HTTP/1 request authority (exactly one well-formed `Host`, port
+omitted or 443, matching absolute-form target when present) must equal both
+the connection SNI and the admission token SNI, `ssl_insecure` is rejected
+under the live bundle, terminal outcomes with unknown external effects latch
+sticky recovery rather than restarting from prior state, and the rendered
+bindings drive the existing binding/path/method match, injection and
+redaction path. The task-level acceptance record for this loop is kept in
+[live-vault-acceptance.md](../docs/guides/live-vault-acceptance.md).
 Public `POST`/`PATCH`/`DELETE /credential-vault` now run the Go mutation
 transaction under the shared policy/Vault barrier: the candidate is installed
 and acknowledged on the receiver before the Store is finalized, a stale

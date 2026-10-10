@@ -327,6 +327,12 @@ func validateRevisionIPCConfig(cfg *RevisionIPCConfig) error {
 			cfg.DrainTimeoutSeconds < 1 || cfg.DrainTimeoutSeconds > 300) {
 		return errInvalidRevisionIPCConfig
 	}
+	// The live credential-bound mode never runs with insecure upstream
+	// verification: credential injection requires the verified origin
+	// identity. The installation-only receiver keeps the legacy escape hatch.
+	if cfg.LiveAdmission && constants.IsTruthy(os.Getenv(constants.EnvMitmproxySslInsecure)) {
+		return errInvalidRevisionIPCConfig
+	}
 	return nil
 }
 

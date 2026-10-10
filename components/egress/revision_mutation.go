@@ -42,9 +42,11 @@ import (
 // Lock order is policy barrier -> exclusive process lease. Both stay held from
 // candidate preparation through local finalization or terminal cleanup. Unlike
 // withRevisionMutationSession, this owner can detach failed resources without a
-// lock upgrade. Recovery directly stops/reaps the exact child before closing its
-// session and discarding the candidate. It never calls lifecycle lock methods.
-// IPC is context-bounded, but existing stop/reap has no hard recovery deadline.
+// lock upgrade. A terminal detach first latches sticky recovery (its remote
+// effects are unprovable), then stops/reaps the exact child before closing its
+// session and discarding the candidate; the same sidecar never restarts from
+// prior state. It never calls lifecycle lock methods. IPC is context-bounded,
+// but existing stop/reap has no hard recovery deadline.
 func (s *policyServer) mutateRevisionVault(
 	ctx context.Context, m *mitmTransparent,
 	prepare func(*credentialvault.Store, *policy.NetworkPolicy) (*credentialvault.MutationCandidate, error),
@@ -99,14 +101,24 @@ func (s *policyServer) mutateRevisionVault(
 	session := m.revisionSession
 	detach := func() (credentialvault.State, error) {
 		s.mitmGate.SetReady(false)
+		// A terminal detach cannot prove the remote outcome, so it latches
+		// sticky recovery BEFORE detaching/stopping: no same-sidecar restart,
+		// every outstanding bootstrap ticket is fenced, nft is quiesced and
+		// quarantine contains. Known prepare rejection and an exact-previous
+		// reconcile are the only nonsticky outcomes and never reach here.
+		s.requireRevisionRecoveryLocked(revisionRecoveryExternalEffectsUnknown)
 		running := m.running
 		m.running, m.revisionSession = nil, nil
-		// Keep currentGen: the exact child's exit event drives fresh bootstrap, whose
-		// snapshot must wait for s.mu. Concurrent shutdown also waits for this lease.
+		// Keep currentGen: the exact child's exit event is fenced by the same
+		// recovery latch, which any fresh bootstrap must wait on via s.mu.
+		// Concurrent shutdown also waits for this lease.
 		m.revisionOwner.stop(running)
 		// Close failures remain a failed transaction. Do not expose error text that
 		// may contain credentials or filesystem details, or restore readiness here.
-		if err := session.Close(); err != nil && s.revisionRecovery != nil {
+		// The detach latch already quiesced/contained, so a second latch attempt
+		// must not repeat those effects; it only fires when nothing latched yet.
+		if err := session.Close(); err != nil && s.revisionRecovery != nil &&
+			s.revisionRecovery.recoveryErrorLocked() == nil {
 			s.requireRevisionRecoveryLocked(revisionRecoverySessionCleanupFailed)
 		}
 		return empty, revision.ErrTransportUnavailable

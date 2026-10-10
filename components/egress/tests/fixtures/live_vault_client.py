@@ -34,11 +34,13 @@ the driver masks well-known authorization headers in its own output.
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import socket
 import ssl
 import sys
+import time
 
 MITM_CA = "/opt/opensandbox/mitmproxy-ca-cert.pem"
 ORIGIN_CA = "/run/live-origin/ca.pem"
@@ -69,9 +71,9 @@ class Result:
             self.connection = None
 
 
-def with_suppressed(fn) -> None:
+def with_suppressed(fn, *args) -> None:
     try:
-        fn()
+        fn(*args)
     except Exception:
         pass
 
@@ -119,6 +121,12 @@ def vault_api(command: dict) -> dict:
 
 
 def perform_one(request: dict, connections: list) -> dict:
+    if request.get("ech_hello"):
+        return perform_ech_hello(request)
+    if request.get("raw") is not None:
+        return perform_raw(request)
+    if request.get("idle_read"):
+        return perform_idle_read(request, connections)
     host = request["host"]
     path = request.get("path", "/echo")
     method = request.get("method", "GET")
@@ -202,6 +210,205 @@ def mask(value: str) -> str:
     if not value:
         return ""
     return "present(" + str(len(value)) + " chars)"
+
+
+def _build_client_hello(sni: str, extra: tuple = ()) -> bytes:
+    """Minimal TLS 1.2 ClientHello body; unknown extensions ride along."""
+    name = sni.encode("ascii")
+    entry = b"\x00" + len(name).to_bytes(2, "big") + name
+    sni_body = len(entry).to_bytes(2, "big") + entry
+    extensions = (0).to_bytes(2, "big") + len(sni_body).to_bytes(2, "big") + sni_body
+    for ext_type, payload in (
+        (0x000A, b"\x00\x04\x00\x17\x00\x18"),   # supported_groups
+        (0x000B, b"\x01\x00"),                    # ec_point_formats
+        (0x000D, b"\x00\x04\x04\x01\x05\x01"),   # signature_algorithms
+    ) + tuple(extra):
+        extensions += ext_type.to_bytes(2, "big") + len(payload).to_bytes(2, "big") + payload
+    return (
+        b"\x03\x03" + b"\x11" * 32 + b"\x00"
+        + (2).to_bytes(2, "big") + b"\xc0\x2f"
+        + b"\x01\x00"
+        + len(extensions).to_bytes(2, "big") + extensions
+    )
+
+
+def _read_leaf_der(sock: socket.socket) -> bytes:
+    """Read TLS records until the Certificate handshake message; return leaf."""
+    buffered = b""
+    handshake = b""
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            continue
+        if not chunk:
+            raise ConnectionError("peer closed before the Certificate message")
+        buffered += chunk
+        offset = 0
+        while offset + 5 <= len(buffered):
+            record_type = buffered[offset]
+            record_len = int.from_bytes(buffered[offset + 3:offset + 5], "big")
+            if offset + 5 + record_len > len(buffered):
+                break
+            payload = buffered[offset + 5:offset + 5 + record_len]
+            offset += 5 + record_len
+            if record_type != 0x16:
+                continue
+            # Handshake messages can span multiple TLS records: parse from
+            # the concatenated handshake stream, not a single record body.
+            handshake += payload
+            inner = 0
+            while inner + 4 <= len(handshake):
+                hs_type = handshake[inner]
+                hs_len = int.from_bytes(handshake[inner + 1:inner + 4], "big")
+                if inner + 4 + hs_len > len(handshake):
+                    break
+                body = handshake[inner + 4:inner + 4 + hs_len]
+                inner += 4 + hs_len
+                if hs_type == 0x0B:
+                    cert_len = int.from_bytes(body[3:6], "big")
+                    return body[6:6 + cert_len]
+            handshake = handshake[inner:]
+    raise TimeoutError("no Certificate message arrived")
+
+
+def perform_ech_hello(request: dict) -> dict:
+    """Send a crafted TLS 1.2 ClientHello and report which cert answered.
+
+    With an ECH extension present the connection must be opaque: the peer
+    certificate is the origin's own. Without it a bound host is intercepted.
+    """
+    host = request["host"]
+    output = {"host": host, "ech_hello": True}
+    ech = request.get("ech", True)
+    extra = [(0xFE0D, b"\x01\x02\x03\x04")] if ech else []
+    sock = None
+    try:
+        sock = socket.create_connection((host, 443), timeout=10)
+        sock.settimeout(10)
+        hello = _build_client_hello(host, extra)
+        record = (
+            b"\x16\x03\x01" + (len(hello) + 4).to_bytes(2, "big")
+            + b"\x01" + len(hello).to_bytes(3, "big") + hello
+        )
+        sock.sendall(record)
+        leaf = _read_leaf_der(sock)
+        origin_der = ssl.PEM_cert_to_DER_cert(open(ORIGIN_CA, "rb").read().decode("ascii"))
+        output["peer_matches_origin"] = (
+            hashlib.sha256(leaf).hexdigest() == hashlib.sha256(origin_der).hexdigest()
+        )
+    except Exception as exc:  # noqa: BLE001 - every failure mode is evidence
+        output["error"] = type(exc).__name__ + ": " + str(exc)[:160]
+    finally:
+        if sock is not None:
+            with_suppressed(sock.close)
+    output["_connection"] = None
+    return output
+
+
+def _read_http_head(stream) -> tuple[str, dict, bytes]:
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = stream.recv(65536)
+        if not chunk:
+            raise ConnectionError("connection closed before the response head")
+        head += chunk
+    header_section, _, body = head.partition(b"\r\n\r\n")
+    lines = header_section.split(b"\r\n")
+    status = lines[0].decode("latin1").split(" ", 2)
+    headers = {}
+    for line in lines[1:]:
+        if b":" in line:
+            name, _, value = line.partition(b":")
+            headers[name.decode("latin1").strip().lower()] = value.decode("latin1").strip()
+    length = int(headers.get("content-length", "0") or "0")
+    while len(body) < length:
+        chunk = stream.recv(length - len(body))
+        if not chunk:
+            break
+        body += chunk
+    return status[1] if len(status) > 1 else "0", headers, body[:length]
+
+
+def perform_raw(request: dict) -> dict:
+    """Send verbatim request bytes over a TLS connection (raw H1 inputs)."""
+    host = request["host"]
+    sni = request.get("sni", host)
+    trust = request.get("trust", "none")
+    output = {"host": host, "raw": True, "trust": trust}
+    connection = None
+    sock = None
+    try:
+        context = trust_context(trust, sni)
+        address = socket.gethostbyname(host)
+        sock = socket.create_connection((address, 443), timeout=10)
+        connection = context.wrap_socket(sock, server_hostname=sni)
+        connection.sendall(request["raw"].encode("latin1"))
+        status, headers, body = _read_http_head(connection)
+        output["status"] = int(status)
+        try:
+            echoed = json.loads(body)
+            echoed["authorization"] = mask(echoed.get("authorization", ""))
+            echoed["private_token"] = mask(echoed.get("private_token", ""))
+            output["echo"] = echoed
+        except ValueError:
+            output["body"] = body.decode("utf-8", "replace")[:200]
+    except Exception as exc:  # noqa: BLE001 - every failure mode is evidence
+        output["error"] = type(exc).__name__ + ": " + str(exc)[:160]
+    if connection is not None:
+        with_suppressed(connection.close)
+    elif sock is not None:
+        # The TLS wrap failed: the raw socket must not leak.
+        with_suppressed(sock.close)
+    output["_connection"] = None
+    return output
+
+
+def perform_idle_read(request: dict, connections: list) -> dict:
+    """Read-only recv on an existing TLS socket; sends nothing.
+
+    Used for drain-deadline evidence: the transport must already exist, and
+    only EOF/TLS EOF/reset (or a timeout) counts — never an HTTP response.
+    """
+    reuse = request.get("keepalive_with")
+    timeout_s = request.get("timeout_s", 10)
+    output = {"idle_read": True, "keepalive_with": reuse}
+    connection = connections[reuse] if reuse is not None else None
+    if connection is None:
+        output["error"] = "no connection to read"
+        output["_connection"] = None
+        return output
+    sock = getattr(connection, "sock", None)
+    if sock is None:
+        output["error"] = "connection socket is gone"
+        output["_connection"] = None
+        return output
+    started = time.monotonic()
+    try:
+        previous_timeout = sock.gettimeout()
+        sock.settimeout(timeout_s)
+        try:
+            data = sock.recv(65536)
+        finally:
+            # Never leave the shared transport with a changed timeout.
+            with_suppressed(sock.settimeout, previous_timeout)
+        output["elapsed_s"] = round(time.monotonic() - started, 3)
+        if data:
+            # Any bytes mean the transport was still serving: not a closure.
+            output["outcome"] = "data"
+            output["bytes"] = len(data)
+        else:
+            output["outcome"] = "eof"
+    except socket.timeout:
+        output["outcome"] = "timeout"
+        output["elapsed_s"] = round(time.monotonic() - started, 3)
+    except (ssl.SSLError, OSError, ConnectionError) as exc:
+        output["outcome"] = "reset"
+        output["elapsed_s"] = round(time.monotonic() - started, 3)
+        output["error"] = type(exc).__name__ + ": " + str(exc)[:160]
+    output["_connection"] = connection
+    return output
 
 
 if __name__ == "__main__":

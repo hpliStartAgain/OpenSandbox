@@ -75,6 +75,11 @@ class _Headers:
                 return value
         return default
 
+    def get_all(self, name: str) -> list[str]:
+        return [
+            value for key, value in self._values.items() if key.lower() == name.lower()
+        ]
+
     def items(self) -> list[tuple[str, str]]:
         return list(self._values.items())
 
@@ -92,8 +97,10 @@ class _Headers:
 
 
 class _ClientHello:
-    def __init__(self, sni: str | None) -> None:
+    def __init__(self, sni: str | None, extensions: list | None = None) -> None:
         self.sni = sni
+        # Mirrors mitmproxy 11: list[(int, bytes)]; a valid hello has a list.
+        self.extensions = [] if extensions is None else extensions
 
 
 class _ClientConn:
@@ -112,8 +119,13 @@ class _ClientConn:
 
 
 class _ClientHelloData:
-    def __init__(self, sni: str | None, client_conn: _ClientConn | None = None) -> None:
-        self.client_hello = _ClientHello(sni)
+    def __init__(
+        self,
+        sni: str | None,
+        client_conn: _ClientConn | None = None,
+        extensions: list | None = None,
+    ) -> None:
+        self.client_hello = _ClientHello(sni, extensions)
         client = client_conn if client_conn is not None else _ClientConn(sni)
         self.context = types.SimpleNamespace(client=client)
         self.ignore_connection = False
@@ -131,7 +143,8 @@ class _Request:
         self.scheme = "https"
         self.method = "GET"
         self.path = path
-        self.headers = _Headers()
+        self.headers = _Headers({"host": host})
+        self.authority = ""
         self.raw_content: bytes | None = None
         self.content = b""
         self.stream = False
@@ -622,7 +635,8 @@ class CredentialBoundSnapshotValidationTest(unittest.TestCase):
 
         snapshot = Snapshot(identity, payload)
         with mock.patch.object(
-            self.runtime, "token_for", return_value=object()
+            self.runtime, "token_for",
+            return_value=types.SimpleNamespace(sni="api.example.com"),
         ), mock.patch.object(
             self.runtime, "acquire_request", return_value=_fake_admission(snapshot)
         ):
@@ -637,7 +651,8 @@ class CredentialBoundSnapshotValidationTest(unittest.TestCase):
 
         snapshot = Snapshot(identity, payload)
         with mock.patch.object(
-            self.runtime, "token_for", return_value=object()
+            self.runtime, "token_for",
+            return_value=types.SimpleNamespace(sni="api.example.com"),
         ), mock.patch.object(
             self.runtime, "acquire_request", return_value=_fake_admission(snapshot)
         ):
@@ -735,6 +750,494 @@ def os_environ() -> dict[str, str]:
     import os
 
     return os.environ
+
+
+class CredentialBoundSslInsecureTest(unittest.TestCase):
+    """ssl_insecure must never combine with the live admission receiver."""
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(MITMSCRIPTS))
+        self.system, self.receiver, self.runtime = _system_with_live_runtime()
+        self._epoch = 0
+
+    def tearDown(self) -> None:
+        sys.path.remove(str(MITMSCRIPTS))
+        for module in (
+            "credential_bound",
+            "revision_ipc",
+            "revision_publication",
+            "revision_receiver",
+            "tls_registry",
+            "tls_decision",
+            "decision_snapshot",
+            "host_selectors",
+        ):
+            sys.modules.pop(module, None)
+        self.system.ctx.options.ssl_insecure = False
+
+    def _install_bound(self) -> None:
+        self._epoch += 1
+        payload = _decision_payload(
+            [_binding("api", "api.example.com", "token-v1")], ["token-v1"], 1
+        )
+        identity = _revision(payload, self._epoch, 1)
+        self.receiver.prepare(identity, payload)
+        self.receiver.commit(identity)
+
+    def test_load_rejects_ssl_insecure_with_live_bundle(self) -> None:
+        system = _load_system_module()
+        system.ctx.options.ssl_insecure = True
+        env = {ENV["socket"]: "/nonexistent/x.sock", ENV["token"]: TOKEN,
+               ENV["control"]: CONTROL, ENV["subject"]: SUBJECT,
+               ENV["limit"]: "1048576",
+               LIVE_ENV["tls_capacity"]: "64",
+               LIVE_ENV["request_capacity"]: "256",
+               LIVE_ENV["drain_timeout"]: "5"}
+        with mock.patch.dict(os_environ(), env, clear=False):
+            with self.assertRaises(SystemExit):
+                system.load(None)
+
+    def test_configure_hook_rejects_toggling_ssl_insecure(self) -> None:
+        self.system.ctx.options.ssl_insecure = True
+        with self.assertRaises(SystemExit):
+            self.system.configure({"ssl_insecure"})
+        self.system.ctx.options.ssl_insecure = False
+        # Unrelated option changes and legacy mode stay non-fatal.
+        self.system.configure({"other_option"})
+
+    def test_handshake_denies_when_option_turned_true(self) -> None:
+        self._install_bound()
+        self.system.ctx.options.ssl_insecure = True
+        data = _ClientHelloData("api.example.com")
+        self.system.tls_clienthello(data)
+        self.assertFalse(data.ignore_connection)
+        self.assertTrue(data.client_conn.closed)
+
+    def test_request_denies_injection_when_option_turned_true(self) -> None:
+        self._install_bound()
+        conn = _ClientConn(sni="api.example.com")
+        self.system.tls_clienthello(_ClientHelloData("api.example.com", conn))
+        self.assertFalse(conn.closed)
+        self.system.ctx.options.ssl_insecure = True
+        flow = _Flow(client_conn=conn)
+        self.system.requestheaders(flow)
+        self.assertIsNotNone(flow.response)
+        self.assertEqual(flow.response.status_code, 503)
+        self.assertNotIn("Authorization", flow.request.headers)
+
+
+class CredentialBoundECHTest(unittest.TestCase):
+    """ECH extension handling at hook level (real-wire cases in test_ech_wire)."""
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(MITMSCRIPTS))
+        self.system, self.receiver, self.runtime = _system_with_live_runtime()
+        self._epoch = 0
+        self.install_bound()
+
+    def tearDown(self) -> None:
+        sys.path.remove(str(MITMSCRIPTS))
+        for module in (
+            "credential_bound",
+            "revision_ipc",
+            "revision_publication",
+            "revision_receiver",
+            "tls_registry",
+            "tls_decision",
+            "decision_snapshot",
+            "host_selectors",
+        ):
+            sys.modules.pop(module, None)
+
+    def install_bound(self) -> None:
+        self._epoch += 1
+        payload = _decision_payload(
+            [_binding("api", "api.example.com", "token-v1")], ["token-v1"], 1
+        )
+        identity = _revision(payload, self._epoch, 1)
+        self.receiver.prepare(identity, payload)
+        self.receiver.commit(identity)
+
+    def test_ech_extension_passes_through_opaquely(self) -> None:
+        # Bound outer SNI but an ECH extension is present: the connection is
+        # passed through untouched — no decrypt, no admission token, no tunnel.
+        data = _ClientHelloData(
+            "api.example.com",
+            extensions=[(0x0000, b"\x00\x14"), (0xFE0D, b"\x01\x02\x03")],
+        )
+        self.system.tls_clienthello(data)
+        self.assertTrue(data.ignore_connection)
+        self.assertFalse(data.client_conn.closed)
+        self.assertIsNone(self.runtime.token_for(data.client_conn))
+
+    def test_valid_extension_list_without_ech_still_decrypts(self) -> None:
+        data = _ClientHelloData(
+            "api.example.com",
+            extensions=[(0x0000, b"\x00\x14"), (0x0010, b"\x00\x03\x02h2")],
+        )
+        self.system.tls_clienthello(data)
+        self.assertFalse(data.ignore_connection)
+        self.assertFalse(data.client_conn.closed)
+        self.assertIsNotNone(self.runtime.token_for(data.client_conn))
+
+    def test_malformed_extensions_deny_instead_of_decrypting(self) -> None:
+        for bad in (
+            [(0xFE0D,)],                        # short tuple
+            [("0xfe0d", b"\x00")],              # non-int type
+            [(0xFE0D, "not-bytes")],            # non-bytes body
+            "not-a-list",                        # uninspectable shape
+        ):
+            data = _ClientHelloData("api.example.com", extensions=bad)
+            self.system.tls_clienthello(data)
+            self.assertFalse(data.ignore_connection, f"{bad!r} was tunneled")
+            self.assertTrue(data.client_conn.closed, f"{bad!r} was not denied")
+
+
+class CredentialBoundH1AuthorityTest(unittest.TestCase):
+    """Strict HTTP/1 authority validation before binding selection."""
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(MITMSCRIPTS))
+        self.system, self.receiver, self.runtime = _system_with_live_runtime()
+        self._epoch = 0
+        self.install_bound()
+
+    def tearDown(self) -> None:
+        sys.path.remove(str(MITMSCRIPTS))
+        for module in (
+            "credential_bound",
+            "revision_ipc",
+            "revision_publication",
+            "revision_receiver",
+            "tls_registry",
+            "tls_decision",
+            "decision_snapshot",
+            "host_selectors",
+        ):
+            sys.modules.pop(module, None)
+
+    def install_bound(self) -> None:
+        self._epoch += 1
+        payload = _decision_payload(
+            [_binding("api", "api.example.com", "token-v1")], ["token-v1"], 1
+        )
+        identity = _revision(payload, self._epoch, 1)
+        self.receiver.prepare(identity, payload)
+        self.receiver.commit(identity)
+
+    def _admitted_flow(self, host: str = "api.example.com") -> _Flow:
+        conn = _ClientConn(sni="api.example.com")
+        self.system.tls_clienthello(_ClientHelloData("api.example.com", conn))
+        flow = _Flow(client_conn=conn, host=host)
+        return flow
+
+    def _assert_denied(self, flow: _Flow) -> None:
+        self.system.requestheaders(flow)
+        self.assertIsNotNone(flow.response)
+        self.assertEqual(flow.response.status_code, 403)
+        self.assertNotIn("Authorization", flow.request.headers)
+        self.system.response(flow)
+
+    def _assert_allowed(self, flow: _Flow) -> None:
+        self.system.requestheaders(flow)
+        self.assertIsNone(flow.response)
+        self.assertEqual(flow.request.headers.get("Authorization"), "token-v1")
+        self.system.response(flow)
+
+    def test_origin_form_matching_host_succeeds(self) -> None:
+        self._assert_allowed(self._admitted_flow())
+
+    def test_explicit_port_443_host_succeeds(self) -> None:
+        flow = self._admitted_flow()
+        flow.request.headers["host"] = "api.example.com:443"
+        self._assert_allowed(flow)
+
+    def test_uppercase_and_root_dot_normalize(self) -> None:
+        flow = self._admitted_flow()
+        flow.request.headers["host"] = "API.EXAMPLE.COM.:443"
+        self._assert_allowed(flow)
+
+    def test_valid_matching_absolute_target_succeeds(self) -> None:
+        flow = self._admitted_flow()
+        flow.request.authority = "api.example.com:443"
+        self._assert_allowed(flow)
+
+    def test_absolute_target_wrong_host_denies(self) -> None:
+        flow = self._admitted_flow()
+        flow.request.authority = "other.example.com:443"
+        self._assert_denied(flow)
+
+    def test_absolute_target_wrong_port_denies(self) -> None:
+        flow = self._admitted_flow()
+        flow.request.authority = "api.example.com:8443"
+        self._assert_denied(flow)
+
+    def test_conflicting_host_and_authority_deny(self) -> None:
+        flow = self._admitted_flow()
+        flow.request.headers["host"] = "api.example.com"
+        flow.request.authority = "other.example.com"
+        self._assert_denied(flow)
+
+    def test_wrong_host_port_denies(self) -> None:
+        flow = self._admitted_flow()
+        flow.request.headers["host"] = "api.example.com:8443"
+        self._assert_denied(flow)
+
+    def test_missing_host_denies(self) -> None:
+        flow = self._admitted_flow()
+        del flow.request.headers["host"]
+        self._assert_denied(flow)
+
+    def test_duplicate_host_denies(self) -> None:
+        flow = self._admitted_flow()
+        flow.request.headers.get_all = lambda name: (
+            ["api.example.com", "api.example.com"]
+            if name.lower() == "host"
+            else []
+        )
+        self._assert_denied(flow)
+
+    def test_malformed_host_denies(self) -> None:
+        for bad in (
+            "api.example.com evil",
+            "api.example.com:abc",
+            "api.example.com:",
+            "user@api.example.com",
+            "api.example.com,other.example.com",
+            "api%2eexample.com",
+            "api.example.com/path",
+            "api.example.com?q=1",
+            "[::1]",
+            "api.example.com:1",
+            "no-tld",
+            "127.0.0.1",
+        ):
+            flow = self._admitted_flow()
+            flow.request.headers["host"] = bad
+            self._assert_denied(flow)
+
+    def test_cross_authority_denied_even_on_out_of_scope_path(self) -> None:
+        flow = self._admitted_flow()
+        flow.request.path = "/health"
+        flow.request.headers["host"] = "other.example.com"
+        self._assert_denied(flow)
+
+    def test_token_sni_mismatch_denies(self) -> None:
+        # A non-registry token object must never acquire admission; the
+        # request is denied before any credential is consulted.
+        flow = self._admitted_flow()
+        with mock.patch.object(
+            self.runtime, "token_for",
+            return_value=types.SimpleNamespace(sni="other.example.com"),
+        ):
+            self.system.requestheaders(flow)
+        self.assertTrue(
+            flow.killed or (flow.response is not None and flow.response.status_code >= 400),
+            "a foreign token object acquired request admission",
+        )
+        self.assertNotIn("Authorization", flow.request.headers)
+
+    def test_http2_denies_in_live_mode(self) -> None:
+        # H2 is outside this phase's scope: the request is denied (killed,
+        # since an H2 body can stream past the local-response size limit).
+        flow = self._admitted_flow()
+        flow.request.http_version = "HTTP/2.0"
+        self.system.requestheaders(flow)
+        self.assertTrue(
+            flow.killed or (flow.response is not None and flow.response.status_code >= 400),
+            "an HTTP/2 request received credentials in live mode",
+        )
+        self.assertNotIn("Authorization", flow.request.headers)
+
+    def test_connect_method_denies(self) -> None:
+        flow = self._admitted_flow()
+        flow.request.method = "CONNECT"
+        self._assert_denied(flow)
+
+    def test_non_443_request_port_denies(self) -> None:
+        flow = self._admitted_flow()
+        flow.request.port = 8443
+        self._assert_denied(flow)
+
+
+class CredentialBoundDrainPagingTest(unittest.TestCase):
+    """Drain sweeps page past _DRAIN_PAGE_LIMIT and retry failed closes."""
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(MITMSCRIPTS))
+        self.system = _load_system_module()
+        from credential_bound import LiveRuntime
+        from revision_publication import LiveReceiver
+
+        self.receiver = LiveReceiver(
+            CONTROL, SUBJECT, max_snapshot_bytes=1 << 20, capacity=256,
+            request_capacity=2048, drain_timeout_seconds=1,
+        )
+        self.runtime = LiveRuntime(self.receiver, identity=(CONTROL, SUBJECT))
+        self.system._live_runtime = self.runtime
+        self._epoch = 0
+        self.install_bound()
+
+    def tearDown(self) -> None:
+        sys.path.remove(str(MITMSCRIPTS))
+        for module in (
+            "credential_bound",
+            "revision_ipc",
+            "revision_publication",
+            "revision_receiver",
+            "tls_registry",
+            "tls_decision",
+            "decision_snapshot",
+            "host_selectors",
+        ):
+            sys.modules.pop(module, None)
+
+    def install_bound(self) -> None:
+        self._epoch += 1
+        payload = _decision_payload(
+            [_binding("api", "api.example.com", "token-v1")], ["token-v1"], 1
+        )
+        identity = _revision(payload, self._epoch, 1)
+        self.receiver.prepare(identity, payload)
+        self.receiver.commit(identity)
+
+    def _admit(self, count: int) -> list[tuple[Any, Any]]:
+        pairs = []
+        for _ in range(count):
+            data = _ClientHelloData("api.example.com")
+            self.system.tls_clienthello(data)
+            token = self.runtime.token_for(data.client_conn)
+            self.assertIsNotNone(token)
+            pairs.append((token, data.client_conn))
+        return pairs
+
+    def _expire(self, pairs: list[tuple[Any, Any]], *, offset: float = -1) -> None:
+        import time
+
+        registry = self.runtime.registry
+        with registry._lock:
+            for token, _conn in pairs:
+                registry._connection_deadlines[token.serial] = (
+                    time.monotonic() + offset
+                )
+
+    def test_sweep_pages_past_page_limit_without_starvation(self) -> None:
+        # 130 expired transports > 2 * _DRAIN_PAGE_LIMIT: one sweep must reach
+        # every page, not stop at the first page or a stuck target.
+        pairs = self._admit(130)
+        self._expire(pairs)
+        closed = self.runtime.drain_sweep_once()
+        self.assertEqual(130, closed)
+        for _token, conn in pairs:
+            self.assertTrue(conn.closed)
+        # A scheduled close is not a release: membership persists until the
+        # disconnect hook confirms the transport is gone.
+        self.assertEqual(130, self.runtime.registry.count)
+
+    def test_failed_close_is_retried_next_sweep(self) -> None:
+        pairs = self._admit(80)
+        self._expire(pairs)
+        failing = {token.serial for token, _ in pairs[:64]}
+        original = self.runtime._close_established
+        serials = {id(conn): token.serial for token, conn in pairs}
+        failed_once: set = set()
+
+        def flaky(conn):
+            serial = serials.get(id(conn))
+            if serial in failing and serial not in failed_once:
+                failed_once.add(serial)
+                return False
+            return original(conn)
+
+        self.runtime._close_established = flaky
+        first = self.runtime.drain_sweep_once()
+        self.assertEqual(16, first)  # only the last 16 of the first page close
+        self.assertEqual(80, self.runtime.registry.count)  # nothing released
+        second = self.runtime.drain_sweep_once()
+        self.assertEqual(80, second)  # every still-registered transport retried
+        for _token, conn in pairs:
+            self.assertTrue(conn.closed)
+
+    def test_delayed_disconnect_keeps_membership_until_confirmed(self) -> None:
+        pairs = self._admit(3)
+        self._expire(pairs)
+        self.assertEqual(3, self.runtime.drain_sweep_once())
+        self.assertEqual(3, self.runtime.registry.count)
+        # A scheduled close is not confirmed: later sweeps keep retrying the
+        # still-registered transports until client_disconnected releases them.
+        self.assertEqual(3, self.runtime.drain_sweep_once())
+        token, conn = pairs[0]
+        self.assertIs(self.runtime.token_for(conn), token)
+        self.system.client_disconnected(conn)
+        self.assertEqual(2, self.runtime.registry.count)
+        self.assertIsNone(self.runtime.token_for(conn))
+
+    def test_expiry_boundary_is_exact(self) -> None:
+        import time
+
+        pairs = self._admit(2)
+        expired, pending = pairs
+        registry = self.runtime.registry
+        with registry._lock:
+            registry._connection_deadlines[expired[0].serial] = time.monotonic() - 0.001
+            registry._connection_deadlines[pending[0].serial] = time.monotonic() + 100
+        self.assertEqual(1, self.runtime.drain_sweep_once())
+        self.assertTrue(expired[1].closed)
+        self.assertFalse(pending[1].closed)
+        # Exactly-at-now deadlines expire as well (deadline <= now).
+        with registry._lock:
+            registry._connection_deadlines[pending[0].serial] = time.monotonic()
+        # The newly expired target is attempted, and the still-registered
+        # earlier target is retried until its disconnect hook runs.
+        self.assertEqual(2, self.runtime.drain_sweep_once())
+        self.assertTrue(pending[1].closed)
+
+    def test_event_loop_close_failure_retries_until_disconnect(self) -> None:
+        # A scheduled event-loop close is not a confirmed close: a handler
+        # failure must be retried by the next sweep, and later-page targets
+        # must still be attempted.
+        pairs = self._admit(4)
+        self._expire(pairs)
+        conns = {conn.id: conn for _token, conn in pairs}
+        calls: dict[str, int] = {}
+
+        class _Handler:
+            def __init__(self, fail_once: bool) -> None:
+                self.fail_once = fail_once
+
+            def close_connection(self, client_conn: Any) -> None:
+                calls[client_conn.id] = calls.get(client_conn.id, 0) + 1
+                if self.fail_once:
+                    self.fail_once = False
+                    raise OSError("transient close failure")
+                client_conn.closed = True
+
+        handlers = {
+            conn.id: _Handler(fail_once=(conn is pairs[0][1]))
+            for conn in conns.values()
+        }
+
+        class _Loop:
+            def call_soon_threadsafe(self, callback: Any, *args: Any) -> None:
+                callback(*args)
+
+        self.runtime._loop = _Loop()
+        self.runtime._proxyserver = types.SimpleNamespace(connections=handlers)
+        first = self.runtime.drain_sweep_once()
+        self.assertEqual(4, first)  # every expired transport attempted
+        self.assertFalse(pairs[0][1].closed, "failed close must not mark closed")
+        self.assertEqual(1, calls[pairs[0][1].id])
+        for _token, conn in pairs[1:]:
+            self.assertEqual(1, calls[conn.id])
+        # Still registered: a second sweep retries the failed target, and the
+        # registry is only released by the disconnect hook.
+        second = self.runtime.drain_sweep_once()
+        self.assertEqual(4, second)
+        self.assertEqual(2, calls[pairs[0][1].id])
+        self.assertTrue(pairs[0][1].closed)
+        self.assertEqual(4, self.runtime.registry.count)
+        self.system.client_disconnected(pairs[0][1])
+        self.assertEqual(3, self.runtime.registry.count)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/stretchr/testify/require"
 )
 
@@ -350,4 +351,36 @@ func TestRevisionIPCConfigRejectsInvalidLiveAdmission(t *testing.T) {
 	}
 	// A disabled bundle never carries budgets: validation stays clean without them.
 	require.NoError(t, validateRevisionIPCConfig(&base))
+}
+
+func TestRevisionIPCConfigRejectsSslInsecureOnlyForLiveAdmission(t *testing.T) {
+	base := RevisionIPCConfig{
+		SocketPath:          "/run/opensandbox/revision/receiver.sock",
+		SessionToken:        "0123456789abcdef0123456789abcdef",
+		ControlGeneration:   "control-a",
+		SubjectGeneration:   "subject-a",
+		MaxSnapshotBytes:    4096,
+		LiveAdmission:       true,
+		TLSCapacity:         64,
+		RequestCapacity:     256,
+		DrainTimeoutSeconds: 30,
+	}
+	for _, truthy := range []string{"1", "true", "TRUE", "on", "yes"} {
+		t.Run("insecure-"+truthy, func(t *testing.T) {
+			t.Setenv(constants.EnvMitmproxySslInsecure, truthy)
+			require.Error(t, validateRevisionIPCConfig(&base))
+		})
+	}
+	for _, safe := range []string{"", "0", "false", "off", "bogus"} {
+		t.Run("safe-"+safe, func(t *testing.T) {
+			t.Setenv(constants.EnvMitmproxySslInsecure, safe)
+			require.NoError(t, validateRevisionIPCConfig(&base))
+		})
+	}
+	// The installation-only receiver keeps the legacy escape hatch.
+	t.Setenv(constants.EnvMitmproxySslInsecure, "true")
+	legacy := base
+	legacy.LiveAdmission = false
+	require.NoError(t, validateRevisionIPCConfig(&legacy))
+	require.NoError(t, validateRevisionIPCConfig(nil))
 }

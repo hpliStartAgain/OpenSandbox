@@ -53,6 +53,7 @@ from pathlib import Path
 
 MITMDUMP = shutil.which("mitmdump")
 MITMSCRIPTS = Path(__file__).resolve().parents[1] / "mitmscripts"
+TESTS = Path(__file__).resolve().parent
 CONTROL = "runtime-control"
 SUBJECT = "runtime-subject"
 TOKEN = "b" * 43
@@ -177,29 +178,60 @@ class ClientError(Exception):
     """A client-side failure with a fixed, secret-free message."""
 
 
+class TLSOriginServer(socketserver.ThreadingTCPServer):
+    """Threading origin whose TLS wrap happens per accepted connection.
+
+    Wrapping the listening socket would leak the accepted socket when the
+    handshake fails inside ``accept()``; wrapping here closes the raw socket
+    on every failure path. Accepted sockets get a bounded read timeout so a
+    stuck keep-alive handler cannot block ``server_close``'s thread join.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, context: ssl.SSLContext) -> None:
+        self.tls_context = context
+        super().__init__(address, handler)
+
+    def get_request(self):
+        sock, address = self.socket.accept()
+        try:
+            wrapped = self.tls_context.wrap_socket(sock, server_side=True)
+        except Exception:
+            sock.close()
+            raise
+        wrapped.settimeout(60)
+        return wrapped, address
+
+
 class TunneledConnection:
     """One proxy CONNECT tunnel with an explicit SNI and keepalive reuse."""
 
     def __init__(self, proxy_port: int, target_port: int, *, sni: str | None, ca_file: str | None) -> None:
         self.buffer = b""
         self.sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
-        self.sock.sendall(
-            f"CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\n"
-            f"Host: 127.0.0.1:{target_port}\r\n\r\n".encode()
-        )
-        head, surplus = self._read_head(self.sock)
-        if not head.startswith(b"HTTP/1.1 200"):
-            raise ClientError("proxy refused the tunnel: " + head[:80].decode("latin1"))
-        if surplus:
-            raise ClientError("proxy sent unexpected bytes after the tunnel response")
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        if ca_file:
-            context.load_verify_locations(ca_file)
-        else:
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-        context.check_hostname = bool(sni) and bool(ca_file)
-        self.tls = context.wrap_socket(self.sock, server_hostname=sni)
+        try:
+            self.sock.sendall(
+                f"CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{target_port}\r\n\r\n".encode()
+            )
+            head, surplus = self._read_head(self.sock)
+            if not head.startswith(b"HTTP/1.1 200"):
+                raise ClientError("proxy refused the tunnel: " + head[:80].decode("latin1"))
+            if surplus:
+                raise ClientError("proxy sent unexpected bytes after the tunnel response")
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            if ca_file:
+                context.load_verify_locations(ca_file)
+            else:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            context.check_hostname = bool(sni) and bool(ca_file)
+            self.tls = context.wrap_socket(self.sock, server_hostname=sni)
+        except Exception:
+            # A refused tunnel or failed TLS handshake must not leak the socket.
+            self.sock.close()
+            raise
 
     @staticmethod
     def _read_head(stream, buffer: bytes = b"") -> tuple[bytes, bytes]:
@@ -252,11 +284,15 @@ class TunneledConnection:
 class LiveRuntimeHarness:
     """A real mitmdump addon process, its revision IPC, and a local origin."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, origin_port: int | None = None) -> None:
         self.root = root
         # The origin binds canonical 443 inside the test container so the
         # intercepted request port stays 443, as real HTTPS interception has.
-        self.origin_port = 443
+        # Loopback-only runs may pass an ephemeral high port instead; the
+        # canonical_port_443 fixture addon then reproduces the canonical 443
+        # identity inside requestheaders (documented test-only remap, never
+        # production configurability).
+        self.origin_port = 443 if origin_port is None else origin_port
         self.proxy_port = free_port()
         self.directory = root / "receiver"
         self.directory.mkdir(mode=0o700, exist_ok=True)
@@ -267,18 +303,20 @@ class LiveRuntimeHarness:
         self.log_path = root / "proxy.log"
         self.log = self.log_path.open("w+")
 
-    def _start_origin(self) -> socketserver.ThreadingTCPServer:
-        server = socketserver.ThreadingTCPServer(("127.0.0.1", self.origin_port), EchoHandler)
-        server.daemon_threads = True
+    def _start_origin(self) -> "TLSOriginServer":
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(str(self.root / "origin.pem"))
-        server.socket = context.wrap_socket(server.socket, server_side=True)
+        server = TLSOriginServer(("127.0.0.1", self.origin_port), EchoHandler, context)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         return server
 
     def env(self, drain_seconds: int = 1) -> dict:
         return {
-            **os.environ,
+            **{
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith("OPENSANDBOX_EGRESS_REVISION_")
+            },
             "OPENSANDBOX_EGRESS_REVISION_IPC_SOCKET": self.socket_path,
             "OPENSANDBOX_EGRESS_REVISION_IPC_TOKEN": TOKEN,
             "OPENSANDBOX_EGRESS_REVISION_CONTROL_GENERATION": CONTROL,
@@ -299,6 +337,11 @@ class LiveRuntimeHarness:
                 "--set", "connection_strategy=lazy",
                 "--set", "flow_detail=0",
                 "--set", "ssl_verify_upstream_trusted_ca=" + str(self.root / "origin.pem"),
+                *(
+                    ["-s", str(TESTS / "fixtures" / "canonical_port_443.py")]
+                    if self.origin_port != 443
+                    else []
+                ),
                 "-s", str(MITMSCRIPTS / "system.py"),
             ],
             env=self.env(drain_seconds),
@@ -346,9 +389,14 @@ class LiveRuntimeHarness:
         if body is not None:
             headers["Content-Type"] = "application/json"
         connection = http.client.HTTPConnection("localhost", timeout=5)
-        connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        connection.sock.settimeout(5)
-        connection.sock.connect(self.socket_path)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(5)
+            sock.connect(self.socket_path)
+        except Exception:
+            sock.close()
+            raise
+        connection.sock = sock
         try:
             connection.request("POST" if body is not None else "GET", path, body=body, headers=headers)
             response = connection.getresponse()
@@ -400,16 +448,20 @@ class LiveRuntimeHarness:
 class CredentialBoundRuntimeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="oscbr-", dir="/tmp")
+        self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        self.harness = LiveRuntimeHarness(self.root)
+        # Loopback cannot bind privileged 443: the fixture-selected high port
+        # plus the canonical_port_443 addon reproduces the canonical identity;
+        # transparent-mode port-443 evidence remains image-runner only.
+        self.harness = LiveRuntimeHarness(self.root, origin_port=free_port())
+        self.addCleanup(self.harness.stop)
         self.harness.start()
         self.connections: list[TunneledConnection] = []
+        self.addCleanup(self._close_connections)
 
-    def tearDown(self) -> None:
+    def _close_connections(self) -> None:
         for connection in self.connections:
             connection.close()
-        self.harness.stop()
-        self.temporary.cleanup()
 
     def connect(self, *, sni: str | None, trust: str) -> TunneledConnection:
         connection = self.harness.connect(sni=sni, trust=trust)
@@ -506,6 +558,200 @@ class CredentialBoundRuntimeTest(unittest.TestCase):
             self.assertEqual("", payload.get("private_token", ""))
         except (ClientError, ssl.SSLError, OSError, ConnectionError):
             pass
+
+
+@unittest.skipUnless(MITMDUMP, "mitmdump is not installed")
+class IdleDrainRuntimeTest(unittest.TestCase):
+    """Read-only drain evidence on a disposable loopback runtime.
+
+    The origin binds an ephemeral high port (loopback cannot bind 443); the
+    canonical_port_443 fixture addon reproduces the canonical HTTPS/443
+    request identity inside the proxy. Transparent-mode port-443 acceptance
+    itself remains image-runner evidence only.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="osidr-", dir="/tmp")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.harness = LiveRuntimeHarness(self.root, origin_port=free_port())
+        self.addCleanup(self.harness.stop)
+        self.harness.start()
+        self.connection: TunneledConnection | None = None
+        self.addCleanup(self._close_connection)
+
+    def _close_connection(self) -> None:
+        if self.connection is not None:
+            self.connection.close()
+
+    def test_idle_transport_closes_only_at_deadline(self) -> None:
+        # drain_seconds=1 in the harness; the read below is measured from the
+        # successful vault-delete ACK, plus bounded sweep slack.
+        drain_seconds = 1
+        sweep_slack = 2.0
+        self.harness.install(1, [binding(SECRET_ONE)], [SECRET_ONE], 1)
+        self.connection = self.harness.connect(sni=BOUND, trust="mitm")
+        status, payload = self.connection.request("GET", "/v1/data", BOUND)
+        self.assertEqual(200, status)
+        self.assertEqual(SECRET_ONE, payload["private_token"])
+
+        self.harness.install(2, [], [], 0)
+        delete_ack = time.monotonic()
+
+        # Before the retirement deadline the idle socket must stay open: a
+        # read-only recv with a strictly fractional timeout — never an HTTP
+        # write — must time out rather than return data, EOF, or a response.
+        early_timeout = min(0.25, drain_seconds / 4)
+        self.connection.tls.settimeout(early_timeout)
+        try:
+            data = self.connection.tls.recv(4096)
+            self.fail(
+                f"idle transport answered before the drain deadline: {data[:80]!r}"
+            )
+        except socket.timeout:
+            pass
+        finally:
+            self.connection.tls.settimeout(10)
+
+        # By the deadline plus sweep slack the drain must have force-closed
+        # the transport: EOF, TLS close-notify, or a reset — and never a
+        # credential-carrying response (nothing was ever written). A socket
+        # that never closes is a failure, not a pass: the recv is bounded to
+        # the remaining deadline and socket.timeout is not a terminal state.
+        remaining = delete_ack + drain_seconds + sweep_slack - time.monotonic()
+        self.connection.tls.settimeout(max(remaining, 0.5))
+        elapsed = None
+        try:
+            data = self.connection.tls.recv(4096)
+            elapsed = time.monotonic() - delete_ack
+            self.assertEqual(
+                b"", data, "retired transport sent bytes after the deadline"
+            )
+        except socket.timeout:
+            self.fail("idle transport never closed within the drain deadline")
+        except (ssl.SSLError, OSError, ConnectionError):
+            elapsed = time.monotonic() - delete_ack
+        finally:
+            self.connection.tls.settimeout(10)
+        # The close must also not precede the retirement deadline (the early
+        # 0.25s read alone cannot rule out a close at 0.3s): allow only small
+        # ACK-latency tolerance below the drain deadline.
+        self.assertGreaterEqual(
+            elapsed, drain_seconds - 0.1,
+            "transport closed substantially before the retirement deadline",
+        )
+
+
+@unittest.skipUnless(MITMDUMP, "mitmdump is not installed")
+class LiveSslInsecureStartupTest(unittest.TestCase):
+    """ssl_insecure + live admission must fail the addon load, not degrade."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="osssi-", dir="/tmp")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.socket_path = str(self.root / "receiver.sock")
+        self.log_path = self.root / "proxy.log"
+        self.log = None
+        self.process: subprocess.Popen | None = None
+        self.addCleanup(self._stop)
+
+    def _stop(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        if self.log is not None:
+            self.log.close()
+
+    def _start(self, *, live: bool, ssl_insecure: bool) -> None:
+        # Scrub any inherited revision/live bundle variables so the legacy
+        # (installation-only) contrast cannot be contaminated by the caller's
+        # environment.
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("OPENSANDBOX_EGRESS_REVISION_")
+        }
+        env.update(
+            {
+                "OPENSANDBOX_EGRESS_REVISION_IPC_SOCKET": self.socket_path,
+                "OPENSANDBOX_EGRESS_REVISION_IPC_TOKEN": TOKEN,
+                "OPENSANDBOX_EGRESS_REVISION_CONTROL_GENERATION": CONTROL,
+                "OPENSANDBOX_EGRESS_REVISION_SUBJECT_GENERATION": SUBJECT,
+                "OPENSANDBOX_EGRESS_REVISION_MAX_SNAPSHOT_BYTES": "1048576",
+            }
+        )
+        if live:
+            env.update(
+                {
+                    "OPENSANDBOX_EGRESS_REVISION_TLS_CAPACITY": "64",
+                    "OPENSANDBOX_EGRESS_REVISION_REQUEST_CAPACITY": "256",
+                    "OPENSANDBOX_EGRESS_REVISION_DRAIN_TIMEOUT_SECONDS": "5",
+                }
+            )
+        args = [
+            MITMDUMP,
+            "--listen-host", "127.0.0.1",
+            "--listen-port", str(free_port()),
+            "--set", "confdir=" + str(self.root / "ca"),
+            "--set", "flow_detail=0",
+            "-s", str(MITMSCRIPTS / "system.py"),
+        ]
+        if ssl_insecure:
+            args += ["--set", "ssl_insecure=true"]
+        self.log = self.log_path.open("w+")
+        self.process = subprocess.Popen(
+            args, env=env, stdout=self.log, stderr=subprocess.STDOUT
+        )
+
+    def _wait_ready(self, seconds: float = 20) -> bool:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                return False
+            if Path(self.socket_path).exists():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_live_bundle_with_ssl_insecure_exits_before_serving(self) -> None:
+        self._start(live=True, ssl_insecure=True)
+        deadline = time.monotonic() + 20
+        while self.process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertIsNotNone(
+            self.process.poll(),
+            "mitmdump kept serving with ssl_insecure under the live bundle",
+        )
+        self.assertFalse(
+            Path(self.socket_path).exists(),
+            "the live receiver started despite ssl_insecure",
+        )
+        self.log.flush()
+        self.assertIn(
+            "credential proxy", self.log_path.read_text(errors="replace")
+        )
+
+    def test_live_bundle_without_ssl_insecure_starts(self) -> None:
+        self._start(live=True, ssl_insecure=False)
+        self.assertTrue(
+            self._wait_ready(),
+            "live bundle did not start without ssl_insecure: "
+            + self.log_path.read_text(errors="replace")[-1000:],
+        )
+
+    def test_installation_only_bundle_keeps_ssl_insecure_escape(self) -> None:
+        # Legacy installation-only mode retains the insecure escape hatch.
+        self._start(live=False, ssl_insecure=True)
+        self.assertTrue(
+            self._wait_ready(),
+            "installation-only receiver rejected ssl_insecure: "
+            + self.log_path.read_text(errors="replace")[-1000:],
+        )
 
 
 if __name__ == "__main__":

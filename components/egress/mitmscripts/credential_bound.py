@@ -157,18 +157,21 @@ class LiveRuntime:
                 pass
         return False
 
-    def admit_tls(self, *, sni: str | None) -> AdmissionResult:
+    def admit_tls(self, sni: str | None, ech_hidden: bool = False) -> AdmissionResult:
         """Classify one ClientHello against the installed snapshot.
 
-        ECH is not observable through the mitmproxy 11 ClientHello API; the
-        outer SNI is therefore the visible name. Exact-hostname bindings keep
-        hidden inner names out of the decision set, and injection still
-        requires the full request binding match plus SNI/authority agreement.
+        ``ech_hidden`` is set by the caller only after inspecting the actual
+        ClientHello extension list: an ECH-bearing (or GREASE-ECH) connection
+        is passed through opaquely — the byte stream reaches the outer-SNI
+        origin untouched, never decrypted and never credential-bound.
+        Exact-hostname bindings keep hidden inner names out of the decision
+        set, and injection still requires the full request binding match
+        plus SNI/authority agreement.
         """
         return self.registry.admit(
             identity=self.identity,
             sni=sni,
-            ech_hidden=False,
+            ech_hidden=ech_hidden,
             static_passthrough=(),
         )
 
@@ -232,27 +235,34 @@ class LiveRuntime:
     def drain_sweep_once(self) -> int:
         """Close live transports whose retirement deadline expired.
 
-        Each scan restarts at zero (lower serials can expire later) and stops
-        when a page yields no closable target, so a stuck target cannot spin.
-        Closing is best-effort here: the disconnect hook performs the release.
+        Each sweep restarts at serial zero (lower serials can expire later)
+        and pages forward with the after_serial cursor, so every expired
+        transport is attempted once per sweep — including targets past the
+        first page. The sweep terminates on an empty or short page, so a
+        stuck target cannot spin this sweep; a failed close is retried by the
+        next sweep instead. Closing is best-effort here: the disconnect hook
+        performs the release, and a scheduled close never counts as released.
         """
-        closed = 0
-        seen: set[int] = set()
+        attempts = 0
+        cursor = 0
         while True:
-            tokens = self.registry.expired_connections(limit=_DRAIN_PAGE_LIMIT)
-            progressed = False
+            tokens = self.registry.expired_connections(
+                after_serial=cursor, limit=_DRAIN_PAGE_LIMIT
+            )
+            if not tokens:
+                return attempts
             for token in tokens:
-                if token.serial in seen:
-                    continue
-                seen.add(token.serial)
+                cursor = token.serial
                 client_conn = self._connection_for_serial(token.serial)
                 if client_conn is None:
                     continue
+                # A scheduled close is not a confirmed close: retry every
+                # expired transport that is still registered until the
+                # client_disconnected hook releases it.
                 if self._close_established(client_conn):
-                    closed += 1
-                    progressed = True
-            if not progressed or not tokens:
-                return closed
+                    attempts += 1
+            if len(tokens) < _DRAIN_PAGE_LIMIT:
+                return attempts
 
     def _close_established(self, client_conn: Any) -> bool:
         """Force-close one established transport from the drain thread.
@@ -268,10 +278,12 @@ class LiveRuntime:
             if loop is not None and proxyserver is not None:
                 handler = proxyserver.connections.get(client_conn.id)
                 if handler is not None:
+                    # Scheduling is not a confirmed close: keep the transport
+                    # retryable on the next sweep until client_disconnected
+                    # releases the registry admission.
                     loop.call_soon_threadsafe(
                         _invoke_handler_close, handler, client_conn
                     )
-                    _mark_closed(client_conn)
                     return True
         except Exception:  # noqa: BLE001 - never raise into the drain loop
             pass

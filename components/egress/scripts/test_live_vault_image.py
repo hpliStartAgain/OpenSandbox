@@ -66,8 +66,11 @@ REQUIRED = [
     "TestLiveVaultImagePrerequisites",
     "TestUnboundTrafficKeepsEndToEndTLS",
     "TestBoundHostInjectsCredential",
+    "TestH1AuthorityGate",
+    "TestECHOpaquePassThrough",
     "TestRotationStaleAndKeepalive",
     "TestDeleteRevocationAndRemoveReadd",
+    "TestIdleDrainClose",
     "TestFailureBoundaries",
 ]
 
@@ -79,6 +82,18 @@ class Failure(RuntimeError):
 def require(condition, message):
     if not condition:
         raise Failure(message)
+
+
+# Fixture credential material never reaches logs or artifacts: every command
+# record and diagnostic is filtered through this set first.
+FIXTURE_SECRETS = (TOKEN, SECRET_ONE, SECRET_TWO)
+
+
+def sanitize(text: str) -> str:
+    for secret in FIXTURE_SECRETS:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text
 
 
 class Docker:
@@ -93,14 +108,14 @@ class Docker:
             raise Failure(f"Docker command failed: {command[:3]}: {exc}") from exc
         with (self.artifacts / "commands.jsonl").open("a") as stream:
             stream.write(json.dumps({
-                "command": command,
+                "command": [sanitize(arg) for arg in command],
                 "returncode": result.returncode,
-                "stdout": result.stdout[-4000:],
-                "stderr": result.stderr[-4000:],
+                "stdout": sanitize(result.stdout[-4000:]),
+                "stderr": sanitize(result.stderr[-4000:]),
             }) + "\n")
         if check and result.returncode:
             raise Failure(f"docker {' '.join(map(str, args[:3]))} failed ({result.returncode}): "
-                          f"{result.stdout[-3000:]}{result.stderr[-3000:]}")
+                          f"{sanitize(result.stdout[-3000:])}{sanitize(result.stderr[-3000:])}")
         return result
 
     def json(self, *args):
@@ -145,27 +160,45 @@ class LiveVaultRuntime:
         self.docker = docker
         self.image = image
         self.drain_seconds = drain_seconds
-        self.network = "osbs-live-vault-" + uuid.uuid4().hex[:12]
+        # Per-run ownership label: only resources carrying this exact run id
+        # are ever removed; a same-named foreign resource is reported, not
+        # deleted.
+        self.run_id = uuid.uuid4().hex
+        self.network = "osbs-live-vault-" + self.run_id[:12]
         self.egress = self.network + "-egress"
         self.origin = self.network + "-origin"
         self.badcert = self.network + "-badcert"
         self.workdir = Path(tempfile.mkdtemp(prefix="osbs-live-vault-"))
         self.subnet = ""
+        # Only resources this invocation actually created may be cleaned up.
+        self.created: set[str] = set()
+        self.cleanup_report: list[dict] = []
+
+    @property
+    def cleanup_failures(self) -> list[str]:
+        failures = []
+        for entry in self.cleanup_report:
+            # A thrown removal/verification is a failure too: only an
+            # observed rc=0 with a confirmed-absent inspection is clean.
+            if entry.get("returncode") != 0 or entry.get("remaining"):
+                failures.append(f"{entry['kind']}:{entry['name']}")
+        return failures
 
     def origin_addresses(self) -> tuple[str, str]:
         prefix = self.subnet.rsplit(".", 1)[0]
         return f"{prefix}.{ORIGIN_IP_SUFFIX}", f"{prefix}.{BADCERT_IP_SUFFIX}"
 
     def __enter__(self):
-        if not self._create_network():
-            raise Failure("cannot allocate a Docker network for the live vault test")
-        origin_ip, badcert_ip = self.origin_addresses()
         try:
+            if not self._create_network():
+                raise Failure("cannot allocate a Docker network for the live vault test")
+            origin_ip, badcert_ip = self.origin_addresses()
             shared = self.workdir / "shared"
             shared.mkdir()
             (shared / "badcert").mkdir()
             self.docker.run(
                 "run", "-d", "--name", self.origin, "--network", self.network,
+                "--label", f"opensandbox.live-vault-test={self.run_id}",
                 "--ip", origin_ip, "--network-alias", BOUND,
                 "--network-alias", UNBOUND,
                 "-v", f"{shared}:/run/live-origin",
@@ -173,14 +206,17 @@ class LiveVaultRuntime:
                 "--entrypoint", "python3", self.image,
                 "/fixtures/live_vault_origin.py", BOUND, UNBOUND,
             )
+            self.created.add(self.origin)
             self.docker.run(
                 "run", "-d", "--name", self.badcert, "--network", self.network,
+                "--label", f"opensandbox.live-vault-test={self.run_id}",
                 "--ip", badcert_ip, "--network-alias", BADCERT,
                 "-v", f"{shared}/badcert:/run/live-origin",
                 "-v", f"{FIXTURES}:/fixtures:ro",
                 "--entrypoint", "python3", self.image,
                 "/fixtures/live_vault_origin.py", "good.example.com",
             )
+            self.created.add(self.badcert)
             self.wait_origin(self.origin, shared)
             self.wait_origin(self.badcert, shared / "badcert")
             env = {
@@ -202,6 +238,7 @@ class LiveVaultRuntime:
                 "OPENSANDBOX_EGRESS_REVISION_DRAIN_TIMEOUT_SECONDS": str(self.drain_seconds),
             }
             args = ["run", "-d", "--name", self.egress, "--network", self.network,
+                    "--label", f"opensandbox.live-vault-test={self.run_id}",
                     "--cap-add", "NET_ADMIN", "--security-opt", "no-new-privileges",
                     "-v", f"{shared}:/run/live-origin:ro",
                     "--add-host", f"{BOUND}:{origin_ip}",
@@ -210,6 +247,7 @@ class LiveVaultRuntime:
             for key, value in env.items():
                 args += ["--env", key + "=" + value]
             self.docker.run(*args, self.image)
+            self.created.add(self.egress)
             self.docker.run("cp", str(FIXTURES / "live_vault_client.py"),
                             f"{self.egress}:/tmp/live_vault_client.py")
             self.wait_health()
@@ -222,13 +260,23 @@ class LiveVaultRuntime:
         """Allocate the test network, preferring an explicit private subnet."""
         for subnet in SUBNET_CANDIDATES:
             result = self.docker.run(
-                "network", "create", "--subnet", subnet, self.network, check=False
+                "network", "create", "--subnet", subnet,
+                "--label", f"opensandbox.live-vault-test={self.run_id}",
+                self.network, check=False,
             )
             if result.returncode == 0:
                 self.subnet = subnet
+                self.created.add("network:" + self.network)
                 return True
-        result = self.docker.run("network", "create", self.network, check=False)
+        result = self.docker.run(
+            "network", "create",
+            "--label", f"opensandbox.live-vault-test={self.run_id}",
+            self.network, check=False,
+        )
         if result.returncode == 0:
+            # Register before inspecting: an inspection failure must not
+            # strand the just-created network outside cleanup ownership.
+            self.created.add("network:" + self.network)
             self.subnet = self.docker.run(
                 "network", "inspect", self.network,
                 "--format", "{{(index .IPAM.Config 0).Subnet}}",
@@ -294,13 +342,145 @@ class LiveVaultRuntime:
         return self.docker.run("logs", self.egress, timeout=60).stdout
 
     def __exit__(self, *_exc):
+        """Remove only resources this invocation created; record every outcome.
+
+        Cleanup continues past individual failures, each removal's return
+        code is recorded, and every target is re-inspected afterwards so a
+        resource that survived its removal is reported rather than assumed
+        gone. Nothing created before this run is ever deleted.
+        """
+        self.cleanup_report = []
         for name in (self.egress, self.origin, self.badcert):
-            if name:
-                self.docker.run("rm", "-f", name, check=False, timeout=60)
-        if self.network:
-            self.docker.run("network", "rm", self.network, check=False, timeout=60)
-        shutil.rmtree(self.workdir, ignore_errors=True)
+            if name not in self.created:
+                self._cleanup_unregistered("container", name, "rm", "-f", name)
+                continue
+            self._cleanup_remove("container", name, "rm", "-f", name)
+        if ("network:" + self.network) in self.created:
+            self._cleanup_remove("network", self.network, "network", "rm", self.network)
+        else:
+            self._cleanup_unregistered("network", self.network,
+                                       "network", "rm", self.network)
+        try:
+            shutil.rmtree(self.workdir)
+            self.cleanup_report.append(
+                {"kind": "workdir", "name": str(self.workdir), "returncode": 0,
+                 "remaining": self.workdir.exists()}
+            )
+        except OSError as exc:
+            self.cleanup_report.append(
+                {"kind": "workdir", "name": str(self.workdir), "returncode": None,
+                 "error": type(exc).__name__, "remaining": self.workdir.exists()}
+            )
         return False
+
+    @staticmethod
+    def _inspect_args(kind: str, name: str) -> tuple:
+        # Kind-specific subcommands: `docker inspect` alone cannot see
+        # networks, and the wrong type would report a misleading absence.
+        if kind in ("container", "network", "image"):
+            return (kind, "inspect", name)
+        return ("inspect", name)
+
+    def _inspect_state(self, kind: str, name: str) -> tuple[str, int | None]:
+        """Return (state, rc): 'absent' only on a confirmed not-found, else
+        'present' or 'unknown'; daemon errors and unrecognized failures are
+        never proof of absence. The inspection returncode is recorded."""
+        try:
+            inspection = self.docker.run(
+                *self._inspect_args(kind, name), check=False, timeout=30
+            )
+        except Exception:  # noqa: BLE001 - an inspection failure is unknown
+            return "unknown", None
+        if inspection.returncode == 0:
+            return "present", 0
+        stderr = inspection.stderr.lower()
+        if "no such" in stderr or "not found" in stderr:
+            return "absent", inspection.returncode
+        return "unknown", inspection.returncode
+
+    def _owns_unregistered(self, kind: str, name: str) -> str:
+        """Ownership proof for a present but unregistered same-named resource.
+
+        A partially-created ``docker run``/``network create`` can leave an
+        object under our unique name without registering it. Only an exact
+        per-run label match proves this invocation created it; anything else
+        is 'foreign' (never deleted) or 'unknown' on inspection failure.
+        """
+        label_format = (
+            "{{json .Config.Labels}}" if kind == "container" else "{{json .Labels}}"
+        )
+        try:
+            inspection = self.docker.run(
+                *self._inspect_args(kind, name), "--format", label_format,
+                check=False, timeout=30,
+            )
+        except Exception:  # noqa: BLE001 - unknown ownership is never deleted
+            return "unknown"
+        if inspection.returncode != 0:
+            return "unknown"
+        try:
+            labels = json.loads(inspection.stdout.strip() or "null") or {}
+        except ValueError:
+            return "unknown"
+        return "owned" if labels.get("opensandbox.live-vault-test") == self.run_id else "foreign"
+
+    def _cleanup_unregistered(self, kind: str, name: str, *rm_args) -> None:
+        """Handle a same-named resource this run never registered: remove it
+        only when the per-run label proves this invocation created it."""
+        state, rc = self._inspect_state(kind, name)
+        if state == "present":
+            owner = self._owns_unregistered(kind, name)
+            if owner == "owned":
+                self._cleanup_remove(kind, name, *rm_args)
+            elif owner == "foreign":
+                # Same UUID-named resource we cannot have created: report it
+                # as a failure but never delete a foreign object.
+                self.cleanup_report.append(
+                    {"kind": kind, "name": name, "returncode": None,
+                     "skipped": "foreign-owned", "remaining": True,
+                     "inspect_rc": rc}
+                )
+            else:
+                self.cleanup_report.append(
+                    {"kind": kind, "name": name, "returncode": None,
+                     "skipped": "not-created", "remaining": "unknown",
+                     "inspect_rc": rc}
+                )
+        elif state == "unknown":
+            self.cleanup_report.append(
+                {"kind": kind, "name": name, "returncode": None,
+                 "skipped": "not-created", "remaining": "unknown",
+                 "inspect_rc": rc}
+            )
+
+    def _cleanup_remove(self, kind: str, name: str, *rm_args) -> None:
+        entry: dict = {"kind": kind, "name": name}
+        try:
+            result = self.docker.run(*rm_args, check=False, timeout=60)
+            entry["returncode"] = result.returncode
+            if result.returncode:
+                entry["stderr"] = sanitize(result.stderr[-1000:])
+        except Exception as exc:  # noqa: BLE001 - record and keep cleaning
+            entry["returncode"] = None
+            entry["error"] = sanitize(f"{type(exc).__name__}: {exc}"[:500])
+        try:
+            inspection = self.docker.run(
+                *self._inspect_args(kind, name), check=False, timeout=30
+            )
+            entry["inspect_rc"] = inspection.returncode
+            if inspection.returncode == 0:
+                entry["remaining"] = True
+            else:
+                stderr = inspection.stderr.lower()
+                if "no such" in stderr or "not found" in stderr:
+                    entry["remaining"] = False
+                else:
+                    entry["remaining"] = "unknown"
+                    entry["inspect_stderr"] = sanitize(inspection.stderr[-500:])
+        except Exception as exc:  # noqa: BLE001 - unknown is a cleanup failure
+            entry["remaining"] = "unknown"
+            entry["inspect_error"] = sanitize(f"{type(exc).__name__}: {exc}"[:500])
+        self.cleanup_report.append(entry)
 
 
 def run_case(name, action, results, artifacts):
@@ -311,11 +491,70 @@ def run_case(name, action, results, artifacts):
     try:
         action()
     except Exception as exc:
-        record.update(status="FAIL", error=str(exc))
-        print(f"--- FAIL: {name}: {exc}", flush=True)
+        record.update(status="FAIL", error=sanitize(str(exc)))
+        print(f"--- FAIL: {name}: {sanitize(str(exc))}", flush=True)
         raise
     record.update(status="PASS", seconds=round(time.monotonic() - started, 3))
     print(f"--- PASS: {name} ({record['seconds']:.3f}s)", flush=True)
+
+
+def _git_evidence() -> dict:
+    """HEAD SHA, dirty flag and a diff fingerprint; never repo contents."""
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(ROOT), *args],
+                              capture_output=True, text=True, timeout=30)
+
+    evidence: dict = {}
+    try:
+        import hashlib
+
+        head = git("rev-parse", "HEAD")
+        evidence["head"] = head.stdout.strip() if head.returncode == 0 else None
+        status = git("status", "--porcelain")
+        evidence["dirty"] = bool(status.stdout.strip()) if status.returncode == 0 else None
+        diff = git("diff", "HEAD")
+        evidence["diff_fingerprint"] = (
+            "sha256:" + hashlib.sha256(diff.stdout.encode()).hexdigest()
+            if diff.returncode == 0 else None
+        )
+        # git diff ignores untracked files: fingerprint each one by name and
+        # content hash so new sources in the write set are covered too.
+        untracked = git("ls-files", "--others", "--exclude-standard")
+        entries = []
+        if untracked.returncode == 0:
+            for name in sorted(untracked.stdout.split()):
+                path = ROOT / name
+                try:
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                    entries.append({"path": name, "sha256": digest})
+                except OSError:
+                    entries.append({"path": name, "sha256": None})
+        evidence["untracked_files"] = entries
+    except (OSError, subprocess.TimeoutExpired):
+        evidence.update(
+            {"head": None, "dirty": None, "diff_fingerprint": None,
+             "untracked_files": None}
+        )
+    return evidence
+
+
+def _version_evidence(docker: Docker) -> dict:
+    def capture(*command: str) -> str | None:
+        try:
+            result = subprocess.run(list(command), capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    return {
+        "platform": subprocess.run(
+            ["uname", "-srmo"], capture_output=True, text=True, timeout=10
+        ).stdout.strip(),
+        "python": sys.version.split()[0],
+        "go": capture("go", "version"),
+        "docker": capture("docker", "version", "--format", "{{.Server.Version}}"),
+        "mitmproxy": None,  # filled from inside the egress container when it runs
+    }
 
 
 def main(argv=None):
@@ -324,15 +563,46 @@ def main(argv=None):
     parser.add_argument("--artifacts", type=Path, help="directory for evidence")
     parser.add_argument("--drain-seconds", type=int, default=2,
                         help="credential transition drain timeout in the sidecar")
+    parser.add_argument("--base",
+                        help="full SHA of the chosen comparison base; "
+                             "recorded verbatim, UNCONFIRMED when omitted")
     args = parser.parse_args(argv)
+    if not 1 <= args.drain_seconds <= 300:
+        parser.error("--drain-seconds must be in the range 1..300")
     artifacts = args.artifacts or Path(tempfile.mkdtemp(prefix="egress-live-vault-"))
     artifacts.mkdir(parents=True, exist_ok=True)
     docker = Docker(artifacts)
     image = args.image or "opensandbox-egress-livevault:" + uuid.uuid4().hex[:12]
     results = []
     success = False
+    import datetime
+
+    started_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    evidence = {
+        "argv": [sanitize(arg) for arg in (argv if argv is not None else sys.argv[1:])],
+        "image": {
+            "name": image,
+            "id": None,
+            "digests": [],
+            # Provenance is only known when this runner builds the image from
+            # the repo Dockerfile; a supplied --image is never implied to
+            # match any tag, base, or candidate revision.
+            "source": "external --image (provenance unknown)" if args.image
+            else "runner-built from components/egress/Dockerfile",
+        },
+        "environment": _version_evidence(docker),
+        "git": _git_evidence(),
+    }
+    # UNCONFIRMED is a valid absence of a chosen base, not evidence of one.
+    evidence["git"]["base"] = args.base or "UNCONFIRMED"
+    runtime: LiveVaultRuntime | None = None
+    # Only an image this invocation actually built may be removed: a
+    # prereq failure before the build or a supplied --image never yields an
+    # image cleanup entry, let alone a fake "unbuilt image" failure.
+    image_built = False
 
     def prerequisites():
+        nonlocal image_built
         require(shutil.which("docker") is not None, "Docker CLI unavailable; real image test did not run")
         info = docker.json("info", "--format", "{{json .}}")
         (artifacts / "docker-runtime.json").write_text(json.dumps(info, indent=2) + "\n")
@@ -342,8 +612,13 @@ def main(argv=None):
             build_args = ["--build-arg", "GOPROXY=" + _host_goproxy()] if _host_goproxy() else []
             docker.run("build", "-f", ROOT / "components/egress/Dockerfile", *build_args,
                        "-t", image, ROOT, timeout=1800)
-        require(docker.json("image", "inspect", image)[0]["Config"]["Entrypoint"] == ENTRYPOINT,
+            image_built = True
+        inspected = docker.json("image", "inspect", image)[0]
+        require(inspected["Config"]["Entrypoint"] == ENTRYPOINT,
                 "image has an unexpected entrypoint")
+        # Image identity is reported only after inspect, never guessed.
+        evidence["image"]["id"] = inspected.get("Id")
+        evidence["image"]["digests"] = inspected.get("RepoDigests") or []
 
     def test_unbound_end_to_end_tls(runtime: LiveVaultRuntime):
         plan = {"requests": [{"host": UNBOUND, "path": "/anything", "trust": "origin"}]}
@@ -373,6 +648,100 @@ def main(argv=None):
                 f"bound request did not receive the vault credential: {bound}")
         require(unbound.get("status") == 200 and not unbound["echo"].get("private_token"),
                 f"unbound traffic changed after binding: {unbound}")
+
+    def test_h1_authority_gate(runtime: LiveVaultRuntime):
+        created = runtime.client({"requests": [{
+            "vault_api": {"method": "POST", "path": "/credential-vault",
+                          "body": vault_body(SECRET_ONE), "token": TOKEN},
+        }]})
+        require(created[0].get("status") in (201, 409),
+                f"vault create failed: {created}")
+        raw = lambda request_head: {
+            "host": BOUND, "trust": "mitm", "raw": request_head,
+        }
+        outcomes = runtime.client({"requests": [
+            raw("GET /v1/data HTTP/1.1\r\nHost: bound.example.com\r\n\r\n"),
+            raw("GET /v1/data HTTP/1.1\r\nHost: bound.example.com:443\r\n\r\n"),
+            raw("GET /v1/data HTTP/1.1\r\nHost: other.example.com\r\n\r\n"),
+            raw("GET /v1/data HTTP/1.1\r\nHost: bound.example.com:8443\r\n\r\n"),
+            raw("GET /v1/data HTTP/1.1\r\nHost: bound.example.com\r\n"
+                "Host: bound.example.com\r\n\r\n"),
+            raw("GET /v1/data HTTP/1.1\r\nHost: user@bound.example.com\r\n\r\n"),
+            raw("GET /v1/data HTTP/1.1\r\nHost: bound%2eexample.com\r\n\r\n"),
+            raw("GET /v1/data HTTP/1.1\r\nHost: bound.example.com extra\r\n\r\n"),
+            raw("GET https://bound.example.com/v1/data HTTP/1.1\r\n"
+                "Host: bound.example.com\r\n\r\n"),
+            raw("GET https://other.example.com/v1/data HTTP/1.1\r\n"
+                "Host: bound.example.com\r\n\r\n"),
+        ]})
+        valid, port443, other, port8443, dup, userinfo, percent, space, absolute, cross = outcomes
+        require(valid.get("status") == 200 and (valid.get("echo") or {}).get("private_token"),
+                f"origin-form request lost its credential: {valid}")
+        require(port443.get("status") == 200 and (port443.get("echo") or {}).get("private_token"),
+                f"explicit :443 authority lost its credential: {port443}")
+        require(absolute.get("status") == 200 and (absolute.get("echo") or {}).get("private_token"),
+                f"matching absolute-form authority lost its credential: {absolute}")
+        for label, outcome in (("other-host", other), ("wrong-port", port8443),
+                               ("duplicate-host", dup), ("userinfo", userinfo),
+                               ("percent", percent), ("space", space),
+                               ("cross-absolute", cross)):
+            require("error" in outcome or outcome.get("status", 0) >= 400,
+                    f"{label} authority was not denied: {outcome}")
+            require(not (outcome.get("echo") or {}).get("private_token"),
+                    f"{label} authority still received credentials: {outcome}")
+
+    def test_ech_opaque(runtime: LiveVaultRuntime):
+        created = runtime.client({"requests": [{
+            "vault_api": {"method": "POST", "path": "/credential-vault",
+                          "body": vault_body(SECRET_ONE), "token": TOKEN},
+        }]})
+        require(created[0].get("status") in (201, 409),
+                f"vault create failed: {created}")
+        outcomes = runtime.client({"requests": [
+            {"host": BOUND, "ech_hello": True, "ech": True},
+            {"host": BOUND, "ech_hello": True, "ech": False},
+        ]})
+        ech, plain = outcomes
+        require(ech.get("peer_matches_origin") is True,
+                f"ECH-bearing hello was not opaque passthrough: {ech}")
+        require(plain.get("peer_matches_origin") is False,
+                f"bound hello without ECH was not intercepted: {plain}")
+
+    def test_idle_drain_close(runtime: LiveVaultRuntime):
+        # A keepalive connection is bound, the vault is deleted, and the
+        # existing TLS socket is then read — never written — across the
+        # retirement deadline: a timeout before the deadline proves the
+        # transport stayed open; EOF/TLS EOF/reset by the deadline plus
+        # bounded sweep slack proves the drain actually closed it.
+        # The preceding revocation test leaves the vault absent, so this test
+        # creates its own binding first.
+        phase = {"requests": [
+            {"vault_api": {"method": "POST", "path": "/credential-vault",
+                           "body": vault_body(SECRET_ONE), "token": TOKEN}},
+            {"host": BOUND, "path": "/v1/data", "trust": "mitm"},
+            {"vault_api": {"method": "DELETE", "path": "/credential-vault", "token": TOKEN}},
+            {"idle_read": True, "keepalive_with": 1,
+             # A fractional wait strictly before the deadline: an integer
+             # timeout equal to the deadline races the drain and would
+             # produce a false failure at drain_seconds=1.
+             "timeout_s": min(0.25, runtime.drain_seconds / 4)},
+            {"idle_read": True, "keepalive_with": 1,
+             "timeout_s": runtime.drain_seconds + 4},
+        ]}
+        created, bound, deleted, early, late = runtime.client(phase)
+        require(created.get("status") == 201, f"vault create failed: {created}")
+        require(bound.get("status") == 200 and (bound.get("echo") or {}).get("private_token"),
+                f"pre-delete request missing credential: {bound}")
+        require(deleted.get("status") == 204, f"vault delete failed: {deleted}")
+        # The early read must end before the retirement deadline; its elapsed
+        # time is measured from the read start, which follows the delete ACK.
+        require(early.get("outcome") == "timeout"
+                and early.get("elapsed_s", runtime.drain_seconds) < runtime.drain_seconds,
+                f"transport closed or answered before the drain deadline: {early}")
+        require(late.get("outcome") in ("eof", "reset"),
+                f"deadline did not close the retired transport: {late}")
+        require(not (late.get("echo") or {}).get("private_token"),
+                f"closed transport still carried credentials: {late}")
 
     def test_rotation_stale_keepalive(runtime: LiveVaultRuntime):
         stale = runtime.client({"requests": [{
@@ -500,29 +869,94 @@ def main(argv=None):
 
     try:
         run_case(REQUIRED[0], prerequisites, results, artifacts)
-        with LiveVaultRuntime(docker, image, args.drain_seconds) as runtime:
+        managed = LiveVaultRuntime(docker, image, args.drain_seconds)
+        runtime = managed  # bound before __enter__ so its cleanup report survives a failed enter
+        with managed as runtime:
             run_case(REQUIRED[1], lambda: test_unbound_end_to_end_tls(runtime), results, artifacts)
             run_case(REQUIRED[2], lambda: test_bound_injection(runtime), results, artifacts)
-            run_case(REQUIRED[3], lambda: test_rotation_stale_keepalive(runtime), results, artifacts)
-            run_case(REQUIRED[4], lambda: test_delete_revocation(runtime), results, artifacts)
-            run_case(REQUIRED[5], lambda: test_failure_boundaries(runtime), results, artifacts)
-            (artifacts / "egress-logs.txt").write_text(runtime.egress_logs())
+            run_case(REQUIRED[3], lambda: test_h1_authority_gate(runtime), results, artifacts)
+            run_case(REQUIRED[4], lambda: test_ech_opaque(runtime), results, artifacts)
+            run_case(REQUIRED[5], lambda: test_rotation_stale_keepalive(runtime), results, artifacts)
+            run_case(REQUIRED[6], lambda: test_delete_revocation(runtime), results, artifacts)
+            run_case(REQUIRED[7], lambda: test_idle_drain_close(runtime), results, artifacts)
+            run_case(REQUIRED[8], lambda: test_failure_boundaries(runtime), results, artifacts)
+            (artifacts / "egress-logs.txt").write_text(sanitize(runtime.egress_logs()))
+            evidence["environment"]["mitmproxy"] = docker.run(
+                "exec", runtime.egress, "mitmdump", "--version", check=False
+            ).stdout.strip() or None
         require([r["name"] for r in results] == REQUIRED and all(r["status"] == "PASS" for r in results),
                 "required live vault RUN/PASS evidence is incomplete")
         success = True
     except (Failure, ValueError, KeyError) as exc:
         print("Live vault image validation FAILED: " + str(exc), file=sys.stderr)
     finally:
+        cleanup_entries = list(runtime.cleanup_report) if runtime is not None else []
+        if image_built and shutil.which("docker"):
+            # The runner-built image is removed like every other created
+            # resource: checked, inspected and reported, never assumed gone,
+            # and a removal error never prevents results.json being written.
+            removal = {"kind": "image", "name": image}
+            try:
+                removed = docker.run("image", "rm", image, check=False)
+                removal["returncode"] = removed.returncode
+                if removed.returncode:
+                    removal["stderr"] = sanitize(removed.stderr[-1000:])
+            except Exception as exc:  # noqa: BLE001 - record and continue
+                removal["returncode"] = None
+                removal["error"] = sanitize(f"{type(exc).__name__}: {exc}"[:500])
+            try:
+                inspection = docker.run("image", "inspect", image, check=False)
+                removal["inspect_rc"] = inspection.returncode
+                if inspection.returncode == 0:
+                    removal["remaining"] = True
+                else:
+                    stderr = inspection.stderr.lower()
+                    # Only an explicit not-found confirms absence; daemon
+                    # failures like "failed to ..." are unknown, not gone.
+                    if "no such" in stderr or "not found" in stderr:
+                        removal["remaining"] = False
+                    else:
+                        removal["remaining"] = "unknown"
+                        removal["inspect_stderr"] = sanitize(inspection.stderr[-500:])
+            except Exception as exc:  # noqa: BLE001
+                removal["remaining"] = "unknown"
+                removal["inspect_error"] = sanitize(f"{type(exc).__name__}: {exc}"[:500])
+            cleanup_entries.append(removal)
+        cleanup_failures = [
+            f"{e['kind']}:{e['name']}"
+            for e in cleanup_entries
+            if e.get("returncode") != 0 or e.get("remaining")
+        ]
+        if cleanup_failures:
+            # Cleanup failure fails the run even when the test body failed;
+            # both failure records are preserved in results.
+            results.append({"name": "CleanupIntegrity", "status": "FAIL",
+                            "errors": cleanup_failures})
+            print("Live vault image validation FAILED: cleanup left "
+                  + ",".join(cleanup_failures), file=sys.stderr)
+            success = False
+        ended_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        passed = sum(1 for r in results if r["status"] == "PASS")
+        failed = sum(1 for r in results if r["status"] == "FAIL")
+        skipped = sum(1 for r in results if r["status"] == "SKIP")
         (artifacts / "results.json").write_text(json.dumps({
             "kind": "real-runtime-docker-image-live-vault",
-            "image": image,
+            "image": evidence["image"],
             "passed": success,
             "required": REQUIRED,
             "results": results,
+            "counts": {"pass": passed, "fail": failed, "skip": skipped},
+            "exit_status": 0 if success else 1,
+            "utc": {"start": started_utc, "end": ended_utc},
+            "environment": evidence["environment"],
+            "git": evidence["git"],
+            "cleanup": {
+                "status": "clean" if not cleanup_failures else "failed",
+                "failures": cleanup_failures,
+                "entries": cleanup_entries,
+            },
         }, indent=2) + "\n")
         print("Live vault image evidence: " + str(artifacts.resolve()), flush=True)
-        if not args.image and shutil.which("docker"):
-            docker.run("image", "rm", image, check=False)
     return 0 if success else 1
 
 
