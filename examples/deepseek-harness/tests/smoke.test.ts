@@ -1,3 +1,6 @@
+// Copyright 2026 The OpenSandbox Authors
+// SPDX-License-Identifier: Apache-2.0
+
 import { describe, expect, it, vi } from 'vitest';
 import { smoke } from '../smoke.js';
 

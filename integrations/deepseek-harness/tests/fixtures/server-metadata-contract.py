@@ -1,3 +1,6 @@
+# Copyright 2026 The OpenSandbox Authors
+# SPDX-License-Identifier: Apache-2.0
+
 """Run the checked-out FastPath metadata validator without its optional stack.
 
 This fixture compiles the original AST nodes, rather than copying the rules.

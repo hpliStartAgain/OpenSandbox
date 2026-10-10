@@ -1,3 +1,6 @@
+// Copyright 2026 The OpenSandbox Authors
+// SPDX-License-Identifier: Apache-2.0
+
 import { readFile, writeFile } from 'node:fs/promises';
 import { inspect } from 'node:util';
 import { Context, RegistryService } from '@deepseek-ai/cordis';

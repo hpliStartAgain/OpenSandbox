@@ -1,3 +1,6 @@
+// Copyright 2026 The OpenSandbox Authors
+// SPDX-License-Identifier: Apache-2.0
+
 import { StringDecoder } from 'node:string_decoder';
 
 /** Test-only model of execd commandOutputTail: nonempty lines omit CR/LF; blank lines emit LF. */

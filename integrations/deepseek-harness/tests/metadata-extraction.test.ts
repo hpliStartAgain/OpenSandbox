@@ -1,3 +1,6 @@
+// Copyright 2026 The OpenSandbox Authors
+// SPDX-License-Identifier: Apache-2.0
+
 // OFFLINE mutation checks for the source-contract fixture, never a live server.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';

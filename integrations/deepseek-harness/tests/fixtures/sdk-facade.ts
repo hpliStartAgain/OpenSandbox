@@ -1,3 +1,6 @@
+// Copyright 2026 The OpenSandbox Authors
+// SPDX-License-Identifier: Apache-2.0
+
 import type {
   CommandExecution, CommandStatus, ExecdCommands, Sandbox, SandboxFiles,
   ServerStreamEvent,

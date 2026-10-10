@@ -1,3 +1,6 @@
+// Copyright 2026 The OpenSandbox Authors
+// SPDX-License-Identifier: Apache-2.0
+
 import { SandboxApiException, SandboxError, SandboxInternalException } from '@alibaba-group/opensandbox';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SdkTransport } from '../src/sdk-transport.js';

@@ -1,3 +1,6 @@
+// Copyright 2026 The OpenSandbox Authors
+// SPDX-License-Identifier: Apache-2.0
+
 // OFFLINE regression tests: fake SDK network and session boundaries, actual plugin opener/shell.
 // These checks do not establish a deployed Ubuntu result.
 import { afterEach, describe, expect, it, vi } from 'vitest';

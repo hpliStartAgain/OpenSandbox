@@ -1,3 +1,6 @@
+// Copyright 2026 The OpenSandbox Authors
+// SPDX-License-Identifier: Apache-2.0
+
 // OFFLINE source/wire contract: actual published SDK, extracted server validator,
 // in-memory HTTP only. This does not establish deployed FastPath acceptance.
 import { spawnSync } from 'node:child_process';
