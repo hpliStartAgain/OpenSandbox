@@ -68,8 +68,12 @@ func TestFenceEnsureRequiresReadback(t *testing.T) {
 					return nil, tc.writeErr
 				}
 				require.Empty(t, script)
-				require.Equal(t, []string{"-j", "list", "ruleset", "inet"}, args)
-				return tc.readback, tc.readErr
+				if calls == 2 {
+					require.Equal(t, []string{"-j", "list", "ruleset", "inet"}, args)
+					return tc.readback, tc.readErr
+				}
+				require.Equal(t, []string{"-n", "-y", "list", "table", "inet", fenceTable}, args)
+				return []byte(fenceExpectedTable), nil
 			}}
 			err := f.Ensure(context.Background())
 			if tc.wantErr {
@@ -80,7 +84,11 @@ func TestFenceEnsureRequiresReadback(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
-			require.Equal(t, 2, calls, "read kernel state even after command failure")
+			wantCalls := 2
+			if present, err := inspectFence(tc.readback); tc.readErr == nil && err == nil && present {
+				wantCalls = 3
+			}
+			require.Equal(t, wantCalls, calls, "both complete snapshots are required after a command, including a lost result")
 		})
 	}
 }
@@ -92,7 +100,7 @@ func TestFenceReadbackStrict(t *testing.T) {
 		kind, key string
 		value     any
 	}{
-		{"missing-owner", 1, "table", "comment", nil},
+		{"null-owner", 1, "table", "comment", nil},
 		{"wrong-owner", 1, "table", "comment", "foreign"},
 		{"dormant-table", 1, "table", "flags", []string{"dormant"}},
 		{"process-owned-table", 1, "table", "flags", []string{"owner", "persist"}},
@@ -171,7 +179,11 @@ func TestFenceCancellationAndSerialization(t *testing.T) {
 	require.ErrorIs(t, f.Ensure(ctx), context.Canceled)
 	started, release, queued := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var sequence []string
-	f = &Fence{run: func(_ context.Context, script string, _ ...string) ([]byte, error) {
+	f = &Fence{run: func(_ context.Context, script string, args ...string) ([]byte, error) {
+		if args[0] == "-n" {
+			sequence = append(sequence, "text")
+			return []byte(fenceExpectedTable), nil
+		}
 		if script == fenceInstallScript {
 			sequence = append(sequence, "ensure")
 			if len(sequence) == 1 {
@@ -192,7 +204,7 @@ func TestFenceCancellationAndSerialization(t *testing.T) {
 	<-queued
 	close(release)
 	wg.Wait()
-	require.Equal(t, []string{"ensure", "read", "ensure", "read"}, sequence)
+	require.Equal(t, []string{"ensure", "read", "text", "ensure", "read", "text"}, sequence)
 }
 
 func TestFenceScriptIsAnIndependentAtomicBatch(t *testing.T) {
@@ -211,4 +223,111 @@ func TestFenceMissingBinaryCannotProveIsolation(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	fence := NewFence()
 	require.ErrorContains(t, fence.Ensure(context.Background()), "installation is unconfirmed")
+}
+
+func TestFenceRequiresCompleteTextSnapshot(t *testing.T) {
+	legacyJSON := []byte(strings.Replace(string(fenceJSON()), `,"comment":"opensandbox quarantine v1"`, "", 1))
+	failure := errors.New("injected text readback failure")
+	for _, tc := range []struct {
+		name                string
+		json                []byte
+		text                string
+		writeErr, textErr   error
+		cancelText, wantErr bool
+	}{
+		{name: "legacy-json-requires-owned-text", json: legacyJSON, text: fenceExpectedTable},
+		{name: "lost-result-with-two-complete-snapshots", json: legacyJSON, text: fenceExpectedTable, writeErr: failure},
+		{name: "text-read-failure", text: fenceExpectedTable, textErr: failure, wantErr: true},
+		{name: "lost-result-and-text-failure", text: fenceExpectedTable, writeErr: failure, textErr: failure, wantErr: true},
+		{name: "text-cancelled", text: fenceExpectedTable, cancelText: true, wantErr: true},
+		{name: "legacy-json-without-text", json: legacyJSON, wantErr: true},
+		{name: "text-missing-owner", json: legacyJSON, text: strings.Replace(fenceExpectedTable, `    comment "opensandbox quarantine v1"`+"\n", "", 1), wantErr: true},
+		{name: "text-wrong-owner", json: legacyJSON, text: strings.Replace(fenceExpectedTable, fenceOwner, "foreign", 1), wantErr: true},
+		{name: "json-omitted-flags-text-dormant", text: strings.Replace(fenceExpectedTable, "    comment", "    flags dormant\n    comment", 1), wantErr: true},
+		{name: "json-omitted-flags-text-owner", text: strings.Replace(fenceExpectedTable, "    comment", "    flags owner\n    comment", 1), wantErr: true},
+		{name: "text-extra-object", text: strings.Replace(fenceExpectedTable, "    chain input", "    set unexpected { type ipv4_addr; }\n    chain input", 1), wantErr: true},
+		{name: "text-extra-chain", text: strings.Replace(fenceExpectedTable, "    chain input", "    chain extra { }\n    chain input", 1), wantErr: true},
+		{name: "text-extra-rule", text: strings.Replace(fenceExpectedTable, "        drop", "        accept\n        drop", 1), wantErr: true},
+		{name: "text-wrong-hook", text: strings.Replace(fenceExpectedTable, "hook input", "hook prerouting", 1), wantErr: true},
+		{name: "text-wrong-priority", text: strings.Replace(fenceExpectedTable, "priority -450", "priority 0", 1), wantErr: true},
+		{name: "text-wrong-policy", text: strings.Replace(fenceExpectedTable, "policy drop", "policy accept", 1), wantErr: true},
+		{name: "text-unclosed-table", text: strings.TrimSuffix(fenceExpectedTable, "}\n"), wantErr: true},
+		{name: "text-trailing-content", text: fenceExpectedTable + "table inet extra {}\n", wantErr: true},
+		{name: "text-owner-internal-space", text: strings.Replace(fenceExpectedTable, "opensandbox quarantine v1", "opensandbox  quarantine v1", 1), wantErr: true},
+		{name: "text-rule-internal-space", text: strings.Replace(fenceExpectedTable, "type filter", "type  filter", 1), wantErr: true},
+		{name: "text-outer-whitespace", text: "\n\t" + strings.ReplaceAll(fenceExpectedTable, "\n", " \t\n\n\t")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			calls := 0
+			f := &Fence{run: func(_ context.Context, script string, args ...string) ([]byte, error) {
+				calls++
+				switch calls {
+				case 1:
+					require.Equal(t, fenceInstallScript, script)
+					return nil, tc.writeErr
+				case 2:
+					require.Empty(t, script)
+					require.Equal(t, []string{"-j", "list", "ruleset", "inet"}, args)
+					if tc.json != nil {
+						return tc.json, nil
+					}
+					return fenceJSON(), nil
+				case 3:
+					require.Empty(t, script)
+					require.Equal(t, []string{"-n", "-y", "list", "table", "inet", fenceTable}, args)
+					if tc.cancelText {
+						cancel()
+					}
+					return []byte(tc.text), tc.textErr
+				default:
+					t.Fatal("unexpected additional command")
+					return nil, nil
+				}
+			}}
+			err := f.Ensure(ctx)
+			if tc.wantErr {
+				require.ErrorContains(t, err, "installation is unconfirmed")
+			} else {
+				require.NoError(t, err)
+			}
+			if tc.textErr != nil {
+				require.ErrorIs(t, err, tc.textErr)
+			}
+			if tc.cancelText {
+				require.ErrorIs(t, err, context.Canceled)
+			}
+			require.Equal(t, 3, calls)
+		})
+	}
+}
+
+func TestFenceTextCannotOverrideInvalidJSON(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{"null-owner", []byte(strings.Replace(string(fenceJSON()), `"comment":"opensandbox quarantine v1"`, `"comment":null`, 1))},
+		{"wrong-owner", []byte(strings.Replace(string(fenceJSON()), fenceOwner, "foreign", 1))},
+		{"flags-dormant", []byte(strings.Replace(string(fenceJSON()), `"handle":1`, `"handle":1,"flags":"dormant"`, 1))},
+		{"extra-object", []byte(strings.Replace(string(fenceJSON()), `{"metainfo":`, `{"set":{"family":"inet","table":"opensandbox_quarantine","name":"extra"}},{"metainfo":`, 1))},
+		{"missing-table", absentFenceJSON},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			f := &Fence{run: func(_ context.Context, script string, args ...string) ([]byte, error) {
+				calls++
+				if script != "" {
+					return nil, nil
+				}
+				if args[0] == "-j" {
+					return tc.data, nil
+				}
+				return []byte(fenceExpectedTable), nil
+			}}
+			require.Error(t, f.Ensure(context.Background()))
+			require.Equal(t, 2, calls, "invalid/incomplete JSON must fail without a text fallback")
+		})
+	}
 }

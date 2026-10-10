@@ -34,7 +34,24 @@ EGRESS = "/opt/opensandbox-egress/egress"
 SUPERVISOR = "/opt/opensandbox-egress/supervisor"
 WORKER_STARTED = "supervisor: worker started ("
 CONFIRMED = "packet isolation=QuarantineConfirmed"
-REQUIRED = ["TestRuntimeImagePrerequisites", "TestRuntimeMitmFaultOwnerContainment"]
+REQUIRED = ["TestRuntimeImagePrerequisites", "TestImageFenceVerifierDormantRejection",
+            "TestRuntimeMitmFaultOwnerContainment"]
+FENCE_TEXT = '''table inet opensandbox_quarantine {
+comment "opensandbox quarantine v1"
+chain input {
+type filter hook input priority -450; policy drop;
+drop
+}
+chain output {
+type filter hook output priority -450; policy drop;
+drop
+}
+chain forward {
+type filter hook forward priority -450; policy drop;
+drop
+}
+}
+'''
 
 SNAPSHOT = r'''
 import json, os, pathlib
@@ -144,7 +161,15 @@ import json, os, subprocess
 namespace = os.readlink("/proc/self/ns/net")
 result = subprocess.run(["nft", "-j", "list", "ruleset", "inet"],
                         check=True, capture_output=True, text=True)
-print(json.dumps({"netns": namespace, "ruleset": json.loads(result.stdout)}))
+ruleset = json.loads(result.stdout)
+present = any(entry.get("table", {}).get("family") == "inet" and
+              entry.get("table", {}).get("name") == "opensandbox_quarantine"
+              for entry in ruleset["nftables"])
+table_text = None
+if present:
+    table_text = subprocess.run(["nft", "-n", "-y", "list", "table", "inet", "opensandbox_quarantine"],
+                                check=True, capture_output=True, text=True).stdout
+print(json.dumps({"netns": namespace, "ruleset": ruleset, "table_text": table_text}))
 '''
 
 class Failure(RuntimeError):
@@ -154,8 +179,8 @@ def require(condition, message):
     if not condition:
         raise Failure(message)
 
-def fence_present(data):
-    """Require the exact independent, unconditional inet fence or true absence."""
+def fence_present(data, table_text=None):
+    """Require strict JSON plus complete owner/flags text, or true JSON absence."""
     require(isinstance(data, dict) and set(data) == {"nftables"}, "invalid nft JSON envelope")
     require(isinstance(data["nftables"], list), "invalid nft JSON entries")
     owned = []
@@ -172,7 +197,8 @@ def fence_present(data):
     for kind, obj in owned:
         if kind == "table":
             require(set(obj) <= {"family", "name", "handle", "comment", "flags"}, "unknown fence table property")
-            require(obj.get("comment") == "opensandbox quarantine v1" and obj.get("flags", []) == [],
+            require(("comment" not in obj or obj["comment"] == "opensandbox quarantine v1")
+                    and obj.get("flags", []) == [],
                     "fence has wrong owner or nonempty flags")
             tables.append(obj)
         elif kind == "chain":
@@ -193,6 +219,11 @@ def fence_present(data):
             raise Failure("unexpected fence object: " + kind)
     require(len(tables) == 1 and set(chains) == set(rules) == {"input", "output", "forward"},
             "fence is missing required hooks")
+    # nft 1.0.6 omits table comments from JSON, and its flag rendering is not
+    # sufficient proof. Text is mandatory even when JSON includes the comment.
+    lines = lambda value: [line.strip() for line in value.splitlines() if line.strip()]
+    require(isinstance(table_text, str) and lines(table_text) == lines(FENCE_TEXT),
+            "fence text does not match the complete owner/no-flags/drop-hook template")
     return True
 
 def processes(snapshot, role):
@@ -243,7 +274,7 @@ def normalize_capabilities(values):
 def validate_observer(data, namespace):
     require(data.get("netns") == namespace,
             f"fence observer ran in wrong namespace: expected {namespace}, observed {data.get('netns')}")
-    return fence_present(data["ruleset"])
+    return fence_present(data["ruleset"], data.get("table_text"))
 
 
 def validate_fault(before, after, observed, health, logs):
@@ -298,13 +329,52 @@ class Runtime:
             raise
 
     def __exit__(self, *_):
-        for name in reversed(self.created):
+        evidence = {"captures": [], "cleanup": []}
+
+        def capture(filename, *args, combine_stderr=False):
+            entry = {"file": filename}
+            evidence["captures"].append(entry)
             try:
-                for suffix, args in (("logs.txt", ("logs", name)), ("inspect.json", ("inspect", name))):
-                    result = self.docker.run(*args, check=False)
-                    (self.docker.artifacts / (name + "-" + suffix)).write_text(result.stdout + result.stderr)
-            finally:
-                self.docker.run("rm", "--force", name, check=False)
+                result = self.docker.run(*args, check=False, timeout=10)
+                entry.update(returncode=result.returncode,
+                             status="collected" if result.returncode == 0 else "command-failed")
+                # Keep exact nft stdout, including unsupported JSON properties.
+                # This is diagnostic evidence, never accepted containment proof.
+                output = result.stdout + result.stderr if combine_stderr else result.stdout
+                (self.docker.artifacts / filename).write_text(output)
+                (self.docker.artifacts / (filename + ".stderr")).write_text(result.stderr)
+            except Exception as exc:
+                entry.update(status="capture-failed", error=str(exc))
+                print(f"Exit diagnostic {filename} failed: {exc}", file=sys.stderr)
+
+        if self.name in self.created:
+            # Read only test-owned namespace/ruleset data. Never read process
+            # environments, IPC credentials, or change any rules for diagnostics.
+            capture("exit-sidecar-netns.txt", "exec", self.name, "readlink", "/proc/self/ns/net")
+            capture("exit-nft-version.txt", "exec", self.name, "nft", "--version")
+            capture("exit-nft-ruleset.json", "exec", self.name, "nft", "-j", "list", "ruleset", "inet")
+            capture("exit-nft-quarantine.txt", "exec", self.name, "nft", "-n", "-y", "list", "table", "inet", "opensandbox_quarantine")
+        if self.original and self.workload in self.created:
+            # Attempt this before deleting either container, even when the owner
+            # timed out before the ordinary successful-path observer could run.
+            capture("exit-workload-observer.json", "run", "--rm", "--network", "container:" + self.workload,
+                    "--cap-drop", "ALL", "--cap-add", "NET_ADMIN", "--read-only", "--entrypoint", "python3",
+                    self.image, "-c", FENCE_OBSERVER)
+        for name in reversed(self.created):
+            for suffix, args in (("logs.txt", ("logs", name)), ("inspect.json", ("inspect", name))):
+                capture(name + "-" + suffix, *args, combine_stderr=suffix == "logs.txt")
+            try:
+                result = self.docker.run("rm", "--force", name, check=False, timeout=10)
+                evidence["cleanup"].append({"container": name, "returncode": result.returncode})
+            except Exception as exc:
+                evidence["cleanup"].append({"container": name, "error": str(exc)})
+                print(f"Cleanup of {name} failed: {exc}", file=sys.stderr)
+        try:
+            self.record("exit-diagnostics", evidence)
+        except Exception as exc:
+            print(f"Exit diagnostic manifest could not be saved: {exc}", file=sys.stderr)
+        # Returning None preserves any original test exception; collection or
+        # cleanup failures cannot turn a failed runtime assertion into a pass.
 
     def wait(self, description, predicate, timeout=60):
         deadline = time.monotonic() + timeout
@@ -372,6 +442,50 @@ class Runtime:
         return result
 
 
+def test_image_verifier(docker, image):
+    """Isolated verifier fixture, never a substitute for the real owner test."""
+    directory = docker.artifacts / "verifier"
+    directory.mkdir()
+    fixture = Runtime(Docker(directory), image)
+    d = fixture.docker
+    fixture.created.append(fixture.name)
+    try:
+        d.run("create", "--name", fixture.name, "--network", "none", "--cap-drop", "ALL",
+              "--cap-add", "NET_ADMIN", "--read-only", "--entrypoint", "sleep", image, "120")
+        host = d.json("inspect", fixture.name)[0]["HostConfig"]
+        require(not host["Privileged"] and host["NetworkMode"] == "none" and not host["PidMode"]
+                and normalize_capabilities(host["CapDrop"]) == ["ALL"]
+                and normalize_capabilities(host["CapAdd"]) == ["NET_ADMIN"], "unsafe verifier fixture")
+        d.run("start", fixture.name)
+        namespace = d.run("exec", fixture.name, "readlink", "/proc/self/ns/net").stdout.strip()
+        apply = "import subprocess,sys; subprocess.run(['nft','-f','-'],input=sys.argv[1],text=True,check=True)"
+        d.run("exec", fixture.name, "python3", "-c", apply, FENCE_TEXT)
+        valid = d.json("exec", fixture.name, "python3", "-c", FENCE_OBSERVER)
+        fixture.record("valid-observer", valid)
+        require(validate_observer(valid, namespace), "real valid verifier fixture was not accepted")
+        dormant = "delete table inet opensandbox_quarantine\n" + FENCE_TEXT.replace("{\n", "{\nflags dormant;\n", 1)
+        d.run("exec", fixture.name, "python3", "-c", apply, dormant)
+        raw = d.run("exec", fixture.name, "nft", "-j", "list", "ruleset", "inet", check=False)
+        text = d.run("exec", fixture.name, "nft", "-n", "-y", "list", "table", "inet", "opensandbox_quarantine", check=False)
+        actual_namespace = d.run("exec", fixture.name, "readlink", "/proc/self/ns/net").stdout.strip()
+        fixture.record("dormant-readback", {"netns": actual_namespace,
+            "json": {"returncode": raw.returncode, "stdout": raw.stdout, "stderr": raw.stderr},
+            "text": {"returncode": text.returncode, "stdout": text.stdout, "stderr": text.stderr}})
+        require(actual_namespace == namespace, "verifier fixture namespace changed")
+        require(text.returncode == 0 and any(line.strip().rstrip(";") == "flags dormant" for line in text.stdout.splitlines()),
+                "real dormant fixture was not established")
+        if raw.returncode:
+            print("Verifier rejected dormant table: JSON read failed; raw output and stderr preserved", flush=True)
+        else:
+            try:
+                accepted = fence_present(json.loads(raw.stdout), text.stdout)
+            except (Failure, ValueError):
+                accepted = False
+            require(not accepted, "verifier accepted a real dormant table")
+    finally:
+        fixture.__exit__(*sys.exc_info())
+
+
 def test_runtime_fault(docker, image):
     with Runtime(docker, image) as runtime:
         before = runtime.snapshot()
@@ -393,7 +507,7 @@ def test_runtime_fault(docker, image):
         child = processes(current, "mitmdump")[0]
         runtime.record("before-mitm-fault", current)
         # This is a real owner caller: current-child OnExit -> revision recovery
-        # -> Ensure. The harness never installs or removes quarantine itself.
+        # -> Ensure. This runtime-fault test never installs or removes quarantine itself.
         docker.run("exec", runtime.name, "kill", "-KILL", str(child["pid"]))
         runtime.wait("owner-confirmed packet quarantine", lambda: CONFIRMED in runtime.logs(), timeout=20)
         # Observe three times across the first normal child-retry windows. No
@@ -448,7 +562,8 @@ def main(argv=None):
     success = False
     try:
         run_case(REQUIRED[0], prerequisites)
-        run_case(REQUIRED[1], lambda: test_runtime_fault(docker, image))
+        run_case(REQUIRED[1], lambda: test_image_verifier(docker, image))
+        run_case(REQUIRED[2], lambda: test_runtime_fault(docker, image))
         require([r["name"] for r in results] == REQUIRED and all(r["status"] == "PASS" for r in results),
                 "required runtime image RUN/PASS evidence is incomplete")
         success = True

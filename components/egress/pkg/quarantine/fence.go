@@ -77,7 +77,9 @@ func (f *Fence) Ensure(ctx context.Context) error {
 // hook. Input and forward necessarily follow their earlier prerouting hook.
 const fenceInstallScript = `add table inet opensandbox_quarantine
 delete table inet opensandbox_quarantine
-table inet opensandbox_quarantine {
+` + fenceExpectedTable
+
+const fenceExpectedTable = `table inet opensandbox_quarantine {
     comment "opensandbox quarantine v1"
     chain input {
         type filter hook input priority -450; policy drop;
@@ -118,12 +120,42 @@ func (f *Fence) read(ctx context.Context) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	return inspectFence(out)
+	present, err := inspectFence(out)
+	if err != nil || !present {
+		return false, err
+	}
+	// Older nft omits table comments in JSON and has a buggy single-flag JSON
+	// printer. Require an independent, complete fixed textual snapshot as well.
+	text, err := f.run(ctx, "", "-n", "-y", "list", "table", "inet", fenceTable)
+	if err != nil {
+		return false, fmt.Errorf("read quarantine text state: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if !exactFenceText(text) {
+		return false, errors.New("quarantine text state does not exactly match the required fence")
+	}
+	return true, nil
 }
 
-// inspectFence accepts exactly the owned table, three base chains and three
-// unconditional drop rules. Extra flags (notably dormant/owner), expressions,
-// chains, objects or unknown properties cannot silently weaken this check.
+func exactFenceText(data []byte) bool {
+	normalize := func(text string) string {
+		var lines []string
+		for _, line := range strings.Split(text, "\n") {
+			if line = strings.TrimSpace(line); line != "" {
+				lines = append(lines, line)
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+	return normalize(string(data)) == normalize(fenceExpectedTable)
+}
+
+// inspectFence checks the exact JSON table, three base chains and three drop
+// rules. Old nft omits table comments, so this check alone is not confirmation:
+// read also requires the complete textual table, including its exact owner.
+// Extra flags, expressions, chains, objects or unknown properties are rejected.
 func inspectFence(data []byte) (bool, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
@@ -174,7 +206,8 @@ func inspectFence(data []byte) (bool, error) {
 			switch kind {
 			case "table":
 				tables++
-				if !onlyKeys(object, "family", "name", "handle", "comment", "flags") || object["comment"] != fenceOwner || !emptyFlags(object) {
+				comment, hasComment := object["comment"]
+				if !onlyKeys(object, "family", "name", "handle", "comment", "flags") || (hasComment && comment != fenceOwner) || !emptyFlags(object) {
 					return false, errors.New("quarantine table ownership or flags do not match")
 				}
 			case "chain":

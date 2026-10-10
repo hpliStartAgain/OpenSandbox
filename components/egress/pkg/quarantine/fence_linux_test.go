@@ -118,12 +118,34 @@ func TestQuarantineFenceKernelFaults(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, present)
 	})
+	t.Run("text-readback-failure", func(t *testing.T) {
+		f := &Fence{run: func(ctx context.Context, script string, args ...string) ([]byte, error) {
+			if len(args) > 0 && args[0] == "-n" {
+				return nil, injected
+			}
+			return runFenceNft(ctx, script, args...)
+		}}
+		require.ErrorIs(t, f.Ensure(ctx), injected)
+		present, err := NewFence().read(ctx)
+		require.NoError(t, err)
+		require.True(t, present)
+	})
 	require.NoError(t, NewFence().Ensure(ctx))
 	_, err := runFenceNft(ctx, "add table inet opensandbox_quarantine { flags dormant; }\n", "-f", "-")
 	require.NoError(t, err)
 	_, err = NewFence().read(ctx)
 	require.Error(t, err, "a disabled table must never be accepted")
 	require.NoError(t, NewFence().Ensure(ctx), "must replace a disabled table")
+	// Existing-table updates may ignore userdata, so replace it atomically.
+	foreignTable := strings.Replace(fenceExpectedTable, fenceOwner, "foreign", 1)
+	_, err = runFenceNft(ctx, "delete table inet opensandbox_quarantine\n"+foreignTable, "-f", "-")
+	require.NoError(t, err)
+	raw, err := runFenceNft(ctx, "", "-n", "-y", "list", "table", "inet", fenceTable)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `comment "foreign"`, "the negative fixture must really change the kernel owner")
+	_, err = NewFence().read(ctx)
+	require.Error(t, err, "foreign ownership must fail even when old JSON omits table comments")
+	require.NoError(t, NewFence().Ensure(ctx))
 	cleanupKernelFence(t, ctx)
 }
 

@@ -32,11 +32,11 @@ def fence():
 
 class FenceReadbackTests(unittest.TestCase):
     def test_exact_fence_and_positive_absence(self):
-        self.assertTrue(runner.fence_present(fence()))
+        self.assertTrue(runner.fence_present(fence(), runner.FENCE_TEXT))
         self.assertFalse(runner.fence_present({"nftables": [{"metainfo": {}}]}))
         unrelated = fence()
         unrelated["nftables"].append({"table": {"family": "inet", "name": "opensandbox"}})
-        self.assertTrue(runner.fence_present(unrelated))
+        self.assertTrue(runner.fence_present(unrelated, runner.FENCE_TEXT))
 
     def test_partial_fence_is_not_absence(self):
         for index in range(1, 8):
@@ -44,7 +44,33 @@ class FenceReadbackTests(unittest.TestCase):
                 value = fence()
                 del value["nftables"][index]
                 with self.assertRaises(runner.Failure):
-                    runner.fence_present(value)
+                    runner.fence_present(value, runner.FENCE_TEXT)
+
+    def test_old_json_missing_comment_requires_complete_text_owner_evidence(self):
+        old = fence()
+        del old["nftables"][1]["table"]["comment"]
+        self.assertTrue(runner.fence_present(old, runner.FENCE_TEXT))
+        for bad in (None, "", "table inet opensandbox_quarantine {}"):
+            with self.subTest(text=bad), self.assertRaises(runner.Failure):
+                runner.fence_present(old, bad)
+        for bad in (None, "wrong owner"):
+            old["nftables"][1]["table"]["comment"] = bad
+            with self.subTest(comment=bad), self.assertRaises(runner.Failure):
+                runner.fence_present(old, runner.FENCE_TEXT)
+
+    def test_full_text_flags_or_wrong_structure_cannot_be_masked_by_valid_json(self):
+        padded = "\n" + "\n\n".join("  " + line + "\t" for line in runner.FENCE_TEXT.splitlines()) + "\n"
+        self.assertTrue(runner.fence_present(fence(), padded))
+        unsafe = [runner.FENCE_TEXT.replace("{\n", "{\nflags dormant;\n", 1),
+                  runner.FENCE_TEXT.replace("{\n", "{\nflags owner;\n", 1),
+                  runner.FENCE_TEXT.replace("opensandbox quarantine v1", "wrong owner"),
+                  runner.FENCE_TEXT.replace("policy drop", "policy accept", 1),
+                  runner.FENCE_TEXT.replace("type filter", "type  filter", 1),
+                  runner.FENCE_TEXT.replace("drop\n", "accept\n", 1),
+                  runner.FENCE_TEXT + "table inet extra {}\n"]
+        for text in unsafe:
+            with self.subTest(text=text), self.assertRaisesRegex(runner.Failure, "fence text"):
+                runner.fence_present(fence(), text)
 
     def test_unsafe_table_chain_rule_and_extra_objects_rejected(self):
         cases = []
@@ -67,12 +93,12 @@ class FenceReadbackTests(unittest.TestCase):
         for data in cases:
             with self.subTest(data=data):
                 with self.assertRaises(runner.Failure):
-                    runner.fence_present(data)
+                    runner.fence_present(data, runner.FENCE_TEXT)
 
 
 class RunnerTests(unittest.TestCase):
     def test_runtime_only_required_cases_and_embedded_scripts(self):
-        self.assertEqual(runner.REQUIRED, ["TestRuntimeImagePrerequisites", "TestRuntimeMitmFaultOwnerContainment"])
+        self.assertEqual(runner.REQUIRED, ["TestRuntimeImagePrerequisites", "TestImageFenceVerifierDormantRejection", "TestRuntimeMitmFaultOwnerContainment"])
         for name in ("SNAPSHOT", "WORKLOAD", "WORKLOAD_CLIENT", "FENCE_OBSERVER"):
             compile(getattr(runner, name), name, "exec")
         source = Path(runner.__file__).read_text()
@@ -208,18 +234,96 @@ class RunnerTests(unittest.TestCase):
                             runtime.start_workload()
 
     def test_observer_must_prove_actual_namespace_before_fence(self):
-        self.assertTrue(runner.validate_observer({"netns": "net:[100]", "ruleset": fence()}, "net:[100]"))
+        self.assertTrue(runner.validate_observer({"netns": "net:[100]", "ruleset": fence(), "table_text": runner.FENCE_TEXT}, "net:[100]"))
         with patch.object(runner, "fence_present") as validate:
             with self.assertRaisesRegex(runner.Failure, "observer ran in wrong namespace"):
                 runner.validate_observer({"netns": "net:[200]", "ruleset": fence()}, "net:[100]")
             validate.assert_not_called()
+
+    def test_observer_always_collects_fixed_numeric_text_for_present_table(self):
+        output = io.StringIO()
+        responses = [subprocess.CompletedProcess([], 0, json.dumps(fence()), ""),
+                     subprocess.CompletedProcess([], 0, runner.FENCE_TEXT, "")]
+        with patch.object(runner.subprocess, "run", side_effect=responses) as run, \
+                patch("os.readlink", return_value="net:[100]"), redirect_stdout(output):
+            exec(runner.FENCE_OBSERVER, {})
+        self.assertEqual(run.call_args.args[0], ["nft", "-n", "-y", "list", "table", "inet", "opensandbox_quarantine"])
+        self.assertTrue(runner.validate_observer(json.loads(output.getvalue()), "net:[100]"))
+        with patch.object(runner.subprocess, "run", side_effect=[responses[0], subprocess.CalledProcessError(1, ["nft"])]), \
+                patch("os.readlink", return_value="net:[100]"), self.assertRaises(subprocess.CalledProcessError):
+            exec(runner.FENCE_OBSERVER, {})
+        output = io.StringIO()
+        with patch.object(runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, '{"nftables":[]}', "")) as run, \
+                patch("os.readlink", return_value="net:[100]"), redirect_stdout(output):
+            exec(runner.FENCE_OBSERVER, {})
+        run.assert_called_once()
+        self.assertFalse(runner.validate_observer(json.loads(output.getvalue()), "net:[100]"))
+
+    def test_disposable_verifier_rejects_dormant_even_when_old_json_omits_flag(self):
+        for json_fails in (False, True):
+            with self.subTest(json_fails=json_fails), tempfile.TemporaryDirectory() as tmp:
+                docker = runner.Docker(Path(tmp))
+                old = fence()
+                del old["nftables"][1]["table"]["comment"]
+                dormant = runner.FENCE_TEXT.replace("{\n", "{\nflags dormant;\n", 1)
+
+                def command(*args, **kwargs):
+                    code, error = 0, ""
+                    if args[0] == "inspect":
+                        output = json.dumps([{"HostConfig": {"Privileged": False, "NetworkMode": "none", "PidMode": "",
+                                              "CapDrop": ["CAP_ALL"], "CapAdd": ["CAP_NET_ADMIN"]}}])
+                    elif args[-1] == runner.FENCE_OBSERVER:
+                        output = json.dumps({"netns": "net:[100]", "ruleset": old, "table_text": runner.FENCE_TEXT})
+                    elif "readlink" in args:
+                        output = "net:[100]\n"
+                    elif args[-5:] == ("nft", "-j", "list", "ruleset", "inet"):
+                        output = json.dumps(old)
+                        if json_fails:
+                            code, output, error = 139, "partial", "old JSON renderer failed"
+                    elif args[-7:] == ("nft", "-n", "-y", "list", "table", "inet", "opensandbox_quarantine"):
+                        output = dormant
+                    else:
+                        output = ""
+                    return subprocess.CompletedProcess(args, code, output, error)
+
+                with patch.object(runner.Docker, "run", side_effect=command) as run, redirect_stdout(io.StringIO()):
+                    runner.test_image_verifier(docker, "ordinary-image")
+                calls = [call.args for call in run.call_args_list]
+                create = calls[0]
+                self.assertEqual(create[0], "create")
+                self.assertEqual(create[create.index("--network") + 1], "none")
+                self.assertEqual(create[create.index("--cap-add") + 1], "NET_ADMIN")
+                self.assertEqual(create[create.index("--cap-drop") + 1], "ALL")
+                self.assertEqual(create[create.index("--entrypoint") + 1], "sleep")
+                self.assertNotIn("--privileged", create)
+                self.assertNotIn("--mount", create)
+                self.assertNotIn(runner.EGRESS, create)
+                self.assertEqual([args for args in calls if args[0] == "rm"], [("rm", "--force", create[2])])
+                evidence = json.loads((Path(tmp) / "verifier/dormant-readback.json").read_text())
+                self.assertEqual(evidence["text"]["stdout"], dormant)
+                self.assertEqual(evidence["json"]["returncode"], 139 if json_fails else 0)
+                self.assertEqual(evidence["json"]["stderr"], "old JSON renderer failed" if json_fails else "")
+
+    def test_disposable_verifier_exception_still_removes_its_container(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            docker = runner.Docker(Path(tmp))
+
+            def command(*args, **kwargs):
+                if args[0] == "inspect":
+                    return subprocess.CompletedProcess(args, 0, '[{"HostConfig":{"Privileged":true}}]', "")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with patch.object(runner.Docker, "run", side_effect=command) as run, self.assertRaisesRegex(runner.Failure, "unsafe verifier"):
+                runner.test_image_verifier(docker, "ordinary-image")
+            calls = [call.args for call in run.call_args_list]
+            self.assertEqual([args for args in calls if args[0] == "rm"], [("rm", "--force", calls[0][2])])
 
     def test_observer_is_read_only_and_has_no_private_mounts(self):
         with tempfile.TemporaryDirectory() as tmp:
             docker = runner.Docker(Path(tmp))
             runtime = runner.Runtime(docker, "ordinary-image")
             runtime.original = {"netns": "net:[100]"}
-            observed = {"netns": "net:[100]", "ruleset": fence()}
+            observed = {"netns": "net:[100]", "ruleset": fence(), "table_text": runner.FENCE_TEXT}
             with patch.object(runtime, "record") as record, patch.object(runtime, "control", return_value={}), \
                     patch.object(docker, "json", return_value=observed) as query:
                 self.assertTrue(runtime.observe("unit")["fenced"])
@@ -262,6 +366,82 @@ class RunnerTests(unittest.TestCase):
                 with self.subTest(key=key), patch.object(docker, "run", return_value=result), \
                         self.assertRaisesRegex(runner.Failure, "original workload process or namespace was replaced"):
                     runtime.control("status")
+
+    def test_exit_captures_raw_namespace_and_nft_before_removing_resources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            docker = runner.Docker(Path(tmp))
+            runtime = runner.Runtime(docker, "ordinary-image")
+            runtime.created = [runtime.name, runtime.workload]
+            runtime.original = {"netns": "net:[100]"}
+            raw = '{"nftables":[{"table":{"family":"inet","name":"opensandbox_quarantine"}}]}\n'
+            text = 'table inet opensandbox_quarantine {\n}\n'
+
+            def command(*args, **kwargs):
+                if args[0] == "exec" and args[2] == "readlink":
+                    output = "net:[100]\n"
+                elif args[-5:] == ("nft", "-j", "list", "ruleset", "inet"):
+                    output = raw
+                elif args[-7:] == ("nft", "-n", "-y", "list", "table", "inet", "opensandbox_quarantine"):
+                    output = text
+                else:
+                    output = "{}\n"
+                return subprocess.CompletedProcess(args, 0, output, "")
+
+            with patch.object(docker, "run", side_effect=command) as run, patch.object(runner, "fence_present") as validate:
+                self.assertIsNone(runtime.__exit__(runner.Failure, runner.Failure("owner timeout"), None))
+                validate.assert_not_called()
+            self.assertEqual((Path(tmp) / "exit-sidecar-netns.txt").read_text(), "net:[100]\n")
+            self.assertEqual((Path(tmp) / "exit-nft-ruleset.json").read_text(), raw)
+            self.assertEqual((Path(tmp) / "exit-nft-quarantine.txt").read_text(), text)
+            commands = [call.args for call in run.call_args_list]
+            first_remove = next(i for i, args in enumerate(commands) if args[0] == "rm")
+            observer = next(i for i, args in enumerate(commands) if args[0] == "run")
+            self.assertLess(observer, first_remove)
+            self.assertEqual(commands[0], ("exec", runtime.name, "readlink", "/proc/self/ns/net"))
+            self.assertTrue(all(commands.index(args) < first_remove for args in commands if args[0] == "exec"))
+            manifest = json.loads((Path(tmp) / "exit-diagnostics.json").read_text())
+            self.assertEqual([row["container"] for row in manifest["cleanup"]], [runtime.workload, runtime.name])
+
+    def test_exit_diagnostic_failures_preserve_original_failure_and_attempt_all_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            docker = runner.Docker(Path(tmp))
+            runtime = runner.Runtime(docker, "ordinary-image")
+            runtime.created = [runtime.name, runtime.workload]
+
+            def command(*args, **kwargs):
+                if args == ("rm", "--force", runtime.name):
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                if args[-5:] == ("nft", "-j", "list", "ruleset", "inet"):
+                    return subprocess.CompletedProcess(args, 1, "", "nft readback unavailable\n")
+                raise runner.Failure("injected diagnostic or cleanup timeout")
+
+            original = runner.Failure("original owner-confirmation timeout")
+            with patch.object(runner.Runtime, "__enter__", return_value=runtime), \
+                    patch.object(docker, "run", side_effect=command) as run, redirect_stderr(io.StringIO()):
+                with self.assertRaises(runner.Failure) as raised:
+                    with runtime:
+                        raise original
+                self.assertIs(raised.exception, original)
+            removals = [call.args for call in run.call_args_list if call.args[0] == "rm"]
+            self.assertEqual(removals, [("rm", "--force", runtime.workload), ("rm", "--force", runtime.name)])
+            manifest = json.loads((Path(tmp) / "exit-diagnostics.json").read_text())
+            self.assertIn("capture-failed", [row["status"] for row in manifest["captures"]])
+            self.assertIn("command-failed", [row["status"] for row in manifest["captures"]])
+            self.assertIn("error", manifest["cleanup"][0])
+            self.assertEqual(manifest["cleanup"][1]["returncode"], 0)
+            self.assertEqual((Path(tmp) / "exit-nft-ruleset.json.stderr").read_text(), "nft readback unavailable\n")
+
+    def test_exit_artifact_write_failure_cannot_prevent_cleanup_or_hide_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            docker = runner.Docker(Path(tmp))
+            runtime = runner.Runtime(docker, "ordinary-image")
+            runtime.created = [runtime.name, runtime.workload]
+            with patch.object(docker, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run, \
+                    patch.object(Path, "write_text", side_effect=OSError("artifact disk unavailable")), \
+                    redirect_stderr(io.StringIO()):
+                self.assertIsNone(runtime.__exit__(runner.Failure, runner.Failure("owner timeout"), None))
+            self.assertEqual([call.args for call in run.call_args_list if call.args[0] == "rm"],
+                             [("rm", "--force", runtime.workload), ("rm", "--force", runtime.name)])
 
 
 if __name__ == "__main__":
