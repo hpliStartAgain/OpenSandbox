@@ -1,0 +1,69 @@
+{
+  "status": "P0_STOP",
+  "baseline_commit": "98fc6ce404d683e80b86f86e5c817b36658dcde1",
+  "baseline_tree": "907b2b068f4189ae8c727a5be5dbfad45b596855",
+  "approved_design_sha256": "67d37962c19c0ff96c388dad96c9d53ff0665cf9584abddfe775ec9126ced383",
+  "production_modified": false,
+  "files": {
+    "PROCESS_STOP_ASSESSMENT.md": {
+      "sha256": "734b65270c7a6ed1b0a798d0bd1a487f426ee0f5f9d8467bc0a148a2798be6ed",
+      "bytes": 6285
+    },
+    "README.md": {
+      "sha256": "7b4593b8d6903dc2b9f3e8d019b57dbe0c84e3f9c1f51d2fd85f478d25153a79",
+      "bytes": 6685
+    },
+    "admission/README.md": {
+      "sha256": "8a6f86bf2f2c1cbc845ee34f30f6a52205d34020f2b60c128091555b2083badf",
+      "bytes": 3067
+    },
+    "admission/baseline-publication.log": {
+      "sha256": "079652e25ca5893a1b7312eac963ffbe78a936ad8a0395d18293f3aa81f3f37c",
+      "bytes": 3945
+    },
+    "admission/baseline-registry.log": {
+      "sha256": "03457d12d2baa94e65fcb204d2a194548a86a0cc329d76261eb22d84718a0ea1",
+      "bytes": 11812
+    },
+    "admission/test.log": {
+      "sha256": "02d230f8a178efe3b042dc9140342db34895f9d43a41139f64a2e30c920801b8",
+      "bytes": 2524
+    },
+    "admission/test_admission_seams.py": {
+      "sha256": "c7f35bbce2369f02c1c160487f7119627372a67adf06f0d393f2560c5c854493",
+      "bytes": 14457
+    },
+    "upstream/README.md": {
+      "sha256": "5cdbb1e55c6fc243196020dc7e299d6760c6abf26a82b322599c929ad45b42b4",
+      "bytes": 9316
+    },
+    "upstream/SHA256SUMS": {
+      "sha256": "87675733a655885bb3aba4e623e344052a8bb04daeb9709cef04d7f15d63c901",
+      "bytes": 603
+    },
+    "upstream/pending-task-test-output.txt": {
+      "sha256": "9af620536f50224e00638a464a1011ae3a1a0ac2f3a45ab81300aca082ff0a40",
+      "bytes": 396
+    },
+    "upstream/pending_task_results.json": {
+      "sha256": "64a6cc91d9b0947aab0e65b0ee665a6ba431b1116552d6413fbd0a27b3fe3fcf",
+      "bytes": 1717
+    },
+    "upstream/proof_pending_tasks.py": {
+      "sha256": "f6c5294ef1fe33573298d8f9e0735fef213feae8cba53dd85a5aef8c19a3b7ca",
+      "bytes": 16015
+    },
+    "upstream/proof_results.json": {
+      "sha256": "a84164f31ae9b147e8c0c8a2e5a697a39e80250a7d9083ae3aa371836d0a8180",
+      "bytes": 17829
+    },
+    "upstream/proof_upstream.py": {
+      "sha256": "ff052cfa21091671b460f6ef84d983f194b2477ca379f3c00c64389fd0fb074c",
+      "bytes": 25658
+    },
+    "upstream/test-output.txt": {
+      "sha256": "14462e2e4f2827b1ac3c03bb38668584555f335d97d90e0143bb07f9ea1bb89c",
+      "bytes": 2039
+    }
+  }
+}

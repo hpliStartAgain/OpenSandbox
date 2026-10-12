@@ -1,0 +1,22 @@
+test_400_check_invalid_cannot_be_relabelled_refused (__main__.AdmissionSeams.test_400_check_invalid_cannot_be_relabelled_refused) ... ok
+test_413_early_body_limit_cannot_be_relabelled_refused (__main__.AdmissionSeams.test_413_early_body_limit_cannot_be_relabelled_refused) ... ok
+test_configured_nextlayer_selector_preserves_installed_instance (__main__.AdmissionSeams.test_configured_nextlayer_selector_preserves_installed_instance) ... /workspace/scratch/1982e08ae44a/osep0023-venv/lib/python3.12/site-packages/ldap3/utils/asn1.py:50: DeprecationWarning: tagMap is deprecated. Please use TAG_MAP instead.
+  from pyasn1.codec.ber.encoder import tagMap, typeMap, AbstractItemEncoder
+/workspace/scratch/1982e08ae44a/osep0023-venv/lib/python3.12/site-packages/ldap3/utils/asn1.py:50: DeprecationWarning: typeMap is deprecated. Please use TYPE_MAP instead.
+  from pyasn1.codec.ber.encoder import tagMap, typeMap, AbstractItemEncoder
+/workspace/scratch/1982e08ae44a/osep0023-venv/lib/python3.12/site-packages/passlib/utils/__init__.py:854: DeprecationWarning: 'crypt' is deprecated and slated for removal in Python 3.13
+  from crypt import crypt as _crypt
+ok
+test_instance_slot_and_raw_identity_before_transparent_rewrite (__main__.AdmissionSeams.test_instance_slot_and_raw_identity_before_transparent_rewrite) ... ok
+test_normal_kill_is_exact_refused_no_origin_and_three_table_cleanup (__main__.AdmissionSeams.test_normal_kill_is_exact_refused_no_origin_and_three_table_cleanup) ... ok
+test_parse_error_before_hook_retains_no_identity (__main__.AdmissionSeams.test_parse_error_before_hook_retains_no_identity) ... ok
+test_parse_error_stops_following_valid_stream_in_same_batch (__main__.AdmissionSeams.test_parse_error_stops_following_valid_stream_in_same_batch) ... ok
+test_paused_hook_keeps_identity_and_no_admission_until_consumed (__main__.AdmissionSeams.test_paused_hook_keeps_identity_and_no_admission_until_consumed) ... ok
+test_reset_while_requestheaders_paused_clears_identity_and_late_hook_fails_closed (__main__.AdmissionSeams.test_reset_while_requestheaders_paused_clears_identity_and_late_hook_fails_closed) ... ok
+test_same_batch_data_and_peer_rst_credit_and_cleanup (__main__.AdmissionSeams.test_same_batch_data_and_peer_rst_credit_and_cleanup) ... ok
+test_disconnect_releases_pending_identity_even_with_hook_paused (__main__.DisconnectSeam.test_disconnect_releases_pending_identity_even_with_hook_paused) ... ok
+
+----------------------------------------------------------------------
+Ran 11 tests in 0.246s
+
+OK

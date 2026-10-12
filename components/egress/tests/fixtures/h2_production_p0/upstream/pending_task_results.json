@@ -1,0 +1,68 @@
+[
+  {
+    "case": "before_start",
+    "task_observer": {
+      "same_task": true,
+      "done": true,
+      "cancelled": true,
+      "writer_absent": true
+    },
+    "hooks": [
+      "requestheaders"
+    ],
+    "pending_layer_commands_remain": true,
+    "upstream_connection_closed": true,
+    "server_event_and_close_connection_unmodified": true,
+    "socket_attempts": 0
+  },
+  {
+    "case": "server_connect_hook",
+    "task_observer": {
+      "same_task": true,
+      "done": true,
+      "cancelled": true,
+      "writer_absent": true
+    },
+    "hooks": [
+      "requestheaders",
+      "server_connect"
+    ],
+    "pending_layer_commands_remain": true,
+    "upstream_connection_closed": true,
+    "server_event_and_close_connection_unmodified": true,
+    "socket_attempts": 0
+  },
+  {
+    "case": "semaphore",
+    "task_observer": {
+      "same_task": true,
+      "done": true,
+      "cancelled": true,
+      "writer_absent": true
+    },
+    "hooks": [
+      "requestheaders",
+      "server_connect"
+    ],
+    "pending_layer_commands_remain": true,
+    "upstream_connection_closed": true,
+    "server_event_and_close_connection_unmodified": true,
+    "socket_attempts": 0
+  },
+  {
+    "case": "negative_server_connected_wait",
+    "actual_open_connection_and_stream_writer": true,
+    "transport_kind": "synthetic asyncio.Transport; no socket",
+    "task_done": true,
+    "task_cancelled": true,
+    "opening_io_replaced": true,
+    "opening_io_writer_absent": true,
+    "current_io_writer_open": true,
+    "transport_still_registered": true,
+    "server_disconnected_hook": false,
+    "repeated_normal_close_recovers": false,
+    "terminal_predicate": false,
+    "p0_stop": true,
+    "socket_attempts": 0
+  }
+]

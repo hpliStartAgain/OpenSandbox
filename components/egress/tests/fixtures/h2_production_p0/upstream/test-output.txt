@@ -1,0 +1,21 @@
+test_buffered_upload_end_after_response_is_not_finished (__main__.Proof.test_buffered_upload_end_after_response_is_not_finished) ... ok
+test_concurrency_queue_is_client_id_keyed (__main__.Proof.test_concurrency_queue_is_client_id_keyed) ... ok
+test_connecting_cancellation_requires_open_completion (__main__.Proof.test_connecting_cancellation_requires_open_completion) ... ok
+test_connecting_flow_pointer_is_not_pending_connection (__main__.Proof.test_connecting_flow_pointer_is_not_pending_connection) ... ok
+test_dependency_versions (__main__.Proof.test_dependency_versions) ... ok
+test_early_response_not_upload_completion (__main__.Proof.test_early_response_not_upload_completion) ... ok
+test_early_response_reset_orphan_and_both_close_orders (__main__.Proof.test_early_response_reset_orphan_and_both_close_orders) ... ok
+test_id_reorder_uses_owned_child_mapping (__main__.Proof.test_id_reorder_uses_owned_child_mapping) ... ok
+test_no_buffer_orphan_still_needs_upstream_close (__main__.Proof.test_no_buffer_orphan_still_needs_upstream_close) ... ok
+test_outer_handle_event_and_wakeup_survive_close (__main__.Proof.test_outer_handle_event_and_wakeup_survive_close) ... ok
+test_queue_progresses_through_dependency_not_adapter (__main__.Proof.test_queue_progresses_through_dependency_not_adapter) ... ok
+test_reconnecting_pending_match_precedes_stale_flow_pointer (__main__.Proof.test_reconnecting_pending_match_precedes_stale_flow_pointer) ... ok
+test_reset_before_response_is_propagated (__main__.Proof.test_reset_before_response_is_propagated) ... ok
+test_response_headers_then_reset_still_propagates (__main__.Proof.test_response_headers_then_reset_still_propagates) ... ok
+test_response_hook_paused_then_reset_is_queued (__main__.Proof.test_response_hook_paused_then_reset_is_queued) ... ok
+test_upload_trailers_are_obligations_until_window_progress (__main__.Proof.test_upload_trailers_are_obligations_until_window_progress) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 0.038s
+
+OK

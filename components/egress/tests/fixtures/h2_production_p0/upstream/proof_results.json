@@ -1,0 +1,759 @@
+[
+  {
+    "case": "response_done_upload_end_buffered",
+    "before": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": false,
+      "upstream_streams": [
+        1
+      ],
+      "queue": {},
+      "upload_buffers": {
+        "1": 21
+      },
+      "upload_trailers": [],
+      "h2_state": "HALF_CLOSED_REMOTE"
+    },
+    "after": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": false,
+      "upstream_streams": [
+        1
+      ],
+      "queue": {},
+      "upload_buffers": {},
+      "upload_trailers": [],
+      "h2_state": "CLOSED"
+    }
+  },
+  {
+    "case": "concurrency_queue",
+    "state": {
+      "client_id": 3,
+      "kind": "queued",
+      "upstream_id": null,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": true,
+      "client_state": "state_stream_request_body",
+      "server_state": "state_wait_for_response_headers",
+      "upstream_layer_done": false,
+      "upstream_streams": [
+        1
+      ],
+      "queue": {
+        "3": [
+          "RequestHeaders",
+          "RequestData"
+        ]
+      },
+      "upload_buffers": {},
+      "upload_trailers": [],
+      "h2_state": null
+    }
+  },
+  {
+    "case": "connecting_cancel",
+    "synthetic_upstream_callback": false,
+    "waiting_count": 0,
+    "root_stream_count": 0,
+    "pending_command_count": 0,
+    "owner_tunnel_state": "CLOSED",
+    "upstream_bytes_sent": 0
+  },
+  {
+    "case": "connecting_cancel",
+    "synthetic_upstream_callback": true,
+    "waiting_count": 0,
+    "root_stream_count": 0,
+    "pending_command_count": 0,
+    "owner_tunnel_state": "CLOSED",
+    "upstream_bytes_sent": 0
+  },
+  {
+    "case": "connecting",
+    "states": [
+      {
+        "client_id": 1,
+        "kind": "connecting",
+        "upstream_id": null,
+        "flow_points_at_owned_connection": false,
+        "chain": [
+          "ServerTLSLayer",
+          "HttpClient"
+        ],
+        "root_stream_present": true,
+        "client_state": "state_wait_for_request_headers",
+        "server_state": "state_uninitialized",
+        "upstream_layer_done": null,
+        "upstream_streams": null,
+        "queue": null,
+        "upload_buffers": null,
+        "upload_trailers": null,
+        "h2_state": null
+      },
+      {
+        "client_id": 3,
+        "kind": "connecting",
+        "upstream_id": null,
+        "flow_points_at_owned_connection": false,
+        "chain": [
+          "ServerTLSLayer",
+          "HttpClient"
+        ],
+        "root_stream_present": true,
+        "client_state": "state_wait_for_request_headers",
+        "server_state": "state_uninitialized",
+        "upstream_layer_done": null,
+        "upstream_streams": null,
+        "queue": null,
+        "upload_buffers": null,
+        "upload_trailers": null,
+        "h2_state": null
+      }
+    ],
+    "warning": "flow.server_conn is the old context server until GetHttpConnectionCompleted"
+  },
+  {
+    "case": "versions",
+    "actual": {
+      "mitmproxy": "11.0.2",
+      "h2": "4.1.0",
+      "hyperframe": "6.0.1"
+    }
+  },
+  {
+    "case": "early_response_pending_upload",
+    "state": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": true,
+      "client_state": "state_stream_request_body",
+      "server_state": "state_done",
+      "upstream_layer_done": false,
+      "upstream_streams": [
+        1
+      ],
+      "queue": {},
+      "upload_buffers": {
+        "1": 16
+      },
+      "upload_trailers": [],
+      "h2_state": "HALF_CLOSED_REMOTE"
+    }
+  },
+  {
+    "case": "orphan_close",
+    "upstream_first": false,
+    "before": [
+      {
+        "client_id": 1,
+        "kind": "mapped",
+        "upstream_id": 1,
+        "flow_points_at_owned_connection": true,
+        "chain": [
+          "HttpClient",
+          "Http2Client"
+        ],
+        "root_stream_present": false,
+        "client_state": null,
+        "server_state": null,
+        "upstream_layer_done": false,
+        "upstream_streams": [
+          1
+        ],
+        "queue": {
+          "3": [
+            "RequestHeaders",
+            "RequestData"
+          ]
+        },
+        "upload_buffers": {
+          "1": 13
+        },
+        "upload_trailers": [],
+        "h2_state": "HALF_CLOSED_REMOTE"
+      },
+      {
+        "client_id": 3,
+        "kind": "queued",
+        "upstream_id": null,
+        "flow_points_at_owned_connection": true,
+        "chain": [
+          "HttpClient",
+          "Http2Client"
+        ],
+        "root_stream_present": true,
+        "client_state": "state_stream_request_body",
+        "server_state": "state_wait_for_response_headers",
+        "upstream_layer_done": false,
+        "upstream_streams": [
+          1
+        ],
+        "queue": {
+          "3": [
+            "RequestHeaders",
+            "RequestData"
+          ]
+        },
+        "upload_buffers": {
+          "1": 13
+        },
+        "upload_trailers": [],
+        "h2_state": null
+      }
+    ],
+    "after_first": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": false,
+      "upstream_streams": [
+        1
+      ],
+      "queue": {
+        "3": [
+          "RequestHeaders",
+          "RequestData",
+          "RequestProtocolError"
+        ]
+      },
+      "upload_buffers": {
+        "1": 13
+      },
+      "upload_trailers": [],
+      "h2_state": "HALF_CLOSED_REMOTE"
+    },
+    "after": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": true,
+      "upstream_streams": [],
+      "queue": {
+        "3": [
+          "RequestHeaders",
+          "RequestData",
+          "RequestProtocolError"
+        ]
+      },
+      "upload_buffers": {
+        "1": 13
+      },
+      "upload_trailers": [],
+      "h2_state": "HALF_CLOSED_REMOTE"
+    },
+    "sibling_after": {
+      "client_id": 3,
+      "kind": "queued",
+      "upstream_id": null,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": true,
+      "upstream_streams": [],
+      "queue": {
+        "3": [
+          "RequestHeaders",
+          "RequestData",
+          "RequestProtocolError"
+        ]
+      },
+      "upload_buffers": {
+        "1": 13
+      },
+      "upload_trailers": [],
+      "h2_state": null
+    }
+  },
+  {
+    "case": "orphan_close",
+    "upstream_first": true,
+    "before": [
+      {
+        "client_id": 1,
+        "kind": "mapped",
+        "upstream_id": 1,
+        "flow_points_at_owned_connection": true,
+        "chain": [
+          "HttpClient",
+          "Http2Client"
+        ],
+        "root_stream_present": false,
+        "client_state": null,
+        "server_state": null,
+        "upstream_layer_done": false,
+        "upstream_streams": [
+          1
+        ],
+        "queue": {
+          "3": [
+            "RequestHeaders",
+            "RequestData"
+          ]
+        },
+        "upload_buffers": {
+          "1": 13
+        },
+        "upload_trailers": [],
+        "h2_state": "HALF_CLOSED_REMOTE"
+      },
+      {
+        "client_id": 3,
+        "kind": "queued",
+        "upstream_id": null,
+        "flow_points_at_owned_connection": true,
+        "chain": [
+          "HttpClient",
+          "Http2Client"
+        ],
+        "root_stream_present": true,
+        "client_state": "state_stream_request_body",
+        "server_state": "state_wait_for_response_headers",
+        "upstream_layer_done": false,
+        "upstream_streams": [
+          1
+        ],
+        "queue": {
+          "3": [
+            "RequestHeaders",
+            "RequestData"
+          ]
+        },
+        "upload_buffers": {
+          "1": 13
+        },
+        "upload_trailers": [],
+        "h2_state": null
+      }
+    ],
+    "after_first": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": true,
+      "upstream_streams": [],
+      "queue": {
+        "3": [
+          "RequestHeaders",
+          "RequestData"
+        ]
+      },
+      "upload_buffers": {
+        "1": 13
+      },
+      "upload_trailers": [],
+      "h2_state": "HALF_CLOSED_REMOTE"
+    },
+    "after": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": true,
+      "upstream_streams": [],
+      "queue": {
+        "3": [
+          "RequestHeaders",
+          "RequestData"
+        ]
+      },
+      "upload_buffers": {
+        "1": 13
+      },
+      "upload_trailers": [],
+      "h2_state": "HALF_CLOSED_REMOTE"
+    },
+    "sibling_after": {
+      "client_id": 3,
+      "kind": "queued",
+      "upstream_id": null,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": true,
+      "upstream_streams": [],
+      "queue": {
+        "3": [
+          "RequestHeaders",
+          "RequestData"
+        ]
+      },
+      "upload_buffers": {
+        "1": 13
+      },
+      "upload_trailers": [],
+      "h2_state": null
+    }
+  },
+  {
+    "case": "reorder",
+    "states": [
+      {
+        "client_id": 1,
+        "kind": "mapped",
+        "upstream_id": 3,
+        "flow_points_at_owned_connection": true,
+        "chain": [
+          "HttpClient",
+          "Http2Client"
+        ],
+        "root_stream_present": true,
+        "client_state": "state_stream_request_body",
+        "server_state": "state_wait_for_response_headers",
+        "upstream_layer_done": false,
+        "upstream_streams": [
+          1,
+          3
+        ],
+        "queue": {},
+        "upload_buffers": {},
+        "upload_trailers": [],
+        "h2_state": "OPEN"
+      },
+      {
+        "client_id": 3,
+        "kind": "mapped",
+        "upstream_id": 1,
+        "flow_points_at_owned_connection": true,
+        "chain": [
+          "HttpClient",
+          "Http2Client"
+        ],
+        "root_stream_present": true,
+        "client_state": "state_stream_request_body",
+        "server_state": "state_wait_for_response_headers",
+        "upstream_layer_done": false,
+        "upstream_streams": [
+          1,
+          3
+        ],
+        "queue": {},
+        "upload_buffers": {},
+        "upload_trailers": [],
+        "h2_state": "OPEN"
+      }
+    ]
+  },
+  {
+    "case": "orphan_without_buffer",
+    "before": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": false,
+      "upstream_streams": [
+        1
+      ],
+      "queue": {},
+      "upload_buffers": {},
+      "upload_trailers": [],
+      "h2_state": "HALF_CLOSED_REMOTE"
+    },
+    "after": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": true,
+      "upstream_streams": [],
+      "queue": {},
+      "upload_buffers": {},
+      "upload_trailers": [],
+      "h2_state": "HALF_CLOSED_REMOTE"
+    }
+  },
+  {
+    "case": "adapter_outer_handle_event_wakeup",
+    "emitted_targets": [
+      "client",
+      "verified owned upstream"
+    ],
+    "observer_saw_upstream_callback": false,
+    "observer_saw_wakeup_after_client_done": true,
+    "upstream_done_at_wakeup": true
+  },
+  {
+    "case": "normal_queue_progress",
+    "before": {
+      "client_id": 3,
+      "kind": "queued",
+      "upstream_id": null,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": true,
+      "client_state": "state_done",
+      "server_state": "state_wait_for_response_headers",
+      "upstream_layer_done": false,
+      "upstream_streams": [
+        1
+      ],
+      "queue": {
+        "3": [
+          "RequestHeaders",
+          "RequestData",
+          "RequestEndOfMessage"
+        ]
+      },
+      "upload_buffers": {},
+      "upload_trailers": [],
+      "h2_state": null
+    },
+    "after": {
+      "client_id": 3,
+      "kind": "mapped",
+      "upstream_id": 3,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": true,
+      "client_state": "state_done",
+      "server_state": "state_wait_for_response_headers",
+      "upstream_layer_done": false,
+      "upstream_streams": [
+        3
+      ],
+      "queue": {},
+      "upload_buffers": {},
+      "upload_trailers": [],
+      "h2_state": "HALF_CLOSED_LOCAL"
+    }
+  },
+  {
+    "case": "replacement_connection_stale_flow_pointer",
+    "state": {
+      "client_id": 3,
+      "kind": "connecting",
+      "upstream_id": null,
+      "flow_points_at_owned_connection": false,
+      "chain": [
+        "ServerTLSLayer",
+        "HttpClient"
+      ],
+      "root_stream_present": true,
+      "client_state": "state_wait_for_request_headers",
+      "server_state": "state_uninitialized",
+      "upstream_layer_done": null,
+      "upstream_streams": null,
+      "queue": null,
+      "upload_buffers": null,
+      "upload_trailers": null,
+      "h2_state": null
+    },
+    "pending_exact_command_identity_takes_precedence": true
+  },
+  {
+    "case": "reset_before_response",
+    "state": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": false,
+      "upstream_streams": [
+        1
+      ],
+      "queue": {},
+      "upload_buffers": {},
+      "upload_trailers": [],
+      "h2_state": "CLOSED"
+    }
+  },
+  {
+    "case": "response_headers_then_reset",
+    "state": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": false,
+      "upstream_streams": [
+        1
+      ],
+      "queue": {},
+      "upload_buffers": {},
+      "upload_trailers": [],
+      "h2_state": "CLOSED"
+    }
+  },
+  {
+    "case": "response_hook_reset_order",
+    "state": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": false,
+      "upstream_streams": [
+        1
+      ],
+      "queue": {},
+      "upload_buffers": {
+        "1": 14
+      },
+      "upload_trailers": [],
+      "h2_state": "HALF_CLOSED_REMOTE"
+    },
+    "paused_queue": []
+  },
+  {
+    "case": "upstream_trailers",
+    "before": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": false,
+      "upstream_streams": [
+        1
+      ],
+      "queue": {},
+      "upload_buffers": {
+        "1": 20
+      },
+      "upload_trailers": [
+        1
+      ],
+      "h2_state": "HALF_CLOSED_REMOTE"
+    },
+    "after": {
+      "client_id": 1,
+      "kind": "mapped",
+      "upstream_id": 1,
+      "flow_points_at_owned_connection": true,
+      "chain": [
+        "HttpClient",
+        "Http2Client"
+      ],
+      "root_stream_present": false,
+      "client_state": null,
+      "server_state": null,
+      "upstream_layer_done": false,
+      "upstream_streams": [
+        1
+      ],
+      "queue": {},
+      "upload_buffers": {},
+      "upload_trailers": [],
+      "h2_state": "CLOSED"
+    }
+  }
+]
