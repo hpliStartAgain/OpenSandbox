@@ -115,7 +115,7 @@ in-process runner actually created.
 
 ## Next validation gate
 
-The smallest useful next experiment is W2 in a permitted Linux executor: a
+The smallest useful next experiment is W2 in a permitted local executor: a
 test-only real mitmdump layer adapter, verified local TLS client and origin,
 actual decoded client frames, withheld flow-control credit, and an assertion
 that final closure truncates neither old payload nor GOAWAY. Check refused
@@ -126,3 +126,51 @@ Publishing a branch/PR or triggering CI requires its own authorization.
 Production wiring, dependency changes, or acceptance of the changed GOAWAY
 timing requires a separately reviewed design. This isolated result grants none
 of those approvals.
+
+
+## Prepared real-TLS W2 fixture
+
+The separate runner below is prepared for a permitted local environment. It has
+not been executed in the restricted cloud workspace. Its pure adapter and
+report-validation tests are not real-wire evidence.
+
+```sh
+python -m unittest discover -v -s tests -p 'test_h2_delayed_goaway_wire_addon.py'
+python -m unittest discover -v -s scripts -p 'test_h2_delayed_goaway_wire.py'
+python scripts/h2_delayed_goaway_wire.py --artifacts /tmp/h2-w2-evidence-unique
+```
+
+Use the same Python environment for all commands, with exact versions
+`mitmproxy==11.0.2`, `h2==4.1.0`, and `hyperframe==6.0.1`. The runner requires
+loopback sockets and subprocesses, uses temporary verified client/origin TLS
+certificates, and never loads the production addon. It does not inherit a TLS
+keylog destination or publish private TLS material in the evidence directory.
+
+The adapter reuses the configured `NextLayer` selector, then populates only the
+unstarted `HttpLayer.connections[client]` slot preserved by its playback seam.
+It adapts that one receiving `Http2Server` instance. All DATA, resets, GOAWAY,
+and connection closure go through the existing protocol APIs and commands.
+No global dependency patch or state restoration is involved.
+
+An ordinary `RequestWakeup` polls a local synthetic fence control file and
+commits through the existing receiver. This is not authenticated revision IPC.
+The real response hook finishes the admission handle while stream output may
+still be buffered. The adapter waits for both stream directions to be closed,
+empty DATA/trailer buffers, and preceding `SendData` commands to be consumed
+before ordinary GOAWAY and close. Command consumption is not TLS flush; the
+client's independent frame decoder and h2 peer decide whether delivery worked.
+
+The single bounded scenario uses an HTTPS/H1 origin, one old H2 stream, refused
+streams 3 and 5 with HPACK insertion/reuse, a 1 KiB client receive window, a
+complete synthetic payload, END_STREAM, GOAWAY(last=1), and EOF. The origin must
+observe exactly the old request. It does not test upstream-H2 ID remapping,
+client-library retry behavior, authenticated IPC races, or the default deadline.
+The test-only drain deadline is 15 seconds; hitting it is a failure, not graceful
+completion.
+
+Exit 0 means only this W2 scenario passed actual client/origin evidence. Exit 1
+means protocol/evidence failure; exit 2 means environment/dependency blocked.
+The report keeps original E1, production readiness, and the other W cases
+unpassed. Save the exact HEAD/tree, source fingerprints, client frames/events,
+origin request log, proxy command metadata, result, and cleanup report together.
+The fixture is not attached to existing product CI.
