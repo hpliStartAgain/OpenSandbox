@@ -11,7 +11,7 @@ import { validateNativeConfig } from './config.js';
 import { NativeOwner } from './owner.js';
 import type { NativeConfig } from './config.js';
 import type { NativeOwnerDependencies, NativeRoute } from './owner.js';
-import { NativeShell, NativeFileSystem, DeniedHostFileSystem, installDeniedFileUploads } from './services.js';
+import { NativeShell, NativeFileSystem, DeniedHostFileSystem, DeniedAttachments, installDeniedFileUploads } from './services.js';
 import { installNativeTools } from './tools.js';
 
 export type { NativeConfig } from './config.js';
@@ -120,6 +120,7 @@ async function mount(ctx: Context, input: NativeConfig, dependencies?: NativeOwn
   // is rollback-covered and awaited before the native loop can release queued model work.
   ctx.on('agent/created', async ({ agent, source }) => { await install(agent, source === 'startup' ? 'startup' : 'resume'); return undefined; });
   await ctx.plugin(DeniedHostFileSystem);
+  await ctx.plugin(DeniedAttachments);
   installDeniedFileUploads(ctx);
   const unregisterPreset = await ctx.agentPresets.register({
     id: 'opensandbox', name: 'OpenSandbox',

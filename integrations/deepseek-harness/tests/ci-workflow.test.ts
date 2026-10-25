@@ -95,6 +95,9 @@ describe('DSH offline CI execution and safety', () => {
       expect(native.match(new RegExp('^\\s+' + command + '$', 'gm')), command).toHaveLength(1);
     }
     expect(text).toContain('integrations/deepseek-harness/native/pnpm-lock.yaml');
+    expect(text).toContain('pnpm exec playwright install --with-deps chromium');
+    expect(text.match(/^\s+pnpm run test:browser$/gm)).toHaveLength(1);
+    expect(text.indexOf('pnpm exec playwright install --with-deps chromium')).toBeLessThan(text.indexOf('pnpm run test:browser'));
   });
   it.each([
     ['success', 'true', 'success', 0], ['success', 'false', 'skipped', 0],

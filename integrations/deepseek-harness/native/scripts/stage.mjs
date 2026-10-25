@@ -9,7 +9,7 @@ export const root = fileURLToPath(new URL('../', import.meta.url));
 export const sharedModules = Object.freeze([
   'binding', 'shell', 'filesystem', 'helper-client', 'sdk-transport', 'errors', 'output', 'types',
 ]);
-export const nativeModules = Object.freeze(['config', 'owner', 'index', 'services', 'tools']);
+export const nativeModules = Object.freeze(['config', 'owner', 'index', 'services', 'tools', 'client']);
 
 /** This disposable tree is the only copy of shared provider sources. Never maintain a fork. */
 export async function stage() {

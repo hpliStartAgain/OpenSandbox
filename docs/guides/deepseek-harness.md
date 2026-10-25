@@ -40,6 +40,13 @@ force flags, consumer overrides, or version exemptions are needed.
 The profile disables unverified local execution, terminals, stock presets,
 subagents, jobs, PTC, skills, workspace previews, file uploads and Open In actions.
 It retains native session/model configuration and history storage on the host.
+The bundle supplies the browser's required `fileUpload` service, but that service
+rejects uploads locally without reading or sending file bytes. The stock upload
+and local attachment-storage plugins remain disabled. File attachments and image
+paste/drop are unsupported; the host rejects non-text prompt attachments too.
+Restored history containing an image cannot read that image through this profile;
+there is no fallback to host attachment storage. Text history and remote tool
+results remain available.
 It is not a sandbox for arbitrary plugins or protection from deliberate edits
 that re-enable host capabilities. Do not add stock or third-party presets.
 Supported tools execute with the configured sandbox credentials/permissions;
@@ -86,6 +93,16 @@ first startup.** Its required-service gates live in the profile, independently
 of the bundle: an absent, disabled or invalid plugin must prevent the required
 native execution/session entry points from starting, not restore local tools.
 Keep the patch when disabling or uninstalling the bundle.
+
+When updating a profile created with an earlier version of this PR, stop DSH,
+update the installed bundle, and update the safety rows from the new example
+while preserving your explicit connection configuration. In particular retain
+`file-upload.disabled: true` and add `attachment-local.disabled: true`. Do not
+re-enable the stock upload plugin to repair a missing browser service: it also
+enables host upload storage. The updated bundle provides the browser service.
+Also copy the `workspace-controller` row, which places the native local workspace
+metadata under the dedicated profile rather than depending on an OS Documents
+directory. Preserve its `ctx.get('profileContext').dir` expression.
 
 This version uses native CLI plugin installation and a profile configuration
 file. It does not ship a custom plugin-page configuration form. The profile
@@ -149,6 +166,11 @@ Open the local Web URL printed by DSH. Configure/select your usual provider and
 model through native settings if it is not already inherited from your DSH home
 configuration. Do not copy another profile's entire patch or tool presets.
 Create a new session with preset `opensandbox`; the profile selects it by default.
+The profile automatically prepares a local metadata workspace under
+`<profile>/workspace-metadata/deepseek-harness/default-workspace`, so a headless
+Linux host does not need `xdg-user-dir` or a desktop Documents folder. This local
+directory identifies native sessions/history; it is not the remote `remoteCwd`,
+does not synchronize files, and does not enable host shell/file tools.
 
 Installing/enabling the plugin, starting DSH, selecting a model and creating a
 session do **not** create a sandbox. The first `bash`, `read`, `write`, or `edit`
@@ -316,8 +338,11 @@ the reported wake timing was a plausible explanation, not a captured HTTP diagno
 ## Validation boundary
 
 Repository CI checks frozen installs, shared backend/helper/consumer regressions,
-native typechecks/build, exact native tarball contents and a clean native
-profile/controller with offline sandbox/model fixtures. Those tests establish
+native typechecks/build, exact native tarball contents, a clean native
+profile/controller, and actual Chromium Web startup/text conversations with
+offline sandbox/model fixtures. The browser test loads the installed client
+plugin graph, creates a session through the UI, sends two text turns, and checks
+upload rejection and unchanged remote binding identity. Those tests establish
 installation and routing contracts, not deployed network isolation or real-model
 quality. Live acceptance must separately use the actual native installed entry,
 your configured model, and the existing OpenSandbox Ingress on ACK fast-sandbox.
@@ -336,11 +361,16 @@ pnpm run build
 pnpm test
 pnpm run pack:check
 pnpm run test:profile
+pnpm exec playwright install --with-deps chromium
+pnpm run test:browser
 ```
 
 `pack:check` validates the artifact allowlist and unchanged shared source/Python
 helper bytes. `test:profile` starts with an ordinary actual native CLI
-installation and exercises the exported entry with offline fixtures. The native bundle intentionally receives framework peers from the DSH host;
+installation and exercises the host entry with offline fixtures; it is not a
+browser test. `test:browser` separately loads the real Web UI from an ordinary
+installed tarball. Browser binaries are a development/CI prerequisite, not part
+of the published bundle. The native bundle intentionally receives framework peers from the DSH host;
 this is not a standalone npm Agent application. No special peer-resolution flags
 or consumer overrides are used. The separate embedded package retains its
 strict standalone npm tarball-consumer check. Registry access is required;

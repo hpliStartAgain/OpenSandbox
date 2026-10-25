@@ -25,6 +25,11 @@
   config:
     default: opensandbox
     selectedDefault: opensandbox
+# Native Web still needs a local workspace identity for session/history metadata.
+# This empty profile-owned directory is not mapped into the remote sandbox.
+- id: workspace-controller
+  config:
+    documentsDirectory: !!js ctx.get('profileContext').dir + '/workspace-metadata'
 - id: hmr
   disabled: true
 - id: client-hmr
@@ -109,7 +114,11 @@
   disabled: true
 - id: file-reference-local
   disabled: true
+# Browser fileUpload is supplied by the native bundle's deny-only client face.
+# Retaining the stock row would also re-enable its host upload storage/routes.
 - id: file-upload
+  disabled: true
+- id: attachment-local
   disabled: true
 - id: open-in-app
   disabled: true

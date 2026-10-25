@@ -18,6 +18,8 @@ pnpm typecheck
 pnpm test
 pnpm pack:check
 pnpm test:profile
+pnpm exec playwright install --with-deps chromium
+pnpm test:browser
 ```
 
 Builds stage a bounded list of existing provider sources, unchanged, in
@@ -28,3 +30,7 @@ SDK 1.1.1 is the only ordinary dependency. No peer overrides are required.
 The profile test installs the actual tarball with the ordinary native CLI into
 fresh temporary profiles. All sandbox/model transport fixtures are offline;
 these checks are not real OpenSandbox/Ingress/model acceptance evidence.
+`test:profile` drives the host Controller; the separate `test:browser` loads the
+actual browser plugin graph and submits text tasks through the Web composer.
+The bundle's deny-only browser upload service preserves that required client
+dependency without enabling stock host upload or local attachment storage.

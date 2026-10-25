@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { runInNewContext } from 'node:vm';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,6 +27,21 @@ export async function pack(destination) {
   const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   assert.deepEqual(manifest.dependencies, {'@alibaba-group/opensandbox': '1.1.1'});
   assert.equal(manifest.dsh.bundle.patch, './cordis.patch.yml');
+  assert.deepEqual(manifest.dsh.client, {platform: 'web', immediately: true});
+  assert.equal(manifest.exports['./client'].default, './dist/client.js');
+  // Exercise the actual browser artifact's loader contract, not a source alias.
+  let clientModule;
+  runInNewContext(await readFile(join(root, 'dist/client.js'), 'utf8'), {
+    window: {__ModuleLoader__: {load(value) { clientModule = value; }}},
+  });
+  assert.equal(clientModule?.id, manifest.name);
+  let upload;
+  const client = clientModule.factory(() => { throw new Error('Unexpected browser dependency'); });
+  client.apply({provide(name, value) { assert.equal(name, 'fileUpload'); upload = value; }});
+  for (const method of ['upload', 'post']) {
+    await assert.rejects(upload[method](new Proxy({}, {get() { throw new Error('Must not read input'); }})),
+      /File uploads are disabled in the OpenSandbox profile\./);
+  }
   assert.equal(manifest.peerDependencies['@deepseek-ai/dsh'], '0.2.1-alpha.1');
   assert.equal(manifest.overrides, undefined);
   assert.equal(manifest.pnpm?.overrides, undefined);

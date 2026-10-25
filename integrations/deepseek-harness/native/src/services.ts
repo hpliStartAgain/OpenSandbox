@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { Context } from '@deepseek-ai/cordis';
+import { AttachmentError, AttachmentStore } from '@deepseek-ai/dsh-attachment';
 import { ShellExecutor } from '@deepseek-ai/dsh-shell';
 import { FileSystem } from '@deepseek-ai/dsh-fs';
 import type { NativeRoute } from './owner.js';
@@ -85,6 +86,29 @@ export class DeniedHostFileSystem extends FileSystem {
   listDir: FileSystem['listDir'] = async () => this.#deny();
   writeText: FileSystem['writeText'] = async () => this.#deny();
   editText: FileSystem['editText'] = async () => this.#deny();
+}
+
+/** Text-only prompt admission: pasted images bypass fileUploads in the native Web client. */
+export class DeniedAttachments extends AttachmentStore {
+  // Native cold-resume projections require positive limits. These inert metadata
+  // values admit no MIME type; the methods below enforce the text-only boundary.
+  readonly imageLimits = Object.freeze({
+    mediaTypes: Object.freeze([]), maxImageBytes: 1, maxImagesPerMessage: 1,
+    maxMessageImageBytes: 1, maxImagePixels: 1, maxImageDimension: 1,
+  });
+  #deny(): never { throw new AttachmentError('File and image attachments are disabled in the OpenSandbox profile.', 'ATTACHMENT_FILES_UNSUPPORTED'); }
+  admitPromptContent: AttachmentStore['admitPromptContent'] = async content => {
+    if (content.some(part => part.type !== 'text')) this.#deny();
+    return content.map(part => {
+      if (part.type !== 'text') return this.#deny();
+      return { type: 'text' as const, text: part.text };
+    });
+  };
+  validateImage: AttachmentStore['validateImage'] = async () => this.#deny();
+  saveImage: AttachmentStore['saveImage'] = async () => this.#deny();
+  saveImages: AttachmentStore['saveImages'] = async () => this.#deny();
+  admitEncodedFile: AttachmentStore['admitEncodedFile'] = async () => this.#deny();
+  readImage: AttachmentStore['readImage'] = async () => this.#deny();
 }
 
 /** Controller plumbing for text-only prompts, with no upload storage or host file transport. */

@@ -4,7 +4,8 @@
 /**
  * Offline composition of the real Web SessionController and native AgentLoop.
  * Only persistence, the configured provider's network adapter, and ancillary
- * attachment/workspace integrations are fixtures. No Agent factory is replaced.
+ * workspace integration are fixtures. No Agent factory is replaced. Attachment
+ * admission is the production native deny-only service, not a test substitute.
  */
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
@@ -279,18 +280,6 @@ export async function createControllerFixture<Config>(
     const originalDefaultModel = root.agentDefaultModel;
     const originalModelSelection = root.agentDefaultModel.currentSelection();
 
-    // Text-only prompts need neither uploaded files nor real attachment storage.
-    root.provide('attachments', {
-      imageLimits: {
-        mediaTypes: [], maxImageBytes: 1, maxImagesPerMessage: 1,
-        maxMessageImageBytes: 1, maxImagePixels: 1, maxImageDimension: 1,
-      },
-      async admitPromptContent(content: readonly { type: string }[]) {
-        assert.ok(content.every(part => part.type === 'text'), 'Fixture admits text-only prompts');
-        return structuredClone(content);
-      },
-      async readImage() { throw new Error('Offline fixture has no attachments'); },
-    } as unknown as Context['attachments']);
     root.provide('workspaceRegistry', {
       archivedSessionIds: [], get: () => undefined, list: () => [],
     });

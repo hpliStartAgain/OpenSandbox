@@ -114,6 +114,15 @@ jobs:
           pnpm run pack:check
           pnpm run test:profile
 
+      - name: Install browser test runtime
+        working-directory: integrations/deepseek-harness/native
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Check actual native Web browser
+        working-directory: integrations/deepseek-harness/native
+        run: |
+          pnpm run test:browser
+
       - name: Verify lockfiles are unchanged
         run: git diff --exit-code -- integrations/deepseek-harness/pnpm-lock.yaml integrations/deepseek-harness/native/pnpm-lock.yaml examples/deepseek-harness/pnpm-lock.yaml
 

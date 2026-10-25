@@ -24,6 +24,7 @@ describe('persistent dedicated Web profile fence', () => {
     expect(row('webserver')?.inject).toContain('webStartup');
     expect(row('agent-preset-registry')?.config).toEqual({default: 'opensandbox', selectedDefault: 'opensandbox'});
     expect(row('session-controller')?.config).toEqual({nativeOpen: false});
+    expect(row('workspace-controller')?.config?.documentsDirectory).toBe("ctx.get('profileContext').dir + '/workspace-metadata'");
     expect(new Set(profile.map(value => value.id)).size).toBe(profile.length);
   });
 
@@ -35,10 +36,18 @@ describe('persistent dedicated Web profile fence', () => {
       'ptc-runtime', 'workflow-ptc', 'tool-workflow', 'tool-ralph', 'skill-filesystem', 'tool-skill',
       'agent-instructions', 'spill-local', 'spill-policy', 'fs-observation-policy',
       'preset-standard', 'preset-ptc', 'preset-minimal', 'preset-cordis',
-      'workspace-files', 'workspace-changes', 'file-reference-local', 'file-upload',
+      'workspace-files', 'workspace-changes', 'file-reference-local', 'file-upload', 'attachment-local',
       'terminal-controller', 'job-controller', 'office-to-pdf', 'directory-picker', 'open-in-app',
       'ui-open-in-app', 'ui-sidebar-documentpreview', 'ui-sidebar-files', 'ui-sidebar-terminal',
     ]) expect(row(id)?.disabled, id).toBe(true);
+  });
+
+  it('publishes a native browser face without re-enabling host upload storage', async () => {
+    const manifest = JSON.parse(await readFile(new URL('package.json', root), 'utf8'));
+    expect(manifest.dsh.client).toEqual({platform: 'web', immediately: true});
+    expect(manifest.exports['./client']).toEqual({types: './dist/client.d.ts', default: './dist/client.js'});
+    expect(row('file-upload')?.disabled).toBe(true);
+    expect(row('attachment-local')?.disabled).toBe(true);
   });
 
   it('retains native session and model settings instead of replacing Agent or model configuration', () => {
