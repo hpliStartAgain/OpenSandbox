@@ -1,6 +1,6 @@
 # OSEP-0027 E2B 兼容：完整实现路线（issue / PR 执行文档）
 
-> 只放在 fork 的 `claude/fervent-dirac-65l11z` 分支上，供 agent 逐个 PR 执行，**不要提交到 upstream**。
+> 执行计划文件，供 agent 逐个 PR 执行。放在计划分支上（upstream 的 `plans/osep-0027-e2b-compat`，fork 的 `claude/fervent-dirac-65l11z`），**不合入 `main`，不要带进任何实现 PR**。
 > 基线：upstream `opensandbox-group/OpenSandbox` 的 `main` = `e564cd18`（2026-11-13，OSEP-0027 经 #2591 合入）。
 > 设计依据：`oseps/0027-optional-e2b-compatibility.md`。本文件只负责拆解和排序，语义以 OSEP 为准；两者不一致时以 OSEP 为准，并在 PR 描述里写明。
 > 本文件里对上游 SDK 的描述来自对 `e2b==2.62.1` wheel 的静态检查，对 envd 0.8.0 的描述来自 OSEP 引用，未实跑；开工时要重新核对。
@@ -42,13 +42,13 @@ OSEP 明确：stub、mock、Docker 上的成功都不能替代 Fast Sandbox 验�
 
 ## 3. 开工前要先定的事（Gate 0）
 
-OSEP 把这些留给了评审。下面是我建议的默认值，**需要你和 maintainer 确认**；没确认之前代码可以在 fork 上推进，但不要往 upstream 提实现 PR。
+OSEP 把这些留给了评审。D2 已由 OSEP 作者决定；其余是建议的默认值，写进 I1 请 maintainer 确认。每个实现 PR 都要链接 I1 并写明 Gate 0 的当前状态；maintainer 对位置或范围提出异议时停下来，不要继续堆 PR。
 
-| # | 待定项 | 建议默认值 | 理由 |
+| # | 待定项 | 取值 | 理由 |
 |---|---|---|---|
-| D1 | 代码放哪 | `components/e2b-compat/`，独立包，独立发布 | R1 要求可选、可单独寻址；不往原生 server 加 E2B 路由 |
-| D2 | 实现语言 | Python（FastAPI + httpx，uv、hatchling、ruff、pytest，与 `server/`、`cli/` 同工具链） | 被测对象是 Python SDK，契约测试可以在同一工具链里直接驱动真实 SDK。备选是 Go（与 `components/ingress` 同类），流式代理更稳，但测试要跨语言 |
-| D3 | 数据面路由是否与适配器同包 | 同包两个可分别部署的 ASGI 应用 | 两者共享 token 派生和原生客户端；OSEP 说这不要求新增一个路由服务 |
+| D1 | 代码放哪 | 建议 `components/e2b-compat/`，独立 Go module，独立发布 | R1 要求可选、可单独寻址；不往原生 server 加 E2B 路由 |
+| D2 | 实现语言 | **Go（已定）** | OSB server 后续有用 Go 重构的排期；与 `components/ingress` 同类，流式反向代理成熟。代价是契约测试跨语言：Go 的服务进程由 Python 测试套件用真实 SDK 驱动 |
+| D3 | 数据面路由是否与适配器同 module | 建议同 module、两个可分别启动的子命令 | 两者共享 token 派生和原生客户端；OSEP 说这不要求新增一个路由服务 |
 | D4 | envd 入口形式 | 先做固定入口：`E2B_SANDBOX_URL` 加 `E2b-Sandbox-Id` / `E2b-Sandbox-Port` 头 | 不需要通配 DNS 和通配证书，最容易在集成环境里落地。SDK 把这个覆盖项标为 deprecated，要在兼容矩阵里写明 |
 | D5 | 可信范围 | 单一管理范围，一把适配器 API key | OSEP 首个实验的设定 |
 | D6 | 超时上限 | 取原生 `server.max_sandbox_timeout_seconds` | OSEP 要求 Gate 0 固定上限，超出即 400，不截断 |
@@ -79,10 +79,18 @@ OSEP 把这些留给了评审。下面是我建议的默认值，**需要你和 
 - PR 描述按 `.github/pull_request_template.md` 四段填写，写明所属 Gate 和"这一步证明了什么、没证明什么"。
 - **单个 PR 不超过 2000 行（含测试和 fixture）**，超了先拆。
 
-**每个 PR 必须本地通过**（包建好之后）
+**Go 约定**：参照 `components/ingress` 的做法——独立 `go.mod`（module 路径沿用现有风格 `github.com/alibaba/opensandbox/e2b-compat`，Go 版本与其他组件一致）、`Makefile`、`build.sh`、`.golangci.yml`、`Dockerfile`、`README.md`、`DEVELOPMENT.md`。日志、版本信息等优先复用 `components/internal`。测试用标准库 `testing` 加 `testify`，HTTP 测试用 `httptest`。尽量只用标准库：`net/http`、`net/http/httputil`、`crypto/hmac`、`crypto/subtle`、`encoding/json`。
+
+**每个 PR 必须本地通过**（module 建好之后）
 
 ```bash
-cd components/e2b-compat && uv sync --all-groups && uv run ruff check && uv run pytest
+cd components/e2b-compat && test -z "$(gofmt -l .)" && go build ./... && go vet ./... && go test ./...
+```
+
+涉及并发的改动再跑一次 `go test -race ./...`。有 Python 契约测试之后（E5 起）再加：
+
+```bash
+cd components/e2b-compat/tests/sdk && uv sync && uv run pytest
 ```
 
 **硬性规则**（都来自 OSEP 的 Requirements，违反即不合格）
@@ -129,8 +137,8 @@ E4 之后控制面和数据面两条线可以并行：E5 与 E6/E7 不改同一�
 OSEP-0027 已合入（#2591），状态 draft。按 OSEP 的 Delivery Gates，实现前需要 Gate 0 的确认。请 maintainer 对下面几项表态，未确认的项我先按"建议"在 fork 上做可行性验证，不向主干提实现 PR。
 
 待确认：
-1. 代码位置：建议 components/e2b-compat/，独立包、独立发布，不向原生 server 添加 E2B 路由。
-2. 实现语言：建议 Python（与 server/、cli/ 同工具链，契约测试可直接驱动被 pin 的 Python SDK）。备选 Go。
+1. 代码位置：建议 components/e2b-compat/，独立 Go module、独立发布，不向原生 server 添加 E2B 路由。
+2. 实现语言：Go（与 components/ingress 同类，也与 server 后续的 Go 重构方向一致）。契约测试用被 pin 的 Python SDK 驱动 Go 服务进程。
 3. 首个版本组合：e2b==2.62.1（Python 同步客户端）、envd 0.8.0、Linux/amd64 Fast Sandbox。
 4. envd 入口：先用固定入口（E2B_SANDBOX_URL + E2b-Sandbox-Id / E2b-Sandbox-Port 头），通配域名方案后置。
 5. 可信范围：单一管理范围、一把适配器 API key。
@@ -140,7 +148,7 @@ OSEP-0027 已合入（#2591），状态 draft。按 OSEP 的 Delivery Gates，�
 9. 评审人和发布归属：谁评审控制面，谁评审模板/数据面。
 
 分期（每个 PR 不超过 2000 行）：
-- 地基：包骨架；token 派生、模板映射、超时规则；原生客户端和假后端
+- 地基：module 骨架；token 派生、模板映射、超时规则；原生客户端和假后端
 - Gate 1a：create/delete 路由；pinned SDK 契约测试；envd 可信初始化；薄路由；真实 envd 开发联调；envd-only 模板；真实后端验证；实验性文档
 - Gate 1b：手动 pause、经 connect 恢复
 - Gate 2/3：info、set-timeout、list、可观测性、框架场景、发布决策
@@ -180,15 +188,15 @@ OSEP-0027 的 Gate 1a 需要一个只跑上游 envd 0.8.0（不带 execd）的�
 
 改动清单：
 
-1. 新目录 `components/e2b-compat/`：`pyproject.toml`（hatchling，`requires-python >=3.10`，依赖 FastAPI、httpx、pydantic；dev 组含 pytest、ruff）、`uv.lock`、`README.md`、`src/opensandbox_e2b_compat/`、`tests/`。许可证头与仓库其他 Python 文件一致。
-2. 配置模型（pydantic，支持文件加环境变量覆盖）：兼容前缀（默认 `/compat/e2b`）、适配器 API key 的引用、原生 API 地址和 key 的引用、HMAC key 的引用和 key 版本、模板映射列表、超时默认值 300 和上下限、对外返回的 `domain`、适配器身份（用于 `clientID`）。机密只通过环境变量或文件路径引用进入，配置对象的 `repr` 和日志不得输出其值。
+1. 新目录 `components/e2b-compat/`：`go.mod`、`main.go`（子命令 `adapter`、`router`，本 PR 里只需能启动并提供健康检查）、`pkg/config/`、`Makefile`、`build.sh`、`.golangci.yml`、`README.md`、`DEVELOPMENT.md`。结构和许可证头照 `components/ingress`。
+2. 配置（文件加环境变量覆盖）：兼容前缀（默认 `/compat/e2b`）、适配器 API key 的引用、原生 API 地址和 key 的引用、HMAC key 的引用和 key 版本、模板映射列表、超时默认值 300 和上下限、对外返回的 `domain`、适配器身份（用于 `clientID`）。机密只通过环境变量或文件路径引用进入；配置结构体的 `String()`、`%+v` 输出和日志不得带出其值（给机密字段一个会打码的类型）。
 3. 配置校验：缺 HMAC key、缺原生地址、映射重复、前缀不以 `/` 开头或为根路径，启动即失败。
-4. ASGI 应用工厂和一个不需要认证的 `/healthz`（挂在兼容前缀之外的管理路径上）。**根级别不注册任何 E2B 路由**。
-5. `.github/workflows/e2b-compat-test.yml`：只在 `components/e2b-compat/**` 变更时触发，跑 `uv sync`、`ruff check`、`pytest`。参照 `server-test.yml` 的写法。
+4. HTTP 服务骨架和一个不需要认证的健康检查（挂在兼容前缀之外的管理路径上）。**根级别不注册任何 E2B 路由**。
+5. `.github/workflows/e2b-compat-test.yml`：只在 `components/e2b-compat/**` 和 `components/internal/**` 变更时触发，跑 gofmt 检查、build、vet、test。照 `ingress-test.yaml` 的写法，Go 版本与其一致。
 6. 如果仓库有许可证头检查（`verify-license.yml`）或路径标签规则（`pr-label-check.yml`、`detect-changes.yml`），把新目录接进去。
 
 - **不做**：任何 E2B 路由；Dockerfile 和 Helm（E11）。
-- **测试**：配置解析和每条校验失败；机密不出现在 `repr` 里；应用能启动且 `/v2/sandboxes`、`/sandboxes` 在根路径下是 404。
+- **测试**：配置解析和每条校验失败；机密不出现在格式化输出里；服务能启动且 `/v2/sandboxes`、`/sandboxes` 在根路径下是 404。
 
 ---
 
@@ -217,10 +225,10 @@ OSEP-0027 的 Gate 1a 需要一个只跑上游 envd 0.8.0（不带 execd）的�
 
 改动清单：
 
-1. 一个 `NativeLifecycle` 接口和基于 httpx 的实现，覆盖：模板模式创建、get、delete、取 endpoint、patch 元数据；pause、resume、renew-expiration、list 先定义签名，实现可以留到用到它们的 PR。认证头 `OPEN-SANDBOX-API-KEY`。
+1. 一个 `NativeLifecycle` 接口和基于 `net/http` 的实现（所有方法带 `context.Context`），覆盖：模板模式创建、get、delete、取 endpoint、patch 元数据；pause、resume、renew-expiration、list 先定义签名，实现可以留到用到它们的 PR。认证头 `OPEN-SANDBOX-API-KEY`。
 2. **结果分类**是这个 PR 的核心：每次调用的结果归为"确定成功"、"确定失败（带原生状态码和错误码）"、"结果不明"（超时、连接在发出请求后断开、5xx 且无法判定是否已执行）。变更类调用不重试；只读调用可以有界重试。
 3. 原生状态到内部枚举的映射，保留 `Pending`、`Running`、`Pausing`、`Paused`、`Resuming`、`Stopping`、`Terminated`、`Failed` 的区别，不在这一层做 E2B 投影。
-4. 假后端：一个进程内可启动的 FastAPI 应用，实现上述原生路由的子集，带可编程的故障注入——丢失响应（已执行但不回包）、延迟、状态迁移时序、指定请求返回指定错误、到期自动终止。它要校验模板模式的原生约束（`timeout >= 60`、拒绝工作负载覆盖），这样适配器的错误映射才有东西可测。
+4. 假后端：一个 Go 包（`internal/fakenative`），既能在 `httptest` 里进程内启动，也能作为独立进程监听端口（E5 的 Python 套件要用）。实现上述原生路由的子集，带可编程的故障注入——丢失响应（已执行但不回包）、延迟、状态迁移时序、指定请求返回指定错误、到期自动终止；独立进程形态下故障注入通过一个仅本机可达的控制接口设置。它要校验模板模式的原生约束（`timeout >= 60`、拒绝工作负载覆盖），这样适配器的错误映射才有东西可测。
 
 - **不做**：E2B 路由。
 - **测试**：每种结果分类至少一条用例，其中"已执行但丢响应"必须验证客户端没有重发；假后端自身的行为测试。
@@ -258,11 +266,12 @@ OSEP-0027 的 Gate 1a 需要一个只跑上游 envd 0.8.0（不带 execd）的�
 
 改动清单：
 
-1. 测试依赖组里锁定 `e2b==2.62.1` 及其传递依赖（写进 `uv.lock`），记录 Python 版本。
-2. 夹具：在本机端口上启动适配器（真实 HTTP，不用 ASGI 直连，因为要测 SDK 的真实传输）、假后端、一个最小的假 envd（只需要让初始化和 SDK 创建后的首次握手通过）。环境变量：`E2B_API_URL` 指向带前缀的适配器地址、`E2B_HTTP_VERSION=1.1`、`E2B_CONNECTION_RETRIES=0`、`E2B_SANDBOX_URL` 指向假 envd。
+1. 新目录 `components/e2b-compat/tests/sdk/`：一个只用于测试的 Python 项目（`pyproject.toml`、`uv.lock`），锁定 `e2b==2.62.1` 及其传递依赖，记录 Python 版本。它不是发布物。
+2. 一个 Go 的开发栈命令（例如 `go run ./cmd/devstack`）：在本机端口上启动适配器、假后端和一个最小的假 envd（只需要让初始化和 SDK 创建后的首次握手通过），把各自的地址和故障注入控制接口打印成一行 JSON。Python 夹具负责构建并启动它、读取地址、测试结束后终止进程。环境变量：`E2B_API_URL` 指向带前缀的适配器地址、`E2B_HTTP_VERSION=1.1`、`E2B_CONNECTION_RETRIES=0`、`E2B_SANDBOX_URL` 指向假 envd。
 3. 用例（T2 的 1a 子集）：不传超时时生效值是 300；超时 0、1、59 被拒绝，60 被接受，超上限被拒绝且不截断；`Sandbox.kill()` 的成功、重复删除、不存在；错误的 API key；被拒绝的选项在 SDK 侧表现为明确异常且消息可读；pause、connect、list、set_timeout、get_info 在 SDK 侧抛出明确的不支持错误。
 4. 原始 JSON `null`、布尔、小数、字符串形式的超时 SDK 发不出来，这几条用原始 HTTP 测。
-5. 把每类请求和响应固化为 golden fixture（去掉 token 和 key），之后每次改适配器都跑。
+5. 把每类请求和响应固化为 golden fixture（去掉 token 和 key），Go 侧的路由测试也读同一份 fixture，这样两种语言的测试钉的是同一个契约。
+6. `e2b-compat-test.yml` 增加一个 job：装 Go 和 uv，跑这套 Python 契约测试。
 
 - **不做**：不 fork、不 monkeypatch SDK。SDK 行为与 OSEP 描述不一致时，记录差异并停下来报告，不要改 SDK 去迁就。
 - **PR 描述必须写明**：这是对假后端的契约证据，不是 Gate 1a 验收。
@@ -281,7 +290,7 @@ OSEP-0027 的 Gate 1a 需要一个只跑上游 envd 0.8.0（不带 execd）的�
 1. 初始化器：经原生 endpoint（URI 加必需的原生头）对该实例的 49983 端口执行私有 `POST /init`，写入派生的 token；随后用该 token 做一次**需要认证**的探测，并读取实际 envd 版本。只有"带 token 的请求成功"才算就绪，端口在听或 `/health` 返回 200 不算。
 2. 版本与模板映射里期望的 envd 版本不一致时判定失败。
 3. 结果分类同 E3：确定成功、确定失败、不明。不明时不重试初始化，交给 E4 的清理路径。
-4. 一个忠实于 pinned 协议的假 envd（供 E5、E7 复用）：首次初始化无需 token；初始化后其余接口要求 `X-Access-Token`；用不同 token 重复初始化被拒；可模拟"重启后丢失认证状态"。
+4. 一个忠实于 pinned 协议的假 envd（Go 包 `internal/fakeenvd`，供 E5 的开发栈和 E7 复用）：首次初始化无需 token；初始化后其余接口要求 `X-Access-Token`；用不同 token 重复初始化被拒；可模拟"重启后丢失认证状态"。
 
 - **不做**：Gate 1b 的恢复路径（恢复时不得重跑首次初始化，留到 E12）。
 - **测试**：正常初始化；token 不匹配；版本不符；初始化丢响应；重启后丢失认证状态时准入保持关闭；两个实例从同一模板分配，token 互不相同且互不可用。
@@ -295,9 +304,9 @@ OSEP-0027 的 Gate 1a 需要一个只跑上游 envd 0.8.0（不带 execd）的�
 
 改动清单：
 
-1. 独立的 ASGI 应用，可与适配器分开部署。固定入口形式：从 `E2b-Sandbox-Id` 和 `E2b-Sandbox-Port` 头取目标。主机名形式（`<port>-<id>.<domain>`）的解析一并实现，两种形式同时出现且不一致时拒绝。
+1. `router` 子命令，可与适配器分开部署，基于 `net/http/httputil.ReverseProxy`。固定入口形式：从 `E2b-Sandbox-Id` 和 `E2b-Sandbox-Port` 头取目标。主机名形式（`<port>-<id>.<domain>`）的解析一并实现，两种形式同时出现且不一致时拒绝。
 2. 准入检查，全部通过才转发，顺序不能变：端口必须是 49983 → ID 对应的原生对象存在、是本适配器创建的、状态为运行且已通过初始化 → `X-Access-Token` 等于对该 ID 重新派生的值（常数时间）→ 这时才去取原生 endpoint。
-3. 转发：保留方法、路径、查询串、请求体和响应体，流式透传，不缓冲整个 body，不重试。剥掉客户端带来的原生路由头（`OpenSandbox-Ingress-To` 等），再加上原生 endpoint 要求的头。上游地址只能来自原生 endpoint 的解析结果，任何客户端输入都不能影响它。
+3. 转发：保留方法、路径、查询串、请求体和响应体，流式透传（`FlushInterval` 设为立即刷新，不缓冲整个 body），不重试，传输层关闭自动重试和连接级重放。剥掉客户端带来的原生路由头（`OpenSandbox-Ingress-To` 等），再加上原生 endpoint 要求的头。上游地址只能来自原生 endpoint 的解析结果，任何客户端输入都不能影响它。
 4. 管理类路径（`/init`、`/upgrade` 等，以 pinned envd 的路由表为准）经客户端入口一律拒绝。
 5. 原生 endpoint 和状态可以短时缓存，但删除、准入关闭要立即使缓存失效。缓存过期、后端不可用、状态不明时拒绝，不放行。
 6. 不做 RPC 级别的功能白名单。OSEP 明确：未测试的 envd 方法不等于被禁用，不要对外宣称它们被移除了。
@@ -316,8 +325,8 @@ OSEP-0027 的 Gate 1a 需要一个只跑上游 envd 0.8.0（不带 execd）的�
 改动清单：
 
 1. 一个脚本按 pin 取 envd 0.8.0 的 Linux/amd64 二进制，校验 SHA-256（校验和写死在仓库里），失败即退出。二进制本身不进仓库。
-2. 夹具：本机启动 envd（按 pinned 版本支持的参数，OSEP 提到 `-isnotfc`、`-no-cgroups`，以实际帮助输出为准），假后端把 49983 的 endpoint 指向它。
-3. 用例：`Sandbox.create()` → 前台命令的 stdout、stderr、非零退出码、命令超时 → 文本和二进制文件写入读取、覆盖、读不存在的路径 → `kill()`。全部走适配器和路由。
+2. 开发栈命令增加一个模式：本机启动真实 envd（按 pinned 版本支持的参数，OSEP 提到 `-isnotfc`、`-no-cgroups`，以实际帮助输出为准），假后端把 49983 的 endpoint 指向它。
+3. 用例（放在 E5 的 Python 套件里，单独打标记）：`Sandbox.create()` → 前台命令的 stdout、stderr、非零退出码、命令超时 → 文本和二进制文件写入读取、覆盖、读不存在的路径 → `kill()`。全部走适配器和路由。
 4. 测试打上标记，默认不在常规 CI 里跑；提供一个手动触发的 workflow。
 
 - **PR 描述必须写明**：不是 Gate 1a 验收；Linux/amd64 以外的环境 NOT_RUN。
@@ -426,5 +435,5 @@ OSEP-0027 的 Gate 1a 需要一个只跑上游 envd 0.8.0（不带 execd）的�
 | 没有 KVM 环境 | E9、E10、E13 的证据出不来 | 用 upstream 的自托管 runner 或阿里环境；前半段先做完 |
 | SDK 把 `E2B_SANDBOX_URL` 和 `E2B_API_URL` 标为 deprecated | 升级 SDK 时固定入口方案可能失效 | 兼容矩阵里写明；通配域名方案作为后续项 |
 | envd 首次初始化无需 token | 初始化前若被不可信方抢先，实例被接管 | E6、E7 的顺序约束和测试；E10 在真实后端上验证竞态 |
-| Python 流式代理在高并发下的表现 | 数据面性能 | Gate 1a 只求正确；E10 记录实测数据，必要时把路由换成 Go 是独立决定 |
+| 契约测试跨语言（Go 服务、Python SDK 套件） | CI 和本地环境要同时有 Go 和 uv；夹具启动失败容易被误读成契约失败 | E5 的夹具对"开发栈没起来"和"用例失败"给出不同的错误；golden fixture 两边共用 |
 | 兼容性被过度宣称 | 用户误以为完整兼容 | 每个 PR 和文档只写被测组合的通过/失败/未测 |

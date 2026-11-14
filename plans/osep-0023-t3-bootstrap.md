@@ -24,7 +24,7 @@
 - 任务表：fork 分支 claude/fervent-dirac-65l11z 上的 plans/osep-0023-fsb-roadmap.md。运行手册：同目录的 osep-0023-autopilot.md。角色说明模板：同目录的 osep-0023-t3-bootstrap.md 的 B、C 两段。用下面的方式读取，不要把这个分支合进任何 feature 分支：
   git fetch origin claude/fervent-dirac-65l11z
   git show FETCH_HEAD:plans/osep-0023-fsb-roadmap.md
-- 通知命令：NOTIFY_CMD="<所有者在这里填一条能给 lhp1968263451@gmail.com 发邮件的本机命令，正文从 stdin 读入>"。如果这一项还是占位符，在预检里报告"通知通道未配置"并停下，不要自己发明发信方式。
+- 通知命令：NOTIFY_CMD="<所有者在这里填一条能给他自己发邮件的本机命令，正文从 stdin 读入>"。如果这一项还是占位符，在预检里报告"通知通道未配置"并停下，不要自己发明发信方式。
 - GitHub 上的一切文字（提交信息、PR 标题和正文、评论回复）用英文；状态目录里的记录和发给所有者的通知用中文。
 
 ## 2. 不可越过的边界
