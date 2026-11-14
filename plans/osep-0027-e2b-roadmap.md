@@ -1,6 +1,6 @@
 # OSEP-0027 E2B 兼容：完整实现路线（issue / PR 执行文档）
 
-> 执行计划文件，供 agent 逐个 PR 执行。放在计划分支上（upstream 的 `plans/osep-0027-e2b-compat`，fork 的 `claude/fervent-dirac-65l11z`），**不合入 `main`，不要带进任何实现 PR**。
+> 执行计划文件，供 agent 逐个 PR 执行。放在 fork（`hpliStartAgain/OpenSandbox`）的计划分支 `claude/fervent-dirac-65l11z` 上，**不推到 upstream，不合入 `main`，不要带进任何实现 PR**。
 > 基线：upstream `opensandbox-group/OpenSandbox` 的 `main` = `e564cd18`（2026-11-13，OSEP-0027 经 #2591 合入）。
 > 设计依据：`oseps/0027-optional-e2b-compatibility.md`。本文件只负责拆解和排序，语义以 OSEP 为准；两者不一致时以 OSEP 为准，并在 PR 描述里写明。
 > 本文件里对上游 SDK 的描述来自对 `e2b==2.62.1` wheel 的静态检查，对 envd 0.8.0 的描述来自 OSEP 引用，未实跑；开工时要重新核对。

@@ -1,6 +1,6 @@
 # OSEP-0027 本地编排 bootstrap 提示词（t3 code）
 
-> 执行计划的配套文件，和 `osep-0027-e2b-roadmap.md` 放在同一个计划分支上（upstream 的 `plans/osep-0027-e2b-compat`）。不合入 `main`，不要带进任何实现 PR。
+> 执行计划的配套文件，和 `osep-0027-e2b-roadmap.md` 放在同一个计划分支上（fork 的 `claude/fervent-dirac-65l11z`）。不推到 upstream，不合入 `main`，不要带进任何实现 PR。
 > 三段提示词：**A** 给主控（Codex），是唯一需要手动粘贴的一段；**B**、**C** 是主控派发给 coder（Claude Code）和 reviewer（Devin）时填空使用的角色说明。
 > 协作协议用"共享目录里的文件"实现，不依赖特定的 agent 间调用方式；t3 code 有原生派发时，用它传递同样的内容即可。
 
@@ -23,8 +23,8 @@
 - fork：hpliStartAgain/OpenSandbox。所有 feature 分支只推到 fork，PR 从 fork 提到 upstream 的 main。
 - 本地仓库：~/code/OpenSandbox（不是这个路径就先找到实际路径，记进状态文件）。
 - 状态目录：~/.osep0027-autopilot/（在仓库之外，不进 git）。
-- 路线文档和角色说明模板在 upstream 的计划分支 plans/osep-0027-e2b-compat 上。只读取，不要把这个分支合进任何 feature 分支，也不要把 plans/ 下的文件带进任何 PR：
-  git fetch upstream plans/osep-0027-e2b-compat
+- 路线文档和角色说明模板在 fork 的计划分支 claude/fervent-dirac-65l11z 上。只读取，不要把这个分支合进任何 feature 分支，不要向它推送，也不要把 plans/ 下的文件带进任何 PR：
+  git fetch origin claude/fervent-dirac-65l11z
   git show FETCH_HEAD:plans/osep-0027-e2b-roadmap.md
   git show FETCH_HEAD:plans/osep-0027-t3-bootstrap.md
 - 设计依据：main 上的 oseps/0027-optional-e2b-compatibility.md。路线文档只负责拆解和排序；两者不一致时以 OSEP 为准，并把差异记下来。
@@ -39,7 +39,7 @@
 1. 不合并。不执行 gh pr merge，不通过 API 合并，不开启 auto-merge，不用管理员权限绕过分支保护。其他 maintainer approve 之后也不由我们合并，等别人点合并。所有者有合并权限，但这个权限在本工作流里不使用。
 2. 不 approve、不 dismiss 任何 review，不修改分支保护和仓库设置。
 3. 我们唯一可以"批准"的是自己 PR 的 CI 运行。批准前确认这次运行的 head SHA 就是你刚推送的提交，且 PR 作者是 hpliStartAgain。
-4. 不直接向 upstream 推任何分支（计划分支已经由所有者放好，你只读），不向 fork 的 main 推送。
+4. 不直接向 upstream 推任何分支，不向 fork 的 main 和计划分支推送。计划分支只读。
 5. 不为了让 CI 变绿而跳过、禁用、隔离测试；不用空提交或关了再开 PR 来触发 CI。
 6. PR 打开之后不改写历史。需要同步 main 时用 merge。
 7. 不改 specs/、原生 server/、原生 SDK、execd。不引入独立数据库。不向原生 server 添加 E2B 路由。
