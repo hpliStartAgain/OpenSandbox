@@ -300,6 +300,15 @@ class SupplementalGlueTest(unittest.TestCase):
         self.assertEqual(out['distributions']['total']['p50'], 8)
         self.assertNotIn('s-private', json.dumps(out))
 
+    def test_budget_collector_uses_the_forwarded_closed_event(self):
+        sp = importlib.util.spec_from_file_location('supplemental_tools_budget', ROOT/'supplemental-tools.py')
+        module = importlib.util.module_from_spec(sp); sp.loader.exec_module(module)
+        log = '\n'.join(['credential proxy: tls-admission-v1 deny registry_exhausted',
+                         '{"msg":"[mitmproxy] credential proxy: tls decision deny reason=registry_exhausted"}',
+                         'credential proxy: tls decision deny reason=request_registry_exhausted'])
+        self.assertEqual(module.budget_denials(log), 1)
+        self.assertEqual(module.budget_denials(log+ '\ncredential proxy: tls decision deny reason=registry_exhausted'), 2)
+
     def test_synthetic_identity_uniqueness_and_fences(self):
         sp = importlib.util.spec_from_file_location('supplemental_subjects', ROOT/'supplemental-subjects.py')
         m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)

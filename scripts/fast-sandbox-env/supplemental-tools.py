@@ -53,6 +53,12 @@ def make_origin_certificate(ca_dir, out_dir, host):
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def budget_denials(text):
+    # launch.go consumes tls-admission-v1 into telemetry, while it forwards
+    # the closed tls-decision deny line to the egress container log.
+    return len(re.findall(r'credential proxy: tls decision deny reason=registry_exhausted(?=["\s]|$)', text))
+
+
 def validate(env):
     positive = ['SUP_REPEATS', 'SUP_LOAD_S', 'SUP_WARMUP_S', 'SUP_IDLE_S', 'SUP_CHURN_S', 'SUP_SOAK_S',
                 'SUP_SOAK_CONCURRENCY', 'SUP_RECOVERY_S', 'SUP_SCALE_PROBES', 'SUP_CLIENT_ATTEMPTS']
@@ -85,6 +91,8 @@ def main(argv):
     command, *a = argv
     if command == 'validate':
         validate(os.environ)
+    elif command == 'budget-denials':
+        print(budget_denials(sys.stdin.read()))
     elif command == 'certificate':
         make_origin_certificate(*a)
     elif command == 'classify':

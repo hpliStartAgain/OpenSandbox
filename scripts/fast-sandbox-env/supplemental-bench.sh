@@ -308,7 +308,7 @@ sup_m7() {
 			sup_fetch "$BENCH_B" "$name"
 			SUP_TOTAL_CONCURRENCY="$burst"
 			sup_append_run m7 "$SUP_RAW/$name.json" bound "$burst" keep-alive 0 1 500m
-			denials="$(kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress --since-time="$since" | grep -c 'tls-admission-v1 deny registry_exhausted' || true)"
+			denials="$(kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress --since-time="$since" | python3 "$SUP_SELF_DIR/supplemental-tools.py" budget-denials)"
 			bench_json_set "$SUP_RAW/m7-spec.json" '.server_budget_denials=((.server_budget_denials // 0)+$n) | .established_alive=$a' \
 				--argjson n "$denials" --argjson a "$(jq .released_alive "$SUP_RAW/$name.json")"
 			t0="$(bench_ns)"

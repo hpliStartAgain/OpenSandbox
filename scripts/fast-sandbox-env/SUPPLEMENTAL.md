@@ -30,7 +30,7 @@ M5 的客户端按 100 次请求周期选择 5 次 bound、95 次 unbound，或�
 
 M6/M8 的时间轴在每个模式单独开始，采样 memory、CPU、throttling、FD、Pod 重启及 OOM。FD 是该 egress 容器中所有进程的 FD 总和，conntrack 是 Pod 网络命名空间可读到的计数。采样写入独立文件，主进程在采样结束后组装报告。M8 每 100 次请求关闭连接，保存分钟级请求数、错误和延迟分位；长跑的总体延迟使用 0.1 ms 分箱。内存斜率单位为 B/s，后 90 分钟窗口由 `SUP_SOAK_ANALYSIS_S` 选择。
 
-M7 在一个 guest 的同一事件循环中释放全部连接任务，成功连接持有到控制端完成 U 探针，以及同一预算耗尽 subject 的 unbound SNI 探针。释放时再次请求这些连接。只有同一隔离窗口中的服务端 `registry_exhausted` 事件与握手关闭共同存在时，才归为预算拒绝；其他 socket 错误保留为未归因。需要超过预算时，显式提供大于 `BENCH_FSB_TLS_CAPACITY` 的 burst 档位。
+M7 在一个 guest 的同一事件循环中释放全部连接任务，成功连接持有到控制端完成 U 探针，以及同一预算耗尽 subject 的 unbound SNI 探针。释放时再次请求这些连接。只有同一隔离窗口中的服务端转发日志中的 `tls decision deny reason=registry_exhausted` 事件与握手关闭共同存在时，才归为预算拒绝；其他 socket 错误保留为未归因。需要超过预算时，显式提供大于 `BENCH_FSB_TLS_CAPACITY` 的 burst 档位。
 
 M9 的总数包含两个真实同置 guest，其余由 Actions v1 合成注册；每个合成对象都有独立 UID、fence、源 IP 和 attachment。SET 成功、ready Hook 成功分开计数；ready Hook 的成功受当前快照 ACK 门保护，因此 ACK 数由该门间接确认。每个规模暂停合成驱动，使用真实 guest 发 U/B 连接。合成 attachment 不创建 VM 或 veth，不能证明 4096 个真实流量源。4097 的容量日志与恢复结果单列。驱动在 `finally` 中清除全部尝试注册的对象，Pool 重建是异常中断后的清理边界。
 
