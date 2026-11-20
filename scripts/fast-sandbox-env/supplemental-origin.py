@@ -34,6 +34,7 @@ import argparse
 import hashlib
 import itertools
 import json
+import resource
 import ssl
 import sys
 import threading
@@ -138,6 +139,8 @@ def main(argv=None):
     parser.add_argument("--key", required=True)
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(65536, hard), hard))
     server = build_server(args.port, args.cert, args.key, args.host)
     sys.stdout.write("credential-bound origin ready\n")
     sys.stdout.flush()

@@ -12,7 +12,9 @@ sup_report() {
 }
 
 sup_spec() {
-	jq -n --argjson smoke "$SUP_SMOKE" '{smoke:$smoke, settings:{}, runs:[], samples:[], paths:[], blocks:[], points:[]}' > "$SUP_RAW/$1-spec.json"
+	jq -n --argjson smoke "$SUP_SMOKE" --arg mem "$BENCH_EGRESS_MEMORY_LIMIT" --argjson cap "$BENCH_FSB_TLS_CAPACITY" \
+		--argjson guests "$SUP_LOAD_GUESTS" --argjson load "$SUP_LOAD_S" --argjson idle "$SUP_IDLE_S" \
+		'{smoke:$smoke, settings:{egress_memory_limit:$mem,per_subject_tls_capacity:$cap,load_guests:$guests,load_seconds:$load,idle_seconds:$idle}, runs:[], samples:[], paths:[], blocks:[], points:[]}'  > "$SUP_RAW/$1-spec.json"
 }
 
 sup_sample() { # -> closed counters for the selected egress + origin
@@ -130,7 +132,7 @@ sup_load_pair() { # measurement concurrency connection seconds body repeat cpu m
 }
 
 sup_m3x_path() { # bound or unbound on the current mode
-	local target="$1" k inc per rem i n id dir raw got alive tcode leaf=mitm contrad=0 identity reading \
+	local target="$1" k inc per rem i n id dir raw got alive tcode leaf=mitm contrad=0 identity reading baseline_oom \
 		held_total=0 points='[]'
 	local -a ids=() codes=() dirs=()
 	[[ "$BENCH_LEG" != credential-bound || "$target" != unbound ]] || leaf=origin
@@ -150,6 +152,7 @@ sup_m3x_path() { # bound or unbound on the current mode
 	identity="$(bench_egress_identity "$BENCH_POD")"
 	sleep "$BENCH_MEM_SETTLE_SECONDS"
 	reading="$(bench_egress_cgroup "$BENCH_POD")"
+	baseline_oom="$(jq -r .oom_kill <<< "$reading")"
 	points="$(jq -n --argjson r "$reading" '[{k:0,held:0,alive:0,anon:$r.anon,memory_current:$r.memory_current,same_process:true}]')"
 	for k in $BENCH_MEM_STEPS; do
 		inc=$((k-held_total)); per=$((inc/BENCH_MEM_SANDBOXES)); rem=$((inc%BENCH_MEM_SANDBOXES))
@@ -171,7 +174,7 @@ sup_m3x_path() { # bound or unbound on the current mode
 		held_total=$((held_total+got)); sleep "$BENCH_MEM_SETTLE_SECONDS"
 		reading="$(bench_egress_cgroup "$BENCH_POD")"
 		points="$(jq --argjson k "$k" --argjson h "$held_total" --argjson r "$reading" \
-			--argjson same "$([[ "$(bench_egress_identity "$BENCH_POD")" == "$identity" ]] && echo true || echo false)" \
+			--argjson same "$([[ "$(bench_egress_identity "$BENCH_POD")" == "$identity" && "$(jq -r .oom_kill <<< "$reading")" == "$baseline_oom" ]] && echo true || echo false)" \
 			'. + [{k:$k,held:$h,alive:null,anon:$r.anon,memory_current:$r.memory_current,same_process:$same}]' <<< "$points")"
 		(( held_total == k )) || break
 	done
@@ -404,12 +407,17 @@ supplemental_bench() {
 	openssl x509 -req -in "$CB_WORK_DIR/ca/echo.csr" -CA "$MITM_CA_DIR/tls.crt" -CAkey "$MITM_CA_DIR/tls.key" -set_serial "0x$(openssl rand -hex 12)" -out "$CB_WORK_DIR/ca/echo.crt" -days 2 -extfile "$CB_WORK_DIR/ca/echo.ext" >/dev/null 2>&1
 	MITM_CA_DIR="$CB_WORK_DIR/ca"; cb_origin_up; MITM_CA_DIR="$original_ca"
 	# Fixture FD limit: no product limit is changed.
-	docker exec "$CB_ORIGIN_CONTAINER" sh -c 'prlimit --pid 1 --nofile=65536:524288' >/dev/null || fail "origin FD limit change failed"
+	docker exec "$CB_ORIGIN_CONTAINER" python3 -c 'from pathlib import Path; assert int([x for x in Path("/proc/1/limits").read_text().splitlines() if x.startswith("Max open files")][0].split()[3]) >= 65536' || fail "origin FD limit is below 65536"
 	BENCH_POLICY="$CB_WORK_DIR/policy.json"
 	jq -n --arg ip "$CB_ORIGIN_IP" --arg domain "$MITM_ECHO_DOMAIN" '{defaultAction:"deny",egress:[{action:"allow",target:$ip},{action:"allow",target:$domain},{action:"allow",target:("unbound."+$domain)}]}' > "$BENCH_POLICY"
-	local measurement
+	local measurement measurement_start report
 	for measurement in $SUP_MEASUREMENTS; do
+		measurement_start="$(bench_ns)"
 		case "$measurement" in m3x) sup_m3x;; m5) sup_m5;; m6|m8) sup_time "$measurement";; m7) sup_m7;; m9) sup_m9;; m10) sup_m10;; esac
+		for report in "$SUP_DIR/$measurement"*.json; do
+			[[ -f "$report" ]] || continue
+			bench_json_set "$report" '.execution_wall_ms=$ms | .execution_scope="measurement including all modes and rebuilds"' --argjson ms "$(bench_elapsed_ms "$measurement_start")"
+		done
 		sup_scan
 		# INVALID is a stop gate even when a report was written by a subshell.
 		if jq -e 'select(.status=="INVALID")' "$SUP_DIR/"*.json >/dev/null; then fail "INVALID supplemental report"; fi
