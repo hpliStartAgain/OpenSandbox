@@ -173,6 +173,8 @@ bench_egress_identity() { echo same; }
 bench_egress_restarts() { echo 0; }
 kubectl() { cat "$SAMPLER_JSON"; }
 docker() { cat "$SAMPLER_JSON"; }
+SUP_TIME_KEY=m5;SUP_TIME_OFFSET=0;SUP_TIME_INTERVAL=1
+sup_sample_loop() { printf '{"t_s":1}\n{"t_s":3}\n' > "$SUP_RAW/$1-samples.jsonl"; }
 sup_load_pair m5 2 keep-alive 2 0 1 500m 5
 cat "$SUP_RAW/m5-spec.json"
 '''
@@ -182,6 +184,7 @@ cat "$SUP_RAW/m5-spec.json"
         spec=json.loads(out.stdout)
         self.assertEqual(spec['resource_windows'][0]['wall_s'],2)
         self.assertEqual(len(spec['runs']),2)
+        self.assertEqual([x['t_s'] for x in spec['samples']],[1,2])
         calls=self.calls_made().splitlines()
         release=calls.index('release',calls.index('release')+1)
         self.assertTrue(all(i>release for i,v in enumerate(calls) if v.startswith('fetch m5-measured')))
