@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# Copyright 2026 The OpenSandbox Authors
+# SPDX-License-Identifier: Apache-2.0
+# Optional bench only. Sourced after integration-env.sh has loaded its helpers.
+SUP_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=credential-bound-bench.sh
+source "$SUP_SELF_DIR/credential-bound-bench.sh"
+
+sup_report() {
+	python3 "$SUP_SELF_DIR/supplemental-report.py" "$1" "$SUP_RAW/$1-spec.json" "$SUP_DIR/$1.json"
+	[[ "$(jq -r .status "$SUP_DIR/$1.json")" != INVALID ]] || fail "supplemental $1 INVALID"
+}
+
+sup_spec() {
+	jq -n --argjson smoke "$SUP_SMOKE" '{smoke:$smoke, settings:{}, runs:[], samples:[], paths:[], blocks:[], points:[]}' > "$SUP_RAW/$1-spec.json"
+}
+
+sup_sample() { # -> closed counters for the selected egress + origin
+	local counters extra origin
+	counters="$(bench_egress_cgroup "$BENCH_POD")" || return 1
+	extra="$(kubectl -n "$RESOURCE_NS" exec "$BENCH_POD" -c egress -- sh -c '
+		fd=0; for p in /proc/[0-9]*; do n=$(ls "$p/fd" 2>/dev/null | wc -l); fd=$((fd+n)); done
+		printf "%s " "$fd"
+		cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo null' 2>/dev/null)" || return 1
+	origin="$(docker exec "$CB_ORIGIN_CONTAINER" sh -c 'cat /sys/fs/cgroup/cpu.stat' | awk '$1=="usage_usec" {print $2}')" || origin=null
+	jq -c --argjson fd "${extra%% *}" --argjson ct "${extra##* }" --argjson o "${origin:-null}" \
+		--argjson r "$(bench_egress_restarts "$BENCH_POD")" \
+		'. + {fd:$fd,conntrack:$ct,restarts:$r,origin_cpu_usec:$o}' <<< "$counters"
+}
+
+sup_sample_loop() { # measurement start_ns stop-file interval
+	local key="$1" start="$2" stop="$3" interval="$4" reading elapsed
+	while [[ ! -e "$stop" ]]; do
+		reading="$(sup_sample)" || return 1
+		elapsed="$(bench_elapsed_ms "$start")"
+		jq -c --argjson t "$elapsed" '. + {t_s:($t/1000)}' <<< "$reading" >> "$SUP_RAW/$key-samples.jsonl"
+		sleep "$interval"
+	done
+}
+
+sup_scan() {
+	cb_log_scan "$CB_WORK_DIR/values" "$SUP_SINCE"
+}
+
+sup_pool() { # mode cpu-limit; each block gets a new Pool and live env readback
+	local mode="$1" cpu="$2" id
+	for id in ${CB_SANDBOXES[@]+"${CB_SANDBOXES[@]}"}; do cb_kill_sandbox "$id"; done
+	sup_scan
+	EGRESS_INTERCEPTION_MODE="$mode"; BENCH_LEG="$mode"
+	bench_render_pool
+	awk -v cpu="$cpu" '
+		/^      - name: / { e=($0=="      - name: egress"); l=0 }
+		e && /^          limits:$/ { l=1 }
+		e && l && /^            cpu:/ { print "            cpu: " cpu; next }
+		{ print }
+	' "$GEN_DIR/$POOL_PROFILE.bench.yaml" > "$GEN_DIR/supplemental-pool.yaml"
+	# shellcheck disable=SC2034 # read by bench_pool_restore
+	BENCH_POOL_RENDERED=1
+	bench_pool_apply "$GEN_DIR/supplemental-pool.yaml" "$BENCH_EGRESS_MEMORY_LIMIT" "$BENCH_FSB_TLS_CAPACITY"
+	kubectl -n "$RESOURCE_NS" get pods -l "app=sandbox-fastlet,fast-sandbox.io/pool=$POOL_NAME" -o json \
+		| jq -e --arg m "$mode" --arg cpu "$cpu" 'all(.items[]; (.spec.containers[] | select(.name=="egress")) as $e |
+			([$e.env[]? | select(.name=="OPENSANDBOX_EGRESS_FSB_INTERCEPTION_MODE") | .value] == [$m]) and $e.resources.limits.cpu==$cpu)' >/dev/null \
+		|| fail "supplemental: live mode/CPU mismatch"
+	wait_for "supplemental: identical warm-image readiness criterion" 300 warm_images_ready
+	sleep "$SUP_IDLE_S"
+}
+
+sup_pair() {
+	bench_pair "$SUP_CRED" "$SUP_CODE"
+	local id
+	for id in "$BENCH_U" "$BENCH_B"; do
+		osb_api file upload "$id" "$SUP_SELF_DIR/supplemental-client.py" "$CB_GUEST_DIR/supplemental.py" >/dev/null
+	done
+}
+
+sup_start() { # id name path concurrency connection duration body [extra args]
+	local id="$1" name="$2" path="$3" c="$4" connection="$5" duration="$6" body="$7" leaf=mitm code="$SUP_CODE" out
+	shift 7
+	if [[ "$path" == unbound ]]; then
+		code=absent
+		[[ "$BENCH_LEG" != credential-bound ]] || leaf=origin
+	fi
+	out="$(osb_api command run "$id" --background -o json -- python3 "$CB_GUEST_DIR/supplemental.py" \
+		"$@" --host "$MITM_ECHO_DOMAIN" --ip "$CB_ORIGIN_IP" --port "$MITM_ECHO_PORT" --cafile "$CB_GUEST_CAFILE" \
+		--origin-leaf "$CB_ORIGIN_LEAF" --expect-leaf "$leaf" --expect-cred "$code" \
+		--unbound-host "unbound.$MITM_ECHO_DOMAIN" --unbound-leaf "$([[ "$BENCH_LEG" == credential-bound ]] && echo origin || echo mitm)" \
+		--out "$CB_GUEST_DIR/$name.json" --concurrency "$c" --connection "$connection" --duration "$duration" --body-bytes "$body" 2>>"$LOGS_DIR/supplemental-guest.err")" \
+		|| fail "supplemental: client launch failed"
+	[[ -n "$(jq -r '.execution_id // empty' <<< "$out")" ]] || fail "supplemental: no execution id"
+}
+
+sup_fetch() { # id name -> file
+	bench_wait "$SUP_CLIENT_ATTEMPTS" bench_guest_fetch "$1" "$CB_GUEST_DIR/$2.json" "$SUP_RAW/$2.json" \
+		|| fail "supplemental: no client result for $2"
+}
+
+sup_append_run() { # key raw-file path concurrency connection body repeat cpu
+	bench_json_set "$SUP_RAW/$1-spec.json" '.runs += [$raw + {path:$path,mode:$mode,concurrency:$c,connection:$conn,body_bytes:$body,repeat:$rep,cpu_limit:$cpu}]' \
+		--argjson raw "$(cat "$2")" --arg path "$3" --arg mode "$BENCH_LEG" --argjson c "$4" --arg conn "$5" \
+		--argjson body "$6" --argjson rep "$7" --arg cpu "$8"
+}
+
+sup_load_pair() { # measurement concurrency connection seconds body repeat cpu mix
+	local key="$1" c="$2" conn="$3" seconds="$4" body="$5" rep="$6" cpu="$7" mix="$8" \
+		start end wall t0 i n name phase duration rate
+	local -a ids=("$BENCH_B") names=() counts=()
+	if [[ "$key" == m5 ]]; then ids=("${SUP_LOAD_IDS[@]}"); fi
+	for phase in warm measured; do
+		duration="$seconds"; [[ "$phase" != warm ]] || duration="$SUP_WARMUP_S"
+		start="$(sup_sample)"; t0="$(bench_ns)"
+		names=(); counts=()
+		for i in "${!ids[@]}"; do
+			n=$((c/${#ids[@]}+(i<c%${#ids[@]}?1:0))); ((n>0)) || continue
+			name="$key-$phase-$SUP_SEQ-$i"; names+=("$name"); counts+=("$n")
+			rate="$SUP_RATE_B"
+			sup_start "${ids[$i]}" "$name" bound "$n" "$conn" "$duration" "$body" load --bound-percent "$mix" --churn-every "$SUP_CHURN_EVERY" --rate "$rate"
+		done
+		for i in "${!names[@]}"; do
+			sup_fetch "${ids[$i]}" "${names[$i]}"
+			if [[ "$phase" == measured ]]; then sup_append_run "$key" "$SUP_RAW/${names[$i]}.json" mixed "${counts[$i]}" "$conn" "$body" "$rep" "$cpu"; fi
+		done
+		if [[ "$phase" == measured ]]; then
+			end="$(sup_sample)"; wall="$(bench_elapsed_ms "$t0")"
+			bench_json_set "$SUP_RAW/$key-spec.json" '.resource_windows = ((.resource_windows // []) + [{egress_start:$s,egress_end:$e,origin_cpu_s:(($e.origin_cpu_usec-$s.origin_cpu_usec)/1000000),wall_s:($w/1000),concurrency:$c,bound_percent:$mix}])' \
+				--argjson s "$start" --argjson e "$end" --argjson w "$wall" --argjson c "$c" --argjson mix "$mix"
+		fi
+	done
+	SUP_SEQ=$((SUP_SEQ+1))
+}
+
+sup_m3x_path() { # bound or unbound on the current mode
+	local target="$1" k inc per rem i n id dir raw got alive tcode leaf=mitm contrad=0 identity reading \
+		held_total=0 points='[]'
+	local -a ids=() codes=() dirs=()
+	[[ "$BENCH_LEG" != credential-bound || "$target" != unbound ]] || leaf=origin
+	for i in $(seq 1 "$BENCH_MEM_SANDBOXES"); do
+		if [[ "$i" == 1 ]]; then
+			cb_create_sandbox m3x "$BENCH_POLICY"; id="$CB_LAST_ID"
+			cb_placement "$id" || fail "M3x placement missing"
+			BENCH_POD="$CB_POD_NAME"; BENCH_POD_UID="$CB_POD_UID"
+		else cb_create_colocated m3x "$BENCH_POLICY" "$BENCH_POD_UID"; id="$CB_LAST_ID"; fi
+		tcode=absent
+		if [[ "$target" == bound ]]; then
+			bench_bind "$id" "$SUP_CRED" m3x-bind; tcode="$SUP_CODE"
+			cb_until "M3x injection ready" 60 "$id" m3x-ready "$tcode"
+		else bench_until_reachable "$id" m3x-ready "$leaf"; fi
+		ids+=("$id"); codes+=("$tcode")
+	done
+	identity="$(bench_egress_identity "$BENCH_POD")"
+	sleep "$BENCH_MEM_SETTLE_SECONDS"
+	reading="$(bench_egress_cgroup "$BENCH_POD")"
+	points="$(jq -n --argjson r "$reading" '[{k:0,held:0,alive:0,anon:$r.anon,memory_current:$r.memory_current,same_process:true}]')"
+	for k in $BENCH_MEM_STEPS; do
+		inc=$((k-held_total)); per=$((inc/BENCH_MEM_SANDBOXES)); rem=$((inc%BENCH_MEM_SANDBOXES))
+		got=0
+		for i in "${!ids[@]}"; do
+			n=$((per+(i<rem?1:0))); (( n > 0 )) || continue
+			dir="$CB_GUEST_DIR/m3x-$target-$k"
+			bench_guest_start "${ids[$i]}" hold-many --tag m3x --conns "$n" --dir "$dir" --wait-timeout 7200 || fail "M3x holder launch"
+			dirs+=("${ids[$i]}|$dir")
+		done
+		for i in "${!ids[@]}"; do
+			n=$((per+(i<rem?1:0))); (( n > 0 )) || continue
+			raw="$SUP_RAW/m3x-$target-$k-$i.json"
+			bench_wait "$SUP_CLIENT_ATTEMPTS" bench_guest_fetch "${ids[$i]}" "$CB_GUEST_DIR/m3x-$target-$k/status.json" "$raw" || fail "M3x holder result missing"
+			got=$((got+$(jq -r .held "$raw")))
+			# classify with the existing closed evidence vocabulary, privately.
+			contrad=$((contrad+$(python3 "$SUP_SELF_DIR/supplemental-tools.py" classify "$raw" "$CB_ORIGIN_LEAF" "$leaf" "${codes[$i]}")))
+		done
+		held_total=$((held_total+got)); sleep "$BENCH_MEM_SETTLE_SECONDS"
+		reading="$(bench_egress_cgroup "$BENCH_POD")"
+		points="$(jq --argjson k "$k" --argjson h "$held_total" --argjson r "$reading" \
+			--argjson same "$([[ "$(bench_egress_identity "$BENCH_POD")" == "$identity" ]] && echo true || echo false)" \
+			'. + [{k:$k,held:$h,alive:null,anon:$r.anon,memory_current:$r.memory_current,same_process:$same}]' <<< "$points")"
+		(( held_total == k )) || break
+	done
+	alive=0
+	for dir in "${dirs[@]}"; do
+		IFS='|' read -r id dir <<< "$dir"
+		osb_api command run "$id" -- touch "$dir/go" >/dev/null
+	done
+	for dir in "${dirs[@]}"; do
+		IFS='|' read -r id dir <<< "$dir"
+		bench_wait "$SUP_CLIENT_ATTEMPTS" bench_guest_fetch "$id" "$dir/done.json" "$SUP_RAW/m3x-done.json" || fail "M3x release result missing"
+		alive=$((alive+$(jq -r .alive_at_release "$SUP_RAW/m3x-done.json")))
+	done
+	# Full final release proves every preceding cumulative point alive. If it
+	# fails, no earlier point receives an invented alive count.
+	points="$(jq --argjson a "$alive" --argjson h "$held_total" 'map(if .k==0 then . else .alive=(if $a==$h then .held else null end) end)' <<< "$points")"
+	bench_json_set "$SUP_RAW/m3x-spec.json" '.paths += [{mode:$mode,target:$target,points:$points,contradictions:$bad}]' \
+		--arg mode "$BENCH_LEG" --arg target "$target" --argjson points "$points" --argjson bad "$contrad"
+	for id in "${ids[@]}"; do cb_kill_sandbox "$id"; done
+}
+
+sup_m3x() {
+	sup_spec m3x
+	local mode target
+	for mode in all credential-bound; do
+		sup_pool "$mode" 500m
+		for target in unbound bound; do sup_m3x_path "$target"; done
+	done
+	sup_report m3x
+}
+
+sup_load_guests() {
+	SUP_LOAD_IDS=("$BENCH_B")
+	local i id
+	for i in $(seq 2 "$SUP_LOAD_GUESTS"); do
+		cb_create_colocated "load-$i" "$BENCH_POLICY" "$BENCH_POD_UID"; id="$CB_LAST_ID"
+		bench_bind "$id" "$SUP_CRED" load-bind
+		cb_until "supplemental load guest injected" 60 "$id" load-ready "$SUP_CODE"
+		osb_api file upload "$id" "$SUP_SELF_DIR/supplemental-client.py" "$CB_GUEST_DIR/supplemental.py" >/dev/null
+		SUP_LOAD_IDS+=("$id")
+	done
+}
+
+sup_m5() {
+	sup_spec m5
+	local mode cpu c conn body rep mix
+	for mode in all credential-bound; do
+		for cpu in $SUP_CPU_LIMITS; do
+			sup_pool "$mode" "$cpu"; sup_pair; sup_load_guests
+			for c in $SUP_CONCURRENCIES; do
+				for conn in new keep-alive; do
+					for mix in 5 100; do
+						for body in $SUP_BODY_BYTES; do
+							for rep in $(seq 1 "$SUP_REPEATS"); do sup_load_pair m5 "$c" "$conn" "$SUP_LOAD_S" "$body" "$rep" "$cpu" "$mix"; done
+						done
+					done
+				done
+			done
+		done
+	done
+	bench_json_set "$SUP_RAW/m5-spec.json" '.settings.traffic_mix_method="per-request 100-request cycle in each guest: 95 unbound / 5 bound or 100 bound; actual counts retained"'
+	sup_report m5
+}
+
+sup_time() { # m6 or m8 on both modes
+	local key="$1" seconds="$SUP_CHURN_S" interval=5 analysis=0 mode t0 stop sampler reading
+	[[ "$key" != m8 ]] || { seconds="$SUP_SOAK_S"; interval=10; analysis="$SUP_SOAK_ANALYSIS_S"; }
+	sup_spec "$key"
+	bench_json_set "$SUP_RAW/$key-spec.json" '.duration_s=$d | .analysis_start_s=$a' --argjson d "$seconds" --argjson a "$analysis"
+	# One report per mode: time axes never cross a Pool rebuild.
+	for mode in all credential-bound; do
+		sup_spec "$key"
+		bench_json_set "$SUP_RAW/$key-spec.json" '.duration_s=$d | .analysis_start_s=$a | .settings.mode=$mode' --argjson d "$seconds" --argjson a "$analysis" --arg mode "$mode"
+		sup_pool "$mode" 500m; sup_pair
+		t0="$(bench_ns)"; stop="$SUP_RAW/$key-stop"; rm -f "$stop"; : > "$SUP_RAW/$key-samples.jsonl"
+		sup_sample_loop "$key" "$t0" "$stop" "$interval" & sampler=$!
+		SUP_SAMPLER="$sampler"
+		if [[ "$key" == m6 ]]; then
+			SUP_CHURN_EVERY=1
+			local stage stage_s=$((seconds/3))
+			((stage_s>0)) || stage_s=1
+			for stage in 1 4 16; do sup_load_pair "$key" "$stage" new "$stage_s" 0 1 500m 100; done
+		else
+			SUP_CHURN_EVERY=100
+			sup_load_pair "$key" "$SUP_SOAK_CONCURRENCY" keep-alive "$seconds" 0 1 500m 5
+		fi
+		touch "$stop"; wait "$sampler" || fail "supplemental sampler failed"; SUP_SAMPLER=""
+		bench_json_set "$SUP_RAW/$key-spec.json" '.samples=$samples' --argjson samples "$(jq -s . "$SUP_RAW/$key-samples.jsonl")"
+		reading="$(sup_sample)"
+		bench_json_set "$SUP_RAW/$key-spec.json" '.samples += [$s + {t_s:($t/1000)}]' --argjson s "$reading" --argjson t "$(bench_elapsed_ms "$t0")"
+		sleep "$SUP_RECOVERY_S"
+		bench_json_set "$SUP_RAW/$key-spec.json" '.recovery=$s' --argjson s "$(sup_sample)"
+		sup_report "$key"
+		mv "$SUP_DIR/$key.json" "$SUP_DIR/$key-$mode.json"
+		cp "$SUP_RAW/$key-spec.json" "$SUP_RAW/$key-$mode-spec.json"
+	done
+	SUP_CHURN_EVERY=0
+}
+
+sup_m7() {
+	local mode burst name since denials t0 key=m7
+	for mode in all credential-bound; do
+		sup_spec m7; sup_pool "$mode" 500m; sup_pair
+		for burst in $SUP_BURSTS; do
+			name="m7-$burst"; since="$(date -u +%FT%TZ)"
+			sup_start "$BENCH_B" "$name" bound "$burst" keep-alive 1 0 burst \
+				--ready-file "$CB_GUEST_DIR/$name-ready.json" --release-file "$CB_GUEST_DIR/$name-go" --hold-s 120
+			bench_wait "$SUP_CLIENT_ATTEMPTS" bench_guest_fetch "$BENCH_B" "$CB_GUEST_DIR/$name-ready.json" "$SUP_RAW/$name-ready.json" || fail "M7 burst readiness missing"
+			# An established successful bound socket remains held during the U probe.
+			cb_guest_once "$BENCH_U" m7-passthrough
+			bench_json_set "$SUP_RAW/m7-spec.json" '.passthrough_ok=$ok' --argjson ok "$([[ "$CB_RC" == 0 ]] && echo true || echo false)"
+			osb_api command run "$BENCH_B" -- touch "$CB_GUEST_DIR/$name-go" >/dev/null
+			sup_fetch "$BENCH_B" "$name"
+			sup_append_run m7 "$SUP_RAW/$name.json" bound "$burst" keep-alive 0 1 500m
+			denials="$(kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress --since-time="$since" | grep -c 'tls-admission-v1 deny registry_exhausted' || true)"
+			bench_json_set "$SUP_RAW/m7-spec.json" '.server_budget_denials=((.server_budget_denials // 0)+$n) | .established_alive=$a' \
+				--argjson n "$denials" --argjson a "$(jq .released_alive "$SUP_RAW/$name.json")"
+			t0="$(bench_ns)"
+			cb_until "M7 recovered bound injection" 60 "$BENCH_B" m7-recovered "$SUP_CODE"
+			bench_json_set "$SUP_RAW/m7-spec.json" '.recovered=true | .recovery_ms=$t' --argjson t "$(bench_elapsed_ms "$t0")"
+		done
+		sup_report m7; mv "$SUP_DIR/m7.json" "$SUP_DIR/m7-$mode.json"
+	done
+}
+
+sup_m9() {
+	sup_spec m9
+	sup_pool credential-bound 500m; sup_pair
+	local remote=/tmp/osep23-supplemental-subjects.py control=/tmp/osep23-supplemental-scale out=/tmp/osep23-supplemental-scale.json step pid
+	kubectl -n "$RESOURCE_NS" exec -i "$BENCH_POD" -c egress -- sh -c 'cat > /tmp/osep23-supplemental-subjects.py' < "$SUP_SELF_DIR/supplemental-subjects.py"
+	kubectl -n "$RESOURCE_NS" exec "$BENCH_POD" -c egress -- mkdir "$control"
+	# shellcheck disable=SC2086 # validated integer list
+	kubectl -n "$RESOURCE_NS" exec "$BENCH_POD" -c egress -- python3 "$remote" --steps $SUP_SUBJECT_STEPS --out "$out" --control-dir "$control" > "$LOGS_DIR/supplemental-subjects.log" 2>&1 & pid=$!
+	SUP_SUBJECT_PID="$pid"
+	for step in $SUP_SUBJECT_STEPS; do
+		bench_wait "$SUP_CLIENT_ATTEMPTS" sup_scale_is "$control" "$step" || fail "M9 scale controller missing"
+		# Each scale is exercised through both real guest paths on this egress.
+		bench_handshakes "$BENCH_U" "m9-u-$step" "$SUP_SCALE_PROBES" "$SUP_RAW/m9-u-$step.json"
+		bench_handshakes "$BENCH_B" "m9-b-$step" "$SUP_SCALE_PROBES" "$SUP_RAW/m9-b-$step.json"
+		kubectl -n "$RESOURCE_NS" exec "$BENCH_POD" -c egress -- touch "$control/continue-$step"
+	done
+	wait "$pid" || fail "M9 synthetic driver failed"; SUP_SUBJECT_PID=""
+	kubectl -n "$RESOURCE_NS" exec "$BENCH_POD" -c egress -- cat "$out" > "$SUP_RAW/m9-driver.json"
+	bench_json_set "$SUP_RAW/m9-spec.json" '.points=$d.points | .cleanup_ok=$d.cleanup_ok | .recovery_ok=$d.recovery_ok' --argjson d "$(cat "$SUP_RAW/m9-driver.json")"
+	local denials
+	denials="$(kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress --since-time="$SUP_SINCE" | grep -c subject_capacity_exhausted || true)"
+	bench_json_set "$SUP_RAW/m9-spec.json" '.points |= map(if .target>4096 then .capacity_rejections=$n else . end)' --argjson n "$denials"
+	python3 "$SUP_SELF_DIR/supplemental-tools.py" m9-probes "$SUP_RAW/m9-spec.json" "$SUP_RAW" "$CB_ORIGIN_LEAF" "$SUP_CODE"
+	sup_report m9
+	kubectl -n "$RESOURCE_NS" exec "$BENCH_POD" -c egress -- rm -rf "$remote" "$control" "$out"
+}
+
+sup_scale_is() {
+	[[ "$(kubectl -n "$RESOURCE_NS" exec "$BENCH_POD" -c egress -- cat "$1/scale" 2>/dev/null)" == "$2" ]]
+}
+
+sup_m10() {
+	sup_spec m10
+	local block mode label t0 switch original_dir="$BENCH_DIR" original_raw="$BENCH_RAW" uid live since
+	for block in $(seq 0 $((SUP_BLOCKS-1))); do
+		label="${SUP_SEQUENCE:$block:1}"; mode=all; [[ "$label" != B ]] || mode=credential-bound
+		t0="$(bench_ns)"; sup_pool "$mode" 500m; switch="$(bench_elapsed_ms "$t0")"
+		since="$(date -u +%FT%TZ)"
+		BENCH_DIR="$SUP_RAW/m10-block-$block"; BENCH_RAW="$BENCH_DIR/raw"; mkdir -p "$BENCH_RAW"
+		bench_m1
+		uid="$(kubectl -n "$RESOURCE_NS" get pods -l "app=sandbox-fastlet,fast-sandbox.io/pool=$POOL_NAME" -o jsonpath='{.items[0].metadata.uid}')"
+		live="$(kubectl -n "$RESOURCE_NS" get pods -l "app=sandbox-fastlet,fast-sandbox.io/pool=$POOL_NAME" -o json | jq -r '.items[0].spec.containers[] | select(.name=="egress") | .env[] | select(.name=="OPENSANDBOX_EGRESS_FSB_INTERCEPTION_MODE") | .value')"
+		kubectl -n "$RESOURCE_NS" logs -l "app=sandbox-fastlet,fast-sandbox.io/pool=$POOL_NAME" -c egress --since-time="$since" --tail=-1 > "$BENCH_RAW/egress.log"
+		python3 "$SUP_SELF_DIR/supplemental-tools.py" segments "$BENCH_RAW/egress.log" "$BENCH_RAW/segments.json"
+		bench_json_set "$SUP_RAW/m10-spec.json" '.blocks += [{mode:$label,p50_ms:$r.pooled_latency_ms.p50,status:$r.status,switch_ms:$switch,pod_uid:$uid,live_mode:$mode,warm_ready:true,segments:$segments}]' \
+			--arg label "$label" --argjson r "$(cat "$BENCH_DIR/m1-create.json")" --argjson switch "$switch" --arg uid "$uid" --arg mode "$live" --argjson segments "$(cat "$BENCH_RAW/segments.json")"
+		BENCH_DIR="$original_dir"; BENCH_RAW="$original_raw"
+	done
+	sup_report m10
+}
+
+sup_cleanup() {
+	[[ -z "${SUP_SAMPLER:-}" ]] || { kill "$SUP_SAMPLER" 2>/dev/null || true; wait "$SUP_SAMPLER" 2>/dev/null || true; }
+	[[ -z "${SUP_SUBJECT_PID:-}" ]] || { kill "$SUP_SUBJECT_PID" 2>/dev/null || true; wait "$SUP_SUBJECT_PID" 2>/dev/null || true; }
+	cb_cleanup
+	EGRESS_INTERCEPTION_MODE="$SUP_ORIGINAL_MODE"
+	bench_pool_restore
+}
+
+supplemental_bench() {
+	[[ "$-" != *x* ]] || fail "supplemental refuses xtrace"
+	SUP_SMOKE="${SUP_SMOKE:-false}"
+	SUP_MEASUREMENTS="${SUP_MEASUREMENTS:-m10 m3x m5 m6 m7 m9 m8}"
+	SUP_CPU_LIMITS="${SUP_CPU_LIMITS:-500m 2}"
+	SUP_CONCURRENCIES="${SUP_CONCURRENCIES:-1 4 16 64 256}"
+	SUP_BODY_BYTES="${SUP_BODY_BYTES:-0 65536}"
+	SUP_REPEATS="${SUP_REPEATS:-3}"
+	SUP_LOAD_S="${SUP_LOAD_S:-60}"; SUP_WARMUP_S="${SUP_WARMUP_S:-10}"; SUP_IDLE_S="${SUP_IDLE_S:-20}"
+	SUP_CHURN_S="${SUP_CHURN_S:-1800}"; SUP_SOAK_S="${SUP_SOAK_S:-7200}"; SUP_SOAK_ANALYSIS_S="${SUP_SOAK_ANALYSIS_S:-1800}"
+	SUP_SOAK_CONCURRENCY="${SUP_SOAK_CONCURRENCY:-16}"; SUP_RECOVERY_S="${SUP_RECOVERY_S:-30}"
+	SUP_BURSTS="${SUP_BURSTS:-500 1000 2000}"; SUP_SUBJECT_STEPS="${SUP_SUBJECT_STEPS:-256 1024 2048 4096 4097}"
+	SUP_SCALE_PROBES="${SUP_SCALE_PROBES:-20}"; SUP_BLOCKS="${SUP_BLOCKS:-8}"; SUP_SEQUENCE=ABBAABBA
+	SUP_CLIENT_ATTEMPTS="${SUP_CLIENT_ATTEMPTS:-7200}"
+	SUP_LOAD_GUESTS="${SUP_LOAD_GUESTS:-4}"; SUP_LOAD_IDS=()
+	SUP_CHURN_EVERY=0; SUP_RATE_U="${SUP_RATE_U:-0}"; SUP_RATE_B="${SUP_RATE_B:-0}"; SUP_SEQ=0
+	export SUP_SMOKE SUP_MEASUREMENTS SUP_CPU_LIMITS SUP_CONCURRENCIES SUP_BODY_BYTES SUP_REPEATS SUP_LOAD_S SUP_WARMUP_S SUP_IDLE_S SUP_CHURN_S SUP_SOAK_S SUP_SOAK_ANALYSIS_S SUP_SOAK_CONCURRENCY SUP_RECOVERY_S SUP_BURSTS SUP_SUBJECT_STEPS SUP_SCALE_PROBES SUP_BLOCKS SUP_CLIENT_ATTEMPTS
+	python3 "$SUP_SELF_DIR/supplemental-tools.py" validate || die "invalid supplemental parameters"
+	bench_validate_knobs
+	load_mitm_ca_fingerprint; bench_load_template_id
+	CB_NET="$(kind_network)"; [[ -n "$CB_NET" ]] || die "kind network missing"
+	SUP_DIR="${SUP_REPORT_DIR:-$WORK/bench/supplemental-$(date -u +%Y%m%dT%H%M%SZ)}"; SUP_RAW="$SUP_DIR/raw"
+	[[ ! -e "$SUP_DIR" ]] || die "supplemental output exists; choose a fresh SUP_REPORT_DIR"
+	mkdir -p "$SUP_RAW" "$GEN_DIR"
+	# shellcheck disable=SC2034 # read by sourced bench helpers
+	BENCH_DIR="$SUP_DIR"; BENCH_RAW="$SUP_RAW"; SUP_ORIGINAL_MODE="$EGRESS_INTERCEPTION_MODE"
+	# shellcheck disable=SC2034 # array read by bench_bind
+	BENCH_BIND_MS=()
+	CB_WORK_DIR="$(mktemp -d "$GEN_DIR/supplemental.XXXXXX")"
+	trap 'sup_cleanup' EXIT
+	SUP_SINCE="$(date -u +%FT%TZ)"; SUP_CRED="$(cb_fake_value supplemental)"; SUP_CODE="$(cb_digest "$SUP_CRED")"
+	(umask 077; printf '%s\n' "$SUP_CRED" > "$CB_WORK_DIR/values")
+	# shellcheck disable=SC2034 # read by cb_origin_up
+	CB_ORIGIN_SRC="$SUP_SELF_DIR/supplemental-origin.py"
+	local original_ca="$MITM_CA_DIR"
+	mkdir "$CB_WORK_DIR/ca"
+	cp "$MITM_CA_DIR/tls.crt" "$CB_WORK_DIR/ca/tls.crt"
+	openssl req -new -newkey rsa:2048 -nodes -keyout "$CB_WORK_DIR/ca/echo.key" -out "$CB_WORK_DIR/ca/echo.csr" -subj "/CN=$MITM_ECHO_DOMAIN" >/dev/null 2>&1
+	printf 'subjectAltName=DNS:%s,DNS:unbound.%s\nextendedKeyUsage=serverAuth\n' "$MITM_ECHO_DOMAIN" "$MITM_ECHO_DOMAIN" > "$CB_WORK_DIR/ca/echo.ext"
+	openssl x509 -req -in "$CB_WORK_DIR/ca/echo.csr" -CA "$MITM_CA_DIR/tls.crt" -CAkey "$MITM_CA_DIR/tls.key" -set_serial "0x$(openssl rand -hex 12)" -out "$CB_WORK_DIR/ca/echo.crt" -days 2 -extfile "$CB_WORK_DIR/ca/echo.ext" >/dev/null 2>&1
+	MITM_CA_DIR="$CB_WORK_DIR/ca"; cb_origin_up; MITM_CA_DIR="$original_ca"
+	# Fixture FD limit: no product limit is changed.
+	docker exec "$CB_ORIGIN_CONTAINER" sh -c 'prlimit --pid 1 --nofile=65536:524288' >/dev/null || fail "origin FD limit change failed"
+	BENCH_POLICY="$CB_WORK_DIR/policy.json"
+	jq -n --arg ip "$CB_ORIGIN_IP" --arg domain "$MITM_ECHO_DOMAIN" '{defaultAction:"deny",egress:[{action:"allow",target:$ip},{action:"allow",target:$domain},{action:"allow",target:("unbound."+$domain)}]}' > "$BENCH_POLICY"
+	local measurement
+	for measurement in $SUP_MEASUREMENTS; do
+		case "$measurement" in m3x) sup_m3x;; m5) sup_m5;; m6|m8) sup_time "$measurement";; m7) sup_m7;; m9) sup_m9;; m10) sup_m10;; esac
+		sup_scan
+		# INVALID is a stop gate even when a report was written by a subshell.
+		if jq -e 'select(.status=="INVALID")' "$SUP_DIR/"*.json >/dev/null; then fail "INVALID supplemental report"; fi
+	done
+	sup_cleanup; trap - EXIT
+}

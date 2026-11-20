@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+# Copyright 2026 The OpenSandbox Authors
+# SPDX-License-Identifier: Apache-2.0
+"""Async closed-loop TLS load and synchronous-start burst client; Python 3.9+.
+
+Every successful response is classified by verified certificate and origin
+credential. Never emits digests, peer names or arbitrary exception messages.
+"""
+import argparse
+import copy
+import asyncio
+import hashlib
+import json
+import os
+from pathlib import Path
+import ssl
+import time
+
+
+def error_kind(exc, phase):
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        kind = 'timeout'
+    elif isinstance(exc, ssl.SSLCertVerificationError):
+        kind = 'verify_failed'
+    elif isinstance(exc, (ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+        kind = 'tls_closed'
+    elif isinstance(exc, ssl.SSLError):
+        kind = 'tls_error'
+    elif isinstance(exc, ConnectionResetError):
+        kind = 'reset'
+    elif isinstance(exc, asyncio.IncompleteReadError):
+        kind = 'eof'
+    elif isinstance(exc, ConnectionRefusedError):
+        kind = 'refused'
+    else:
+        kind = 'io_error'
+    return phase + '/' + kind
+
+
+def save(path, result):
+    tmp = str(path)+'.tmp'
+    Path(tmp).write_text(json.dumps(result, separators=(',', ':')))
+    os.replace(tmp, path)
+
+
+class Session:
+    def __init__(self, args, context):
+        self.args, self.context = args, context
+        self.reader = self.writer = None
+        self.leaf = 'none'
+
+    async def connect(self):
+        start = time.monotonic()
+        self.reader, self.writer = await asyncio.wait_for(asyncio.open_connection(
+            self.args.ip, self.args.port, ssl=self.context, server_hostname=self.args.host), self.args.timeout)
+        tls = self.writer.get_extra_info('ssl_object')
+        digest = hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest()
+        self.leaf = 'origin' if digest == self.args.origin_leaf else 'mitm'
+        return (time.monotonic()-start)*1000
+
+    async def request(self):
+        self.writer.write(('GET /cbv?bytes=%d HTTP/1.1\r\nHost: %s\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+                          % (self.args.body_bytes, self.args.host)).encode('ascii'))
+        await self.writer.drain()
+        header = await self.reader.readuntil(b'\r\n\r\n')
+        lines = header.decode('iso-8859-1').split('\r\n')
+        status = int(lines[0].split()[1])
+        headers = dict(line.lower().split(':', 1) for line in lines[1:] if ':' in line)
+        length = int(headers.get('content-length', '-1'))
+        if not 0 <= length <= 65536:
+            raise ValueError('invalid response length')
+        body = await self.reader.readexactly(length)
+        parsed = json.loads(body)
+        cred = parsed.get('cred')
+        cred_class = 'absent' if cred == 'absent' else 'expected' if cred == self.args.expect_cred else 'other'
+        good = status == 200 and self.leaf == self.args.expect_leaf and cred_class == ('absent' if self.args.expect_cred == 'absent' else 'expected')
+        return good, cred_class
+
+    async def close(self):
+        if self.writer:
+            self.writer.close()
+            try:
+                await asyncio.wait_for(self.writer.wait_closed(), 2)
+            except (OSError, asyncio.TimeoutError):
+                pass
+            self.writer = None
+
+
+async def execute(args):
+    ctx = ssl.create_default_context(cafile=args.cafile)
+    ctx.set_alpn_protocols(['http/1.1'])
+    result = dict(v=1, attempted=0, success=0, failed=0, verified=0, connections=0, contradictions=0,
+                  errors={}, leaf={'origin': 0, 'mitm': 0, 'none': 0}, cred={'expected': 0, 'absent': 0, 'other': 0},
+                  request_ms=[], handshake_ms=[], concurrency=args.concurrency, connection=args.connection,
+                  body_bytes=args.body_bytes, bound_percent=args.bound_percent, released_alive=0)
+    start, cpu = time.monotonic(), time.process_time()
+    gate = asyncio.Event()
+    held = []
+    request_sequence = 0
+
+    async def once(session):
+        result['attempted'] += 1
+        t0 = time.monotonic()
+        phase = 'handshake'
+        try:
+            if session.writer is None:
+                result['handshake_ms'].append(await session.connect())
+                result['connections'] += 1
+            phase = 'recv'
+            good, cred = await asyncio.wait_for(session.request(), args.timeout)
+            result['leaf'][session.leaf] += 1
+            result['cred'][cred] += 1
+            if not good:
+                result['contradictions'] += 1
+            result['success'] += 1
+            result['verified'] += int(good)
+            result['request_ms'].append(round((time.monotonic()-t0)*1000, 3))
+            return good
+        except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError) as exc:
+            key = error_kind(exc, phase)
+            result['errors'][key] = result['errors'].get(key, 0)+1
+            result['failed'] += 1
+            await session.close()
+            return False
+
+    async def worker(index):
+        sessions = {}
+        session = Session(args, ctx)
+        await gate.wait()
+        try:
+            if args.mode == 'burst':
+                if await once(session):
+                    held.append(session)
+                    return
+            else:
+                count = 0
+                while time.monotonic()-start < args.duration:
+                    nonlocal request_sequence
+                    bound = request_sequence % 100 < args.bound_percent
+                    request_sequence += 1
+                    path = 'bound' if bound else 'unbound'
+                    if path not in sessions:
+                        selected = copy.copy(args)
+                        if not bound and args.unbound_host:
+                            selected.host = args.unbound_host
+                            selected.expect_cred = 'absent'
+                            selected.expect_leaf = args.unbound_leaf
+                        sessions[path] = Session(selected, ctx)
+                    session = sessions[path]
+                    await once(session)
+                    count += 1
+                    if args.connection == 'new' or (args.churn_every and count % args.churn_every == 0):
+                        await session.close()
+                    if args.rate:
+                        # Per-worker fixed offered rate, no catch-up bursts.
+                        await asyncio.sleep(args.concurrency/args.rate)
+        finally:
+            for current in list(sessions.values())+[session]:
+                if current not in held:
+                    await current.close()
+    tasks = [asyncio.create_task(worker(i)) for i in range(args.concurrency)]
+    start = time.monotonic()
+    gate.set()
+    await asyncio.gather(*tasks)
+    if args.mode == 'burst':
+        if args.ready_file:
+            save(args.ready_file, dict(result, held=len(held)))
+        deadline = time.monotonic()+args.hold_s
+        while time.monotonic() < deadline and args.release_file and not Path(args.release_file).exists():
+            await asyncio.sleep(.05)
+        for session in held:
+            try:
+                good, _ = await asyncio.wait_for(session.request(), args.timeout)
+                result['released_alive'] += int(good)
+                result['contradictions'] += int(not good)
+            except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+                pass
+            finally:
+                await session.close()
+    result['wall_s'] = time.monotonic()-start
+    result['cpu_s'] = time.process_time()-cpu
+    save(args.out, result)
+    return result
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument('mode', choices=['load', 'burst'])
+    for key in ['host', 'ip', 'cafile', 'origin-leaf', 'expect-leaf', 'expect-cred', 'out']:
+        p.add_argument('--'+key, required=True)
+    p.add_argument('--bound-percent', type=int, choices=[5, 100], default=100)
+    p.add_argument('--unbound-host', default='')
+    p.add_argument('--unbound-leaf', choices=['origin', 'mitm'], default='origin')
+    p.add_argument('--port', type=int, default=443)
+    p.add_argument('--duration', type=float, default=60)
+    p.add_argument('--concurrency', type=int, default=1)
+    p.add_argument('--connection', choices=['new', 'keep-alive'], default='new')
+    p.add_argument('--body-bytes', type=int, choices=[0, 65536], default=0)
+    p.add_argument('--churn-every', type=int, default=0)
+    p.add_argument('--rate', type=float, default=0)
+    p.add_argument('--timeout', type=float, default=20)
+    p.add_argument('--hold-s', type=float, default=60)
+    p.add_argument('--ready-file', default='')
+    p.add_argument('--release-file', default='')
+    a = p.parse_args(argv)
+    if not 1 <= a.concurrency <= 5000 or a.duration <= 0 or a.timeout <= 0 or a.rate < 0 or a.churn_every < 0:
+        p.error('invalid load bounds')
+    return a
+
+
+if __name__ == '__main__':
+    asyncio.run(execute(parse_args()))
