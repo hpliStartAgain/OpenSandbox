@@ -230,14 +230,23 @@ def build_m5(spec):
         wall = window.get("wall_s") or 0
         e0, e1 = window.get("egress_start") or {}, window.get("egress_end") or {}
         status = resource_status([e0,e1]) if window else "PARTIAL"
-        if window.get("origin_cpu_s") is not None and window["origin_cpu_s"] < 0:
-            status = "INVALID"
-        if status == "OK" and (wall <= 0 or window.get("origin_cpu_s") is None):
-            status = "PARTIAL"
-        if window.get("origin_start_s") is not None and window.get("origin_end_s") is not None:
-            overlap_origin = max(0,min(e1.get("captured_at_s",0),window["origin_end_s"])-max(e0.get("captured_at_s",0),window["origin_start_s"]))
-            if wall <= 0 or overlap_origin/wall < .90:
-                status = base.worst([status,"PARTIAL"])
+        if type(wall) not in (int,float) or not math.isfinite(wall):
+            wall=0
+        origin_cpu=window.get("origin_cpu_s")
+        if origin_cpu is not None and (type(origin_cpu) not in (int,float) or not math.isfinite(origin_cpu) or origin_cpu<0):
+            status="INVALID"
+        if status=="OK" and (wall<=0 or origin_cpu is None):
+            status="PARTIAL"
+        boundaries=[e0.get("captured_at_s"),e1.get("captured_at_s"),window.get("origin_start_s"),window.get("origin_end_s")]
+        origin_wall=0
+        if all(type(v) in (int,float) and math.isfinite(v) for v in boundaries):
+            es,ee,os,oe=boundaries
+            origin_wall=oe-os
+            tolerance=max(.1,.01*wall)
+            if origin_wall<=0 or abs(os-es)>tolerance or abs(oe-ee)>tolerance:
+                status=base.worst([status,"PARTIAL"])
+        else:
+            status=base.worst([status,"PARTIAL"])
         times = [(x.get("start_at_s"),x.get("end_at_s")) for x in members]
         overlap = None
         if all(isinstance(a,(int,float)) and isinstance(b,(int,float)) and b>a for a,b in times):
@@ -255,7 +264,7 @@ def build_m5(spec):
             status = base.worst([status,"PARTIAL"])
         client_cores = sum(x["cpu_s"]/x["wall_s"] for x in members) if all(x.get("wall_s",0)>0 and isinstance(x.get("cpu_s"),(int,float)) for x in members) else None
         egress_cores = (e1["usage_usec"]-e0["usage_usec"])/1e6/wall if status=="OK" else None
-        origin_cores = window["origin_cpu_s"]/wall if status=="OK" else None
+        origin_cores = origin_cpu/origin_wall if status=="OK" else None
         candidates = []
         if status == "OK":
             limit = .5 if first.get("cpu_limit")=="500m" else 2
@@ -280,7 +289,7 @@ def build_m5(spec):
                        "errors":sum(x.get("failed",0) for x in members)})
     return {"status":base.worst(statuses), "runs":[run_row(r) for r in runs], "groups":groups,
             "saturation":saturation_points([g for g in groups if g["status"]=="OK"]), "resource_windows":windows,
-            "bottleneck_method":"same scheduled steady window; client CPU divided by each process actual active window; >=90% CPU and egress throttling; only OK groups enter plateau inference"}
+            "bottleneck_method":"same scheduled steady window; observed egress/origin boundaries within max(0.1 s, 1% of window); CPU divided by each actual counter/process window; >=90% CPU and egress throttling; only OK groups enter plateau inference"}
 
 
 def build_time(spec):

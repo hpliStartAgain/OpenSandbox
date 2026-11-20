@@ -57,17 +57,27 @@ class Regressions(unittest.TestCase):
         self.assertEqual(r.build_m7(s)['status'], 'INVALID')
 
     def test_fixed_control_delay_does_not_dilute_cpu(self):
-        a=run(); a.update(success=60, verified=60, failed=0, errors={})
+        a=run(); a.update(attempted=60,success=60, verified=60, failed=0, errors={})
         s=dict(runs=[a],resource_windows=[dict(group=0,wall_s=60,control_wall_s=70,
-            egress_start=sample(),egress_end=sample(60),origin_cpu_s=60)])
+            egress_start=sample(),egress_end=sample(60),origin_cpu_s=60,origin_start_s=100,origin_end_s=160)])
         out=r.build_m5(s)
         self.assertEqual(out['status'],'OK')
         self.assertEqual(out['groups'][0]['cpu_bottleneck_candidates'],['egress','origin','client'])
         self.assertEqual(out['groups'][0]['client_cpu_cores'],1)
 
+    def test_origin_window_drift_and_missing_evidence_degrade(self):
+        a=run();a.update(attempted=60,success=60,verified=60,failed=0,errors={})
+        w=dict(group=0,wall_s=60,egress_start=sample(),egress_end=sample(60),
+               origin_cpu_s=70,origin_start_s=90,origin_end_s=160)
+        out=r.build_m5(dict(runs=[a],resource_windows=[w]))
+        self.assertEqual(out['status'],'PARTIAL')
+        self.assertFalse(out['groups'][0]['cpu_bottleneck_candidates'])
+        del w['origin_start_s']
+        self.assertEqual(r.build_m5(dict(runs=[a],resource_windows=[w]))['status'],'PARTIAL')
+
     def test_resource_regression_identity_and_missing(self):
-        a=run(); a.update(success=60,verified=60,failed=0,errors={})
-        s=dict(runs=[a],resource_windows=[dict(group=0,wall_s=60,egress_start=sample(),egress_end=sample(60),origin_cpu_s=60)])
+        a=run(); a.update(attempted=60,success=60,verified=60,failed=0,errors={})
+        s=dict(runs=[a],resource_windows=[dict(group=0,wall_s=60,egress_start=sample(),egress_end=sample(60),origin_cpu_s=60,origin_start_s=100,origin_end_s=160)])
         for key,value in [('usage_usec',-1),('oom_kill',1),('restarts',1),('identity','changed')]:
             bad=copy.deepcopy(s); bad['resource_windows'][0]['egress_end'][key]=value
             out=r.build_m5(bad); self.assertEqual(out['status'],'INVALID',key)
@@ -76,9 +86,9 @@ class Regressions(unittest.TestCase):
         self.assertEqual(r.build_m5(s)['status'],'PARTIAL')
 
     def test_nonoverlapping_guests_degrade(self):
-        a=run(); a.update(success=60,verified=60,failed=0,errors={})
+        a=run(); a.update(attempted=60,success=60,verified=60,failed=0,errors={})
         b=dict(a,start_at_s=160,end_at_s=220)
-        s=dict(runs=[a,b],resource_windows=[dict(group=0,wall_s=60,egress_start=sample(),egress_end=sample(60),origin_cpu_s=60)])
+        s=dict(runs=[a,b],resource_windows=[dict(group=0,wall_s=60,egress_start=sample(),egress_end=sample(60),origin_cpu_s=60,origin_start_s=100,origin_end_s=160)])
         self.assertEqual(r.build_m5(s)['status'],'PARTIAL')
 
     def test_time_counter_rollback_is_invalid(self):
