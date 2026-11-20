@@ -205,6 +205,15 @@ class Readback(unittest.TestCase):
                 self.assertEqual(result['ready'],0)
         finally:server.shutdown();server.server_close();thread.join(5)
 
+    def test_sampler_handles_exited_process_and_marks_missing_fd(self):
+        from unittest.mock import Mock
+        sampler=module('supplemental-sampler')
+        alive=Mock();alive.iterdir.return_value=iter([1,2])
+        exited=Mock();exited.iterdir.side_effect=FileNotFoundError
+        self.assertEqual(sampler.descriptor_count([exited,alive]),2)
+        denied=Mock();denied.iterdir.side_effect=PermissionError
+        self.assertIsNone(sampler.descriptor_count([denied]))
+
     def test_sample_guard_writes_invalid_and_stops(self):
         import subprocess,sys
         with tempfile.TemporaryDirectory() as d:
