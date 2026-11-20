@@ -133,6 +133,17 @@ cb_create_sandbox supplement /tmp/policy
         self.assertIn('--timeout 22200s ',calls)
         self.assertEqual(calls.count('readback id'),1)
 
+    def test_sampler_failure_terminates_owner(self):
+        body=r'''
+source "$SCRIPT_DIR/supplemental-bench.sh"
+SUP_OWNER_PID=123;SUP_RAW="$WORK";SUP_DIR="$WORK"
+sup_sample() { return 1; }
+kill() { printf '%s\n' "$*" >> "$CALLS"; }
+if sup_sample_loop m8 1 "$WORK/absent-stop" 1; then exit 2; fi
+'''
+        self.sourced(body,OCI_STACK='0')
+        self.assertIn('-TERM 123',self.calls_made())
+
     def test_gate_sampling_precedes_result_collection(self):
         body=r'''
 source "$SCRIPT_DIR/supplemental-bench.sh"

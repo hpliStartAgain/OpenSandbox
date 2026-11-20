@@ -43,7 +43,7 @@ import sys,time
 time.sleep(max(0,int(sys.argv[1])/1e9-time.time()))
 WAIT
 	while [[ ! -e "$stop" ]]; do
-		reading="$(sup_sample)" || return 1
+		reading="$(sup_sample)" || { kill -TERM "$SUP_OWNER_PID"; return 1; }
 		elapsed="$(bench_elapsed_ms "$start")"
 		jq -c --argjson t "$elapsed" --argjson offset "${SUP_TIME_OFFSET:-0}" '. + {t_s:($t/1000+$offset)}' <<< "$reading" >> "$SUP_RAW/$key-samples.jsonl"
 		sleep "$interval"
@@ -506,6 +506,7 @@ sup_cleanup() {
 }
 
 supplemental_bench() {
+	SUP_OWNER_PID="$BASHPID"
 	[[ "$-" != *x* ]] || fail "supplemental refuses xtrace"
 	SUP_SMOKE="${SUP_SMOKE:-false}"
 	SUP_MEASUREMENTS="${SUP_MEASUREMENTS:-m10 m3x m5 m6 m7 m9 m8}"
