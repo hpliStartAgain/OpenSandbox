@@ -15,24 +15,28 @@ SUP_REPORT_DIR=/path/to/new-report-dir \
 | 测量 | 主要参数及默认值 | 顶层报告 |
 | --- | --- | --- |
 | M3x | `BENCH_MEM_STEPS='500 1000 2000'`、`BENCH_MEM_SANDBOXES=4`、`BENCH_MEM_SETTLE_SECONDS=20`、`BENCH_EGRESS_MEMORY_LIMIT=2Gi`、`BENCH_FSB_TLS_CAPACITY=1024` | `m3x.json` |
-| M5 | `SUP_CPU_LIMITS='500m 2'`、`SUP_CONCURRENCIES='1 4 16 64 256'`、`SUP_LOAD_GUESTS=4`、`SUP_BODY_BYTES='0 65536'`、`SUP_REPEATS=3`、`SUP_LOAD_S=60`、`SUP_WARMUP_S=10` | `m5.json` |
+| M5 | `SUP_CPU_LIMITS='500m 2'`、`SUP_CONCURRENCIES='1 16 64 256'`、`SUP_LOAD_GUESTS=4`、`SUP_BODY_BYTES='0 65536'`、`SUP_REPEATS=3`、`SUP_LOAD_S=60`、`SUP_WARMUP_S=10` | `m5.json` |
 | M6 | `SUP_CHURN_S=1800`、并发 1/4/16 各三分之一时长；`SUP_RECOVERY_S=30` | `m6-all.json`、`m6-credential-bound.json` |
-| M7 | `SUP_BURSTS='500 1000 2000'`、每个档位一次 | `m7-all.json`、`m7-credential-bound.json` |
+| M7 | `SUP_BURSTS='500 1000 2000 2049'`、`SUP_BURST_REPEATS=3`、`SUP_RESOURCE_RECOVERY_S=240`、`SUP_RESOURCE_INTERVAL_S=5` | `m7-all.json`、`m7-credential-bound.json` |
 | M8 | `SUP_SOAK_S=7200`、`SUP_SOAK_ANALYSIS_S=1800`、`SUP_SOAK_CONCURRENCY=16`、`SUP_SOAK_RATE_ALL` 与 `SUP_SOAK_RATE_CB` 分别指定为 M5 对应模式校准后的总请求限速 | `m8-all.json`、`m8-credential-bound.json` |
 | M9 | `SUP_SUBJECT_STEPS='256 1024 2048 4096 4097'`、`SUP_SCALE_PROBES=20` | `m9.json` |
 | M10 | `SUP_BLOCKS=8`、固定 ABBAABBA 前缀；`BENCH_CREATE_ROUNDS=3`、`BENCH_CREATE_N=200`、`BENCH_CREATE_CONCURRENCY=10` | `m10.json` |
 
+补测为 guest 单独计算生命周期：M5 覆盖整个 mode×CPU 组的预热、负载、逐点控制余量和收尾，至少 6 小时；M8 覆盖 7200 s 浸泡、预热、恢复和收尾，至少 3 小时。创建请求再增加 600 s，并逐个经 `sandbox get -o json` 读取 `expires_at`，确认剩余时长大于所需时长。回读保存在 `lifetime-readback.jsonl`。原 M1–M4 默认 1h。
+
 补测显式设置 `WARM_IMAGES=1`，等待模板缓存覆盖全部 `POOL_MIN` 个 Fastlet；收尾恢复原 warm 设置。`SUP_IDLE_S=20` 为 Pool warm 判据通过后的等待。`SUP_CLIENT_ATTEMPTS=7200` 是每两秒一次的结果轮询上限。M8 默认包含在完整选择中，未指定两档正数浸泡限速 时预检拒绝执行；只执行其他项目时，用 `SUP_MEASUREMENTS` 选择。
+
+5c 全量执行显式指定 `BENCH_MEM_STEPS='500 1000 2000 4000'`，并将 `BENCH_FSB_TLS_CAPACITY=2048`。
 
 M3x 对 all/cb × bound/unbound 四条路径分别取 cgroup `memory.current` 与 `anon`，按实际完整持有数拟合 OLS。最终在同一批连接上请求并释放，释放不完整的点不参与拟合。混合比例表由实测斜率推导。
 
-M5 的客户端按 100 次请求周期选择 5 次 bound、95 次 unbound，或全部 bound。两个 SNI 使用同一 origin 和 CA，测试叶证书的有效期起点提前 2 天，以覆盖 warm snapshot 恢复后的 guest 时钟；只有主名称绑定 Vault；每次响应核对证书路径与 origin 凭据类别。不同路径的 keep-alive session 分开持有。并发分摊到同一 Fastlet Pod 上的多个 guest，报告保留实际响应计数。`body_bytes=65536` 表示完整 64 KiB JSON 响应。吞吐按 guest 的成功请求数与实际负载时长计算后相加；资源窗口保留 egress、origin 和 client CPU。CPU 候选瓶颈还须结合并发曲线的平台段判断。
+M5 的客户端按 100 次请求周期选择 5 次 bound、95 次 unbound，或全部 bound。两个 SNI 使用同一 origin 和 CA，测试叶证书的有效期起点提前 2 天，以覆盖 warm snapshot 恢复后的 guest 时钟；只有主名称绑定 Vault；每次响应核对证书路径与 origin 凭据类别。不同路径的 keep-alive session 分开持有。并发分摊到同一 Fastlet Pod 上的多个 guest，报告保留实际响应计数。`body_bytes=65536` 表示完整 64 KiB JSON 响应。默认矩阵为两模式 × CPU 500m/2 × 并发 1/16/64/256 × new/keep-alive × 三种流量组合（95/5 小包、95/5 64 KiB、全 bound 小包）× 3 次，共 288 点。所有 guest 的 worker 就绪后，独立 origin 协调端口 18081 发放共同起跑时间；egress 和 origin 各自的 sampler 在同一计划边界读取 cgroup 差值。结果下载在采样后进行。客户端 CPU 除以各进程真实活跃时长，报告保留计划时间、起止时间及重叠时长；重叠不足采样窗口的 90% 时降级。吞吐按各 guest 的成功数与真实时长求和，CPU 候选还须结合有效组的平台段判断。容器身份变化、重启/OOM 增加、计数回退或负值为 INVALID 并停止；缺失资源证据为 PARTIAL/MISSING，异常组不参与平台或瓶颈推导。
 
-M6/M8 的时间轴在每个模式单独开始，采样 memory、CPU、throttling、FD、Pod 重启及 OOM。FD 是该 egress 容器中所有进程的 FD 总和，conntrack 是 Pod 网络命名空间可读到的计数。采样写入独立文件，主进程在采样结束后组装报告。M8 每 100 次请求关闭连接，保存分钟级请求数、错误和延迟分位；长跑的总体延迟使用 0.1 ms 分箱。内存斜率单位为 B/s，后 90 分钟窗口由 `SUP_SOAK_ANALYSIS_S` 选择。
+M6/M8 的时间轴按稳态负载阶段累计，预热、控制等待和结果下载不进入时间轴；M8 从共同测量边界开始，采样 memory、CPU、throttling、FD、Pod 重启及 OOM。FD 是该 egress 容器中所有进程的 FD 总和，conntrack 是 Pod 网络命名空间可读到的计数。采样写入独立文件，主进程在采样结束后组装报告。M8 每 100 次请求关闭连接，保存分钟级请求数、错误和延迟分位；长跑的总体延迟使用 0.1 ms 分箱。内存斜率单位为 B/s，后 90 分钟窗口由 `SUP_SOAK_ANALYSIS_S` 选择。
 
-M7 在一个 guest 的同一事件循环中释放全部连接任务，成功连接持有到控制端完成 U 探针，以及同一预算耗尽 subject 的 unbound SNI 探针。释放时再次请求这些连接。只有同一隔离窗口中的服务端转发日志中的 `tls decision deny reason=registry_exhausted` 事件与握手关闭共同存在时，才归为预算拒绝；其他 socket 错误保留为未归因。需要超过预算时，显式提供大于 `BENCH_FSB_TLS_CAPACITY` 的 burst 档位。
+M7 在一个 guest 的同一事件循环中释放全部连接任务，成功连接持有到控制端完成 U 探针，以及同一预算耗尽 subject 的 unbound SNI 探针。释放时再次请求这些连接。只有同一隔离窗口中的服务端转发日志中的 `tls decision deny reason=registry_exhausted` 事件与握手关闭共同存在时，才归为预算拒绝；其他 socket 错误保留为未归因。每档从 live Pod 读取 per-subject/process 预算，以空载连接数计算精确的成功和超额拒绝范围。成功必须非零，且释放时全部连接仍可请求；只有符合预期范围并有服务端归因的拒绝可以豁免。未归因关闭独立降级。注入恢复时间与资源恢复时间分列；每档保存基线、持有期及释放后 memory.current/anon、FD、conntrack、重启和 OOM 序列。回落容差为 memory.current 32 MiB、anon 16 MiB、FD 4、conntrack 64；有界等待 240 s。资源未回落时报告 PARTIAL，收齐序列后重建 Pool，再进入下一档。
 
-M9 的总数包含两个真实同置 guest，其余由 Actions v1 合成注册；每个合成对象都有独立 UID、fence、源 IP 和 attachment。SET 成功、ready Hook 成功分开计数；ready Hook 的成功受当前快照 ACK 门保护，因此 ACK 数由该门间接确认。每个规模暂停合成驱动，使用真实 guest 发 U/B 连接。合成 attachment 不创建 VM 或 veth，不能证明 4096 个真实流量源。4097 的容量日志与恢复结果单列。驱动在 `finally` 中清除全部尝试注册的对象，Pool 重建是异常中断后的清理边界。
+M9 的总数包含两个真实同置 guest，其余由 Actions v1 合成注册；每个合成对象都有独立 UID、fence、源 IP 和 attachment。SET 成功、ready Hook 成功分开计数；ready Hook 的成功受当前快照 ACK 门保护，因此 ACK 数由该门间接确认。每个规模暂停合成驱动，使用真实 guest 发 U/B 连接。合成 attachment 不创建 VM 或 veth，不能证明 4096 个真实流量源。4097 的容量日志与恢复结果单列。驱动在宿主的任务 runner cgroup 中运行，经仅绑定 127.0.0.1 的 kubectl port-forward 调用 action endpoint；与 egress cgroup 分离。每级暂停后先读取 egress 资源，再枚举 nft；枚举的 CPU 计数差和墙钟单列，累计 CPU 可扣除前序枚举成本重算。报告使用 `egress_per_subject_fit`，仅拟合 egress 内存计数；夹具自身 RSS/CPU 为独立字段。驱动在 `finally` 中清除全部尝试注册的对象，Pool 重建是异常中断后的清理边界。
 
 M10 每块重建 Pool，记录首个 Pod UID、所有 Pod 的真实 mode/CPU readback、warm 就绪与切换时长。每块将 M1 成功样本的 p50 作为一个观测，按相邻 A/B 块配对计算 B−A，以 4 对块差给 Student t 95% CI。日志分段按同一 subject 关联 SET_BINDING total、policyCommit 和 data-plane-ready applyPolicy，再丢弃身份；日志缺失会显示覆盖数。报告不对 ACK 等待作归因。
 
@@ -48,7 +52,7 @@ BENCH_MEM_STEPS='2 4' BENCH_MEM_SANDBOXES=1 BENCH_MEM_SETTLE_SECONDS=1 \
 BENCH_FSB_TLS_CAPACITY=8 \
 SUP_BLOCKS=4 SUP_CPU_LIMITS=500m SUP_CONCURRENCIES=1 SUP_LOAD_GUESTS=1 \
 SUP_BODY_BYTES=0 SUP_REPEATS=1 SUP_LOAD_S=2 SUP_WARMUP_S=1 SUP_IDLE_S=1 \
-SUP_CHURN_S=3 SUP_BURSTS='2 10' SUP_SUBJECT_STEPS='4 8' SUP_SCALE_PROBES=2 \
+SUP_CHURN_S=3 SUP_BURST_REPEATS=1 SUP_BURSTS='2 10' SUP_SUBJECT_STEPS='4 8' SUP_SCALE_PROBES=2 \
 SUP_SOAK_S=5 SUP_SOAK_ANALYSIS_S=0 SUP_SOAK_CONCURRENCY=1 SUP_RECOVERY_S=1 \
   ./scripts/fast-sandbox-env/integration-env.sh bench-supplemental
 ```

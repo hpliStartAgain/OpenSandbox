@@ -68,9 +68,42 @@ def budget_denials(text):
     return len(re.findall(r'credential proxy: tls decision deny reason=registry_exhausted(?=["\s]|$)', text))
 
 
+def m5_cases(env):
+    return [(int(mix),int(body)) for mix in (5,100) for body in env['SUP_BODY_BYTES'].split()
+            if mix==5 or body=='0']
+
+
+def lifetime_seconds(env, measurement):
+    # Per-point 120 s control allowance, plus 30 min creation/cleanup margin.
+    warm, recovery = int(env['SUP_WARMUP_S']), int(env['SUP_RECOVERY_S'])
+    if measurement=='m5':
+        points=len(env['SUP_CONCURRENCIES'].split())*2*len(m5_cases(env))*int(env['SUP_REPEATS'])
+        return max(21600,points*(int(env['SUP_LOAD_S'])+warm+120)+1800)
+    if measurement=='m8':
+        return max(10800,int(env['SUP_SOAK_S'])+warm+recovery+1800)
+    return max(7200,int(env['SUP_CHURN_S'])+3*warm+recovery+1800)
+
+
+def lifetime_readback(payload, required, now=None):
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    expires = datetime.datetime.fromisoformat(payload['expires_at'].replace('Z','+00:00'))
+    remaining = (expires-now).total_seconds()
+    if remaining <= required:
+        raise ValueError('guest API lifetime is shorter than measurement group')
+    return dict(expires_at=expires.isoformat(),read_at=now.isoformat(),remaining_s=remaining,
+                required_s=required,api_readback=True)
+
+
+def gate_call(url, operation, key, participant='host'):
+    import urllib.request
+    with urllib.request.urlopen(url+'/'+operation+'/'+key+'/'+participant,timeout=300) as response:
+        return json.load(response)
+
+
 def validate(env):
     positive = ['SUP_REPEATS', 'SUP_LOAD_S', 'SUP_WARMUP_S', 'SUP_IDLE_S', 'SUP_CHURN_S', 'SUP_SOAK_S',
-                'SUP_SOAK_CONCURRENCY', 'SUP_RECOVERY_S', 'SUP_SCALE_PROBES', 'SUP_CLIENT_ATTEMPTS']
+                'SUP_SOAK_CONCURRENCY', 'SUP_RECOVERY_S', 'SUP_SCALE_PROBES', 'SUP_CLIENT_ATTEMPTS',
+                'SUP_BURST_REPEATS','SUP_RESOURCE_RECOVERY_S','SUP_RESOURCE_INTERVAL_S']
     for k in positive:
         if not env[k].isdigit() or int(env[k]) < 1:
             raise ValueError(k)
@@ -98,7 +131,22 @@ def validate(env):
 
 def main(argv):
     command, *a = argv
-    if command == 'validate':
+    if command == 'lifetime':
+        print(lifetime_seconds(os.environ,a[0]))
+    elif command == 'lifetime-readback':
+        print(json.dumps(lifetime_readback(json.load(sys.stdin),int(a[0]))))
+    elif command == 'gate':
+        print(json.dumps(gate_call(*a)))
+    elif command == 'sample-check':
+        path=Path(a[0]); current=json.load(sys.stdin)
+        previous=json.loads(path.read_text()) if path.exists() else None
+        status=r.resource_status(([previous] if previous else [])+[current])
+        path.write_text(json.dumps(current))
+        if status=='INVALID':
+            Path(a[1]).write_text(json.dumps(dict(status='INVALID',reason='resource lifecycle or counter regression')))
+            raise SystemExit(1)
+        print(json.dumps(current))
+    elif command == 'validate':
         validate(os.environ)
     elif command == 'budget-denials':
         print(budget_denials(sys.stdin.read()))

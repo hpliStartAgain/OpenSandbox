@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 The OpenSandbox Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Synthetic Actions v1 scale driver, executed inside one isolated egress.
+"""Synthetic Actions v1 scale driver, executed outside the measured egress cgroup.
 
 Two real, colocated guests must already be active. They count toward the
 requested total. HTTP 200 SET is registration only. A successful ready Hook
@@ -12,7 +12,8 @@ import argparse
 import ipaddress
 import json
 from pathlib import Path
-import subprocess
+import os
+import resource
 import time
 import urllib.error
 import urllib.request
@@ -43,22 +44,15 @@ def request(url, payload):
         return 0
 
 
-def reading():
-    p = Path('/sys/fs/cgroup')
-    relative = Path('/proc/self/cgroup').read_text().split('0::')[-1].strip()
-    d = p/relative.lstrip('/')
-    if not (d/'memory.current').is_file():
-        d = p
-    out = {'memory_current': int((d/'memory.current').read_text())}
-    for file, keys in [('memory.stat', ['anon']), ('cpu.stat', ['usage_usec'])]:
-        values = dict(line.split() for line in (d/file).read_text().splitlines())
-        out.update({k: int(values[k]) for k in keys})
+def driver_cost():
+    # This process runs in the task runner cgroup. It never reads the
+    # egress cgroup; product snapshots are supplied by the host controller.
+    rss=None
     try:
-        nft = json.loads(subprocess.check_output(['nft', '-j', 'list', 'ruleset'], timeout=20))
-        out['nft_rules'] = sum('rule' in x for x in nft['nftables'])
-    except (OSError, ValueError, subprocess.SubprocessError):
-        out['nft_rules'] = None
-    return out
+        rss=int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines() if line.startswith('VmRSS:')))*1024
+    except (OSError,StopIteration):
+        pass
+    return dict(cpu_s=time.process_time(),rss_bytes=rss,maxrss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
 
 
 def run(args):
@@ -84,12 +78,12 @@ def run(args):
                     activation_ms += (time.monotonic()-t)*1000
             points.append(dict(target=target, registered=len(registered)+args.real_subjects,
                                acked=len(active)+args.real_subjects, active=len(active)+args.real_subjects,
-                               registration_ms=registration_ms, activation_ms=activation_ms, **reading()))
+                               registration_ms=registration_ms, activation_ms=activation_ms, driver_cost=driver_cost()))
             # A host-side probe can exercise the real pair at this exact scale.
             if args.control_dir:
                 d = Path(args.control_dir)
                 d.mkdir(exist_ok=True)
-                (d/'scale').write_text(str(target))
+                temp=d/'scale.tmp';temp.write_text(str(target));os.replace(temp,d/'scale')
                 deadline = time.monotonic()+120
                 while not (d/('continue-'+str(target))).exists():
                     if time.monotonic()>deadline:

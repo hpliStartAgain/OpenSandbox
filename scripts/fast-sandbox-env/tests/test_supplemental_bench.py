@@ -38,7 +38,7 @@ class Reports(unittest.TestCase):
 
     def test_soak_slope_window(self):
         rows = [{'t_s': t, 'memory_current': 100 + t * 2, 'anon': 50 + t,
-                 'fd': 10, 'oom_kill': 0, 'restarts': 0} for t in [0, 1800, 3600, 7200]]
+                 'fd': 10, 'conntrack':0, 'identity':'same', 'usage_usec':t, 'nr_throttled':0, 'throttled_usec':0, 'oom_kill': 0, 'restarts': 0} for t in [0, 1800, 3600, 7200]]
         out = r.build('m8', {'samples': rows, 'analysis_start_s': 1800, 'duration_s': 7200})
         self.assertEqual(out['status'], 'OK')
         self.assertEqual(out['trend']['memory_current']['slope'], 2)
@@ -78,7 +78,7 @@ class Reports(unittest.TestCase):
         run = {'attempted': 4, 'success': 4, 'failed': 0, 'wall_s': 2,
                'request_ms': [1, 2, 3, 4], 'errors': {}, 'contradictions': 0}
         out = r.build('m5', {'runs': [run]})
-        self.assertEqual(out['status'], 'OK')
+        self.assertEqual(out['status'], 'PARTIAL')  # CPU/window evidence is required.
         self.assertEqual(out['runs'][0]['rps'], 2)
         self.assertEqual(out['runs'][0]['latency_ms']['p99_9'], 4)
         self.assertEqual(r.build('m5', {'runs': [dict(run, contradictions=1)]})['status'], 'INVALID')
@@ -188,6 +188,43 @@ class SupplementalClientTest(OriginFixture):
         self.assertGreater(out['success'], 0)
         self.assertEqual(out['contradictions'], 0)
 
+    def test_two_guests_wait_at_common_gate(self):
+        import threading
+        sp=importlib.util.spec_from_file_location('gate_origin',ROOT/'supplemental-origin.py')
+        origin=importlib.util.module_from_spec(sp);sp.loader.exec_module(origin)
+        server=origin.build_gate_server(0,host='127.0.0.1')
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        gate='http://127.0.0.1:'+str(server.server_address[1])
+        processes=[]
+        try:
+            import urllib.request
+            def call(op):
+                with urllib.request.urlopen(gate+'/'+op+'/test/host',timeout=5) as response:return json.load(response)
+            for i in range(2):
+                out=str(Path(self.tmp)/('gate-%s.json'%i))
+                args=[sys.executable,str(ROOT/'supplemental-client.py'),'load','--host','echo.test','--ip','127.0.0.1',
+                    '--port',str(self.port),'--cafile',self.ca,'--origin-leaf',der_sha256(self.leaf),'--expect-leaf','origin',
+                    '--expect-cred','absent','--out',out,'--duration','.3','--gate-url',gate,'--gate-key','test','--participant',str(i)]
+                processes.append((subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE),out))
+                deadline=time.monotonic()+3
+                while call('status')['ready']<i+1 and time.monotonic()<deadline:time.sleep(.01)
+                self.assertFalse(Path(out).exists())
+                time.sleep(.15)
+            self.assertEqual(call('status')['ready'],2)
+            call('release')
+            results=[]
+            for process,out in processes:
+                stdout,stderr=process.communicate(timeout=6)
+                self.assertEqual(process.returncode,0,stderr)
+                results.append(json.loads(Path(out).read_text()))
+            self.assertLess(abs(results[0]['start_at_s']-results[1]['start_at_s']),.1)
+            self.assertGreater(min(x['wall_s'] for x in results),.29)
+            self.assertLess(max(x['wall_s'] for x in results),1)
+        finally:
+            for process,out in processes:
+                if process.poll() is None:process.kill();process.wait()
+            server.shutdown();server.server_close();thread.join(5)
+
 
 class SupplementalShellTest(ShellCase):
     def test_source_does_not_change_default_pool_render(self):
@@ -246,6 +283,7 @@ cat "$SUP_DIR/m10.json"
 source "$SCRIPT_DIR/supplemental-bench.sh"
 SUP_DIR="$WORK/report"; SUP_RAW="$SUP_DIR/raw"; mkdir -p "$SUP_RAW"
 SUP_SMOKE=true; SUP_LOAD_GUESTS=1; SUP_LOAD_S=1; SUP_IDLE_S=1; SUP_BURSTS=2; SUP_SEQ=0; SUP_CLIENT_ATTEMPTS=1
+SUP_BURST_REPEATS=3; SUP_RESOURCE_RECOVERY_S=1; SUP_RESOURCE_INTERVAL_S=1
 SUP_CRED=unused; SUP_CODE=unused; CB_ORIGIN_LEAF=origin; SUP_SINCE=unused; RESOURCE_NS=unused; CB_GUEST_DIR=/tmp
 sup_pool() { BENCH_LEG="$1"; }
 sup_pair() { BENCH_B=b; BENCH_U=u; BENCH_POD=p; }
@@ -255,12 +293,13 @@ bench_ns() { echo 1; }
 bench_elapsed_ms() { echo 1; }
 cb_until() { :; }
 osb_api() { :; }
-kubectl() { :; }
+kubectl() { printf '{"spec":{"containers":[{"name":"egress","env":[{"name":"OPENSANDBOX_EGRESS_FSB_TLS_CAPACITY","value":"2"}]}]}}'; }
+sup_sample() { printf '{"memory_current":100,"anon":50,"fd":10,"conntrack":2,"usage_usec":0,"nr_throttled":0,"throttled_usec":0,"oom_kill":0,"restarts":0,"identity":"same"}'; }
 cb_guest_once() {
  CB_RC=0; leaf=mitm; [[ "$BENCH_LEG" != credential-bound ]] || leaf=origin
  CB_RESULT="$(printf '{"ok":true,"leaf_sha256":"%s","last":{"status":200,"origin":{"cred":"absent"}}}' "$leaf")"
 }
-sup_fetch() { printf '{"success":2,"attempted":2,"failed":0,"contradictions":0,"released_alive":2,"errors":{},"request_ms":[1,2]}' > "$SUP_RAW/$2.json"; }
+sup_fetch() { printf '{"success":2,"attempted":2,"failed":0,"contradictions":0,"released_alive":2,"verified":2,"errors":{},"request_ms":[1,2]}' > "$SUP_RAW/$2.json"; }
 sup_m7
 cat "$SUP_DIR/m7-credential-bound.json"
 '''
@@ -269,6 +308,7 @@ cat "$SUP_DIR/m7-credential-bound.json"
         out = json.loads(result.stdout[result.stdout.index('{'):])
         self.assertEqual(out['status'], 'OK')
         self.assertTrue(out['passthrough_ok'])
+        self.assertEqual(len(out['tiers']),3)
 
     def test_large_latency_payload_does_not_enter_argv(self):
         raw = Path(self.tmp)/'large.json'
@@ -360,9 +400,10 @@ class AdditionalStatistics(unittest.TestCase):
     def test_expected_burst_denial_and_release_failure(self):
         run = dict(attempted=4, success=2, failed=2, errors={'handshake/tls_closed': 2},
                    contradictions=0, released_alive=2, request_ms=[1, 2])
-        s = dict(runs=[run], recovered=True, passthrough_ok=True, server_budget_denials=2)
+        from test_supplemental_v2 import burst
+        s = burst(); s['runs']=[dict(run,verified=2,group=0)]
         self.assertEqual(r.build('m7', s)['status'], 'OK')
-        run['released_alive'] = 1
+        s['runs'][0]['released_alive'] = 1
         self.assertEqual(r.build('m7', s)['status'], 'PARTIAL')
 
 

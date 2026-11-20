@@ -98,6 +98,21 @@ class Session:
             self.writer = None
 
 
+async def gate_request(args, operation):
+    from urllib.parse import urlsplit
+    url=urlsplit(args.gate_url)
+    reader,writer=await asyncio.open_connection(url.hostname,url.port)
+    writer.write(('GET /%s/%s/%s HTTP/1.0\r\nHost: fixture\r\n\r\n' %
+                  (operation,args.gate_key,args.participant)).encode())
+    await writer.drain()
+    data=await asyncio.wait_for(reader.read(),300)
+    writer.close();await writer.wait_closed()
+    head,body=data.split(b'\r\n\r\n',1)
+    if b' 200 ' not in head.split(b'\r\n')[0]:
+        raise RuntimeError('fixture gate failed')
+    return json.loads(body)
+
+
 async def execute(args):
     ctx = ssl.create_default_context(cafile=args.cafile)
     ctx.set_alpn_protocols(['http/1.1'])
@@ -188,7 +203,13 @@ async def execute(args):
                 if current not in held:
                     await current.close()
     tasks = [asyncio.create_task(worker(i)) for i in range(args.concurrency)]
-    start = time.monotonic()
+    if args.gate_url:
+        release = await gate_request(args,'wait')
+        await asyncio.sleep(max(0,release['start_at_s']-release['server_now_s']))
+        mark = await gate_request(args,'started')
+        result.update(scheduled_start_s=release['start_at_s'],start_at_s=mark['marked_at_s'],
+                      start_lag_s=mark['marked_at_s']-release['start_at_s'])
+    start, cpu = time.monotonic(), time.process_time()
     gate.set()
     await asyncio.gather(*tasks)
     if args.mode == 'burst':
@@ -206,12 +227,14 @@ async def execute(args):
                 pass
             finally:
                 await session.close()
+    result['wall_s'] = time.monotonic()-start
+    result['cpu_s'] = time.process_time()-cpu
+    if args.gate_url:
+        result['end_at_s'] = (await gate_request(args,'finished'))['marked_at_s']
     result['minute_windows'] = [dict(minute=w['minute'], success=w['success'], failed=w['failed'], latency_ms=w.get('latency_ms') or summarize(w.get('request_ms', []))) for w in minute_windows.values()]
     if long_run:
         result['request_histogram_ms'] = hist
         result['latency_resolution_ms'] = .1
-    result['wall_s'] = time.monotonic()-start
-    result['cpu_s'] = time.process_time()-cpu
     save(args.out, result)
     return result
 
@@ -221,6 +244,9 @@ def parse_args(argv=None):
     p.add_argument('mode', choices=['load', 'burst'])
     for key in ['host', 'ip', 'cafile', 'origin-leaf', 'expect-leaf', 'expect-cred', 'out']:
         p.add_argument('--'+key, required=True)
+    p.add_argument('--gate-url',default='')
+    p.add_argument('--gate-key',default='')
+    p.add_argument('--participant',default='guest')
     p.add_argument('--bound-percent', type=int, choices=[0, 5, 100], default=100)
     p.add_argument('--unbound-host', default='')
     p.add_argument('--unbound-leaf', choices=['origin', 'mitm'], default='origin')

@@ -96,7 +96,7 @@ def histogram_summary(hist):
 def run_row(raw):
     fields = ("attempted", "success", "failed", "wall_s", "cpu_s", "concurrency", "connection",
               "body_bytes", "bound_percent", "repeat", "mode", "cpu_limit", "path", "errors",
-              "contradictions", "verified", "leaf", "cred", "connections", "released_alive", "group", "total_concurrency", "latency_resolution_ms", "minute_windows")
+              "contradictions", "verified", "leaf", "cred", "connections", "released_alive", "group", "total_concurrency", "latency_resolution_ms", "minute_windows", "start_at_s", "end_at_s", "scheduled_start_s", "start_lag_s")
     row = {k: raw[k] for k in fields if k in raw}
     row["latency_ms"] = histogram_summary(raw["request_histogram_ms"]) if raw.get("request_histogram_ms") else quantiles(raw.get("request_ms", []))
     row["handshake_ms"] = quantiles(raw.get("handshake_ms", []))
@@ -170,48 +170,122 @@ def saturation_points(groups):
     return results
 
 
+RESOURCE_FIELDS = ("memory_current", "anon", "fd", "conntrack", "usage_usec", "nr_throttled",
+                   "throttled_usec", "oom_kill", "restarts")
+COUNTERS = ("usage_usec", "nr_throttled", "throttled_usec", "oom_kill", "restarts", "origin_cpu_usec")
+
+def resource_status(samples):
+    if not samples:
+        return "MISSING"
+    missing = False
+    previous = None
+    for row in samples:
+        missing |= not row.get("identity") or any(row.get(k) is None for k in RESOURCE_FIELDS)
+        for k in RESOURCE_FIELDS + ("origin_cpu_usec",):
+            v = row.get(k)
+            if v is not None and (type(v) not in (int, float) or not math.isfinite(v) or v < 0):
+                return "INVALID"
+        if previous:
+            if row.get("identity") and previous.get("identity") and row["identity"] != previous["identity"]:
+                return "INVALID"
+            for k in COUNTERS:
+                a, b = previous.get(k), row.get(k)
+                if a is not None and b is not None and (b < a or (k in ("oom_kill", "restarts") and b != a)):
+                    return "INVALID"
+        previous = row
+    return "PARTIAL" if missing else "OK"
+
+
+def resource_recovery(tier):
+    samples = [{k:s.get(k) for k in RESOURCE_FIELDS+("identity","captured_at_s","t_s","phase","release_elapsed_s","origin_cpu_usec") if k in s} for s in tier.get("resource_samples", [])]
+    status = resource_status(samples)
+    fields = ("memory_current", "anon", "fd", "conntrack")
+    baseline = next((s for s in samples if s.get("phase")=="baseline"), None)
+    held = [s for s in samples if s.get("phase")=="held"]
+    released = [s for s in samples if s.get("phase")=="released"]
+    tolerances = tier.get("resource_tolerances", {})
+    recovered = None
+    if baseline and held and released and all(k in tolerances for k in fields):
+        recovered = next((s for s in released if all(isinstance(s.get(k),(int,float)) and
+            isinstance(baseline.get(k),(int,float)) and s[k]-baseline[k] <= tolerances[k] for k in fields)), None)
+    if status == "OK" and recovered is None:
+        status = "PARTIAL"
+    delta = {k: released[-1][k]-baseline[k] for k in fields if baseline and released and
+             isinstance(baseline.get(k),(int,float)) and isinstance(released[-1].get(k),(int,float))}
+    return dict(status=status, samples=samples, tolerances=tolerances, final_delta=delta,
+                recovered=recovered is not None, recovery_s=recovered.get("release_elapsed_s") if recovered else None,
+                timeout_s=tier.get("resource_timeout_s"))
+
+
 def build_m5(spec):
     runs = spec.get("runs", [])
-    # Saturation attribution requires independent CPU evidence; preserve only
-    # measured counters, never guess from RPS alone.
-    windows = [{k: x.get(k) for k in ("egress_start", "egress_end", "origin_cpu_s", "client_cpu_s", "wall_s", "group", "concurrency", "bound_percent")}
+    windows = [{k: x.get(k) for k in ("egress_start", "egress_end", "origin_cpu_s", "wall_s",
+                "group", "concurrency", "bound_percent", "scheduled_start_s", "origin_start_s", "origin_end_s")}
                for x in spec.get("resource_windows", [])]
-    groups = []
+    groups, statuses = [], []
     for group in sorted({x.get("group", 0) for x in runs}):
         members = [x for x in runs if x.get("group", 0)==group]
         first = members[0]
         window = next((w for w in windows if w.get("group")==group), {})
-        wall = window.get("wall_s") or max([x.get("wall_s", 0) for x in members] or [0])
-        cpu = sum(x.get("cpu_s", 0) for x in members)
+        wall = window.get("wall_s") or 0
         e0, e1 = window.get("egress_start") or {}, window.get("egress_end") or {}
-        egress_cores = (e1.get("usage_usec", 0)-e0.get("usage_usec", 0))/1e6/wall if wall else None
+        status = resource_status([e0,e1]) if window else "PARTIAL"
+        if window.get("origin_cpu_s") is not None and window["origin_cpu_s"] < 0:
+            status = "INVALID"
+        if status == "OK" and (wall <= 0 or window.get("origin_cpu_s") is None):
+            status = "PARTIAL"
+        if window.get("origin_start_s") is not None and window.get("origin_end_s") is not None:
+            overlap_origin = max(0,min(e1.get("captured_at_s",0),window["origin_end_s"])-max(e0.get("captured_at_s",0),window["origin_start_s"]))
+            if wall <= 0 or overlap_origin/wall < .90:
+                status = base.worst([status,"PARTIAL"])
+        times = [(x.get("start_at_s"),x.get("end_at_s")) for x in members]
+        overlap = None
+        if all(isinstance(a,(int,float)) and isinstance(b,(int,float)) and b>a for a,b in times):
+            start, end = max(a for a,b in times), min(b for a,b in times)
+            # All processes use a scheduled common start. Also verify overlap
+            # against the sampled steady window, not only against one another.
+            start = max(start, e0.get("captured_at_s",start))
+            end = min(end, e1.get("captured_at_s",end))
+            overlap = max(0,end-start)
+            if not wall or overlap/wall < .90:
+                status = base.worst([status,"PARTIAL"])
+        else:
+            status = base.worst([status,"PARTIAL"])
+        if any(not isinstance(x.get("cpu_s"),(int,float)) or x["cpu_s"]<0 or x.get("wall_s",0)<=0 for x in members):
+            status = base.worst([status,"PARTIAL"])
+        client_cores = sum(x["cpu_s"]/x["wall_s"] for x in members) if all(x.get("wall_s",0)>0 and isinstance(x.get("cpu_s"),(int,float)) for x in members) else None
+        egress_cores = (e1["usage_usec"]-e0["usage_usec"])/1e6/wall if status=="OK" else None
+        origin_cores = window["origin_cpu_s"]/wall if status=="OK" else None
         candidates = []
-        limit = .5 if first.get("cpu_limit")=="500m" else 2
-        throttled = e1.get("nr_throttled", 0)-e0.get("nr_throttled", 0)
-        if egress_cores is not None and egress_cores >= .9*limit and throttled>0:
-            candidates.append("egress")
-        if wall and (window.get("origin_cpu_s") or 0)/wall >= .9:
-            candidates.append("origin")
-        if wall and cpu/wall >= .9*len(members):
-            candidates.append("client")
-        groups.append({"group": group, "mode": first.get("mode"), "cpu_limit": first.get("cpu_limit"),
+        if status == "OK":
+            limit = .5 if first.get("cpu_limit")=="500m" else 2
+            if egress_cores >= .9*limit and e1["nr_throttled"]>e0["nr_throttled"]:
+                candidates.append("egress")
+            if origin_cores >= .9:
+                candidates.append("origin")
+            if client_cores >= .9*len(members):
+                candidates.append("client")
+        status = base.worst([status]+[run_status(x) for x in members])
+        if status != "OK":
+            candidates = []
+        statuses.append(status)
+        groups.append({"group": group, "status":status, "mode": first.get("mode"), "cpu_limit": first.get("cpu_limit"),
                        "concurrency": first.get("total_concurrency"), "connection": first.get("connection"),
                        "body_bytes": first.get("body_bytes"), "bound_percent": first.get("bound_percent"), "repeat": first.get("repeat"),
                        "success": sum(x.get("success", 0) for x in members),
-                       "rps": sum(x.get("success", 0)/x["wall_s"] for x in members if x.get("wall_s", 0)>0),
-                       "egress_cpu_cores": egress_cores, "client_cpu_cores": cpu/wall if wall else None,
-                       "origin_cpu_cores": (window.get("origin_cpu_s") or 0)/wall if wall else None,
-                       "cpu_bottleneck_candidates": candidates,
-                       "latency_ms": quantiles([v for x in members for v in x.get("request_ms", [])]),
-                       "errors": sum(x.get("failed", 0) for x in members)})
-    return {"status": base.worst([run_status(r) for r in runs]), "runs": [run_row(r) for r in runs],
-            "groups": groups, "saturation": saturation_points(groups), "resource_windows": windows,
-            "bottleneck_method": "CPU >=90% of limit (egress also throttled); origin/client >=90% of one core per Python process; candidates require a throughput plateau for attribution"}
+                       "rps": sum(x.get("success",0)/x["wall_s"] for x in members if x.get("wall_s",0)>0),
+                       "egress_cpu_cores":egress_cores, "client_cpu_cores":client_cores, "origin_cpu_cores":origin_cores,
+                       "overlap_s":overlap, "cpu_bottleneck_candidates":candidates,
+                       "latency_ms":quantiles([v for x in members for v in x.get("request_ms",[])]),
+                       "errors":sum(x.get("failed",0) for x in members)})
+    return {"status":base.worst(statuses), "runs":[run_row(r) for r in runs], "groups":groups,
+            "saturation":saturation_points([g for g in groups if g["status"]=="OK"]), "resource_windows":windows,
+            "bottleneck_method":"same scheduled steady window; client CPU divided by each process actual active window; >=90% CPU and egress throttling; only OK groups enter plateau inference"}
 
 
 def build_time(spec):
     samples = [{k: x.get(k) for k in ("t_s", "memory_current", "anon", "usage_usec", "nr_throttled",
-               "throttled_usec", "fd", "conntrack", "oom_kill", "restarts", "origin_cpu_usec")}
+               "throttled_usec", "fd", "conntrack", "oom_kill", "restarts", "origin_cpu_usec", "identity", "captured_at_s")}
                for x in spec.get("samples", [])]
     window = [s for s in samples if s["t_s"] >= spec.get("analysis_start_s", 0)]
     trend = {f: base.least_squares([(s["t_s"], s[f]) for s in window if isinstance(s.get(f), (int, float))])
@@ -219,8 +293,8 @@ def build_time(spec):
     status = "MISSING"
     if samples:
         first, last = samples[0], samples[-1]
-        invalid = any(s.get("oom_kill") != first.get("oom_kill") or s.get("restarts") != first.get("restarts") for s in samples)
-        missing = any(s.get(f) is None for s in samples for f in ("memory_current", "anon", "fd", "oom_kill", "restarts"))
+        invalid = resource_status(samples) == "INVALID"
+        missing = resource_status(samples) != "OK"
         status = "INVALID" if invalid else "PARTIAL" if missing or len(window)<2 or last["t_s"] < spec.get("duration_s", 0) else "OK"
     runs = spec.get("runs", [])
     if runs:
@@ -237,35 +311,58 @@ def build_time(spec):
 
 
 def build_m7(spec):
-    runs = spec.get("runs", [])
-    errors = {}
-    for r in runs:
-        for k, v in r.get("errors", {}).items():
-            errors[k] = errors.get(k, 0)+v
-    status = base.worst([run_status(r) for r in runs])
-    refusal = burst_rejections(errors, spec.get("server_budget_denials", 0))
-    if status != "INVALID" and runs:
-        if spec.get("passthrough_contradictions", 0):
+    runs, tiers = spec.get("runs", []), spec.get("tiers", [])
+    rows, statuses = [], []
+    total_refusal = dict(budget=0, unattributed=0)
+    for i, raw in enumerate(runs):
+        tier = next((t for t in tiers if t.get("group")==raw.get("group",i)), {})
+        refusal = burst_rejections(raw.get("errors",{}),tier.get("server_budget_denials",0))
+        for k in total_refusal:
+            total_refusal[k] += refusal[k]
+        status = run_status(raw)
+        expected, rejects = tier.get("expected_success"), tier.get("expected_rejections")
+        recovery = resource_recovery(tier)
+        success, failed = raw.get("success",0), raw.get("failed",0)
+        budget=tier.get("budget",{})
+        attempted=raw.get("attempted",0)
+        numeric_budget=all(type(budget.get(k)) is int and budget[k]>0 for k in ("per_subject","process","available"))
+        available=min(budget['per_subject'],budget['process']) if numeric_budget and budget.get('admission_enabled') is True else attempted
+        expected_count=min(attempted,available)
+        budget_matches=(numeric_budget and budget.get('available')==available and
+                        expected==[expected_count,expected_count] and rejects==[attempted-expected_count,attempted-expected_count])
+        good = (expected and rejects and success>0 and expected[0]<=success<=expected[1] and
+                rejects[0]<=failed<=rejects[1] and raw.get("attempted")==success+failed and
+                raw.get("verified")==success and raw.get("released_alive")==success and
+                not refusal["unattributed"] and refusal["budget"]==failed and
+                tier.get("passthrough_ok") is True and tier.get("same_subject_passthrough_ok") is True and
+                tier.get("recovered") is True and budget_matches)
+        if raw.get("contradictions") or tier.get("passthrough_contradictions"):
             status = "INVALID"
-        elif (not spec.get("recovered") or spec.get("passthrough_ok") is False
-              or any(r.get("released_alive", r.get("success")) != r.get("success") for r in runs)):
-            status = base.worst([status, "PARTIAL"])
-        elif not refusal["unattributed"] and spec.get("recovered"):
+        elif good:
             status = "OK"
-    same_subject = spec.get("same_subject_passthrough_runs", [])
-    if same_subject:
-        status = base.worst([status]+[run_status(r) for r in same_subject])
-    return {"status": status, "same_subject_passthrough_runs": [run_row(r) for r in same_subject], "runs": [run_row(r) for r in runs], "rejections": refusal,
-            "server_budget_denials": spec.get("server_budget_denials", 0),
-            "established_alive": spec.get("established_alive"), "passthrough_ok": spec.get("passthrough_ok"),
-            "recovered": spec.get("recovered", False), "recovery_ms": spec.get("recovery_ms")}
+        else:
+            status = base.worst([status,"PARTIAL"])
+        status = base.worst([status,recovery["status"] if tier else "PARTIAL"])
+        statuses.append(status)
+        rows.append(dict(group=raw.get("group",i),status=status,budget=tier.get("budget"),
+            expected_success=expected,expected_rejections=rejects,rejections=refusal,
+            passthrough_ok=tier.get("passthrough_ok"),same_subject_passthrough_ok=tier.get("same_subject_passthrough_ok"),
+            injection_recovery_ms=tier.get("injection_recovery_ms"),resource_recovery=recovery))
+    if spec.get("passthrough_contradictions"):
+        statuses.append("INVALID")
+    same_subject = spec.get("same_subject_passthrough_runs",[])
+    statuses.extend(run_status(r) for r in same_subject)
+    return dict(status=base.worst(statuses),runs=[run_row(r) for r in runs],tiers=rows,
+                same_subject_passthrough_runs=[run_row(r) for r in same_subject],rejections=total_refusal,
+                passthrough_ok=all(t.get("passthrough_ok") is True for t in tiers) if tiers else None,
+                recovered=all(t.get("recovered") is True for t in tiers) if tiers else False)
 
 
 def build_m9(spec):
     points, statuses = [], []
     for p in spec.get("points", []):
         row = {k: p.get(k) for k in ("target", "registered", "acked", "active", "capacity_rejections",
-                    "registration_ms", "activation_ms", "memory_current", "anon", "usage_usec", "nft_rules")}
+                    "registration_ms", "activation_ms", "memory_current", "anon", "usage_usec", "nft_rules", "nft_enumeration", "driver_cost", "resource_sample")}
         counts = [p.get(k, 0) for k in ("registered", "acked", "active")]
         target = p["target"]
         expected = min(target, 4096)
@@ -286,9 +383,10 @@ def build_m9(spec):
         statuses.append("PARTIAL")
     return {"status": base.worst(statuses), "recovery_ok": spec.get("recovery_ok"), "points": points, "cleanup_ok": bool(spec.get("cleanup_ok")),
             "real_connections": spec.get("real_connections", {"status": "NOT_RUN"}),
-            "per_subject_fit": {field: base.least_squares([(p["acked"], p[field]) for p in points
+            ("egress_per_subject_fit" if spec.get("resource_scope")=="egress_only_external_driver" else "container_total_including_fixture_fit"): {field: base.least_squares([(p["acked"], p[field]) for p in points
                 if p["status"]=="OK" and p["target"]<=4096 and isinstance(p.get(field), (int, float))])
                 for field in ("memory_current", "anon")},
+            "resource_scope":spec.get("resource_scope","container_total_including_fixture"),
             "ack_method": "successful data-plane-ready is gated by the current registration/fence/generation/digest ACK"}
 
 

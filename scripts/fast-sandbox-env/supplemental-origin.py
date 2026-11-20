@@ -38,6 +38,7 @@ import resource
 import ssl
 import sys
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -132,6 +133,41 @@ def build_server(port, cert, key, host="0.0.0.0"):
     return server
 
 
+class GateHandler(BaseHTTPRequestHandler):
+    """Fixture-only coordination on a separate plain HTTP port."""
+    def do_GET(self):
+        parts = self.path.strip('/').split('/')
+        if len(parts)!=3:
+            self.send_error(400); return
+        operation,key,participant=parts
+        with self.server.condition:
+            gate=self.server.gates.setdefault(key,dict(ready=set(),start_at=None,marks={}))
+            if operation=='wait':
+                gate['ready'].add(participant)
+                if not self.server.condition.wait_for(lambda:gate['start_at'] is not None,timeout=300):
+                    self.send_error(408); return
+            elif operation=='release':
+                gate['start_at']=time.time()+2
+                self.server.condition.notify_all()
+            elif operation in ('started','finished'):
+                gate['marks'][participant+'-'+operation]=time.time()
+            elif operation!='status':
+                self.send_error(400); return
+            result=dict(ready=len(gate['ready']),start_at_s=gate['start_at'],server_now_s=time.time(),
+                        marked_at_s=gate['marks'].get(participant+'-'+operation))
+        body=json.dumps(result).encode()
+        self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+
+    def log_message(self,*args):
+        pass
+
+
+def build_gate_server(port=18081,host='0.0.0.0'):
+    server=ThreadingHTTPServer((host,port),GateHandler)
+    server.daemon_threads=True;server.gates={};server.condition=threading.Condition()
+    return server
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=443)
@@ -144,6 +180,8 @@ def main(argv=None):
     server = build_server(args.port, args.cert, args.key, args.host)
     sys.stdout.write("credential-bound origin ready\n")
     sys.stdout.flush()
+    gate=build_gate_server()
+    threading.Thread(target=gate.serve_forever,daemon=True).start()
     server.serve_forever()
     return 0
 
