@@ -95,9 +95,9 @@ sup_fetch() { # id name -> file
 }
 
 sup_append_run() { # key raw-file path concurrency connection body repeat cpu
-	bench_json_set "$SUP_RAW/$1-spec.json" '.runs += [$raw + {path:$path,mode:$mode,concurrency:$c,connection:$conn,body_bytes:$body,repeat:$rep,cpu_limit:$cpu}]' \
+	bench_json_set "$SUP_RAW/$1-spec.json" '.runs += [$raw + {path:$path,mode:$mode,concurrency:$c,connection:$conn,body_bytes:$body,repeat:$rep,cpu_limit:$cpu,group:$group,total_concurrency:$total}]' \
 		--argjson raw "$(cat "$2")" --arg path "$3" --arg mode "$BENCH_LEG" --argjson c "$4" --arg conn "$5" \
-		--argjson body "$6" --argjson rep "$7" --arg cpu "$8"
+		--argjson body "$6" --argjson rep "$7" --arg cpu "$8" --argjson group "$SUP_SEQ" --argjson total "$SUP_TOTAL_CONCURRENCY"
 }
 
 sup_load_pair() { # measurement concurrency connection seconds body repeat cpu mix
@@ -105,6 +105,7 @@ sup_load_pair() { # measurement concurrency connection seconds body repeat cpu m
 		start end wall t0 i n name phase duration rate
 	local -a ids=("$BENCH_B") names=() counts=()
 	if [[ "$key" == m5 ]]; then ids=("${SUP_LOAD_IDS[@]}"); fi
+	SUP_TOTAL_CONCURRENCY="$c"
 	for phase in warm measured; do
 		duration="$seconds"; [[ "$phase" != warm ]] || duration="$SUP_WARMUP_S"
 		start="$(sup_sample)"; t0="$(bench_ns)"
@@ -121,8 +122,8 @@ sup_load_pair() { # measurement concurrency connection seconds body repeat cpu m
 		done
 		if [[ "$phase" == measured ]]; then
 			end="$(sup_sample)"; wall="$(bench_elapsed_ms "$t0")"
-			bench_json_set "$SUP_RAW/$key-spec.json" '.resource_windows = ((.resource_windows // []) + [{egress_start:$s,egress_end:$e,origin_cpu_s:(($e.origin_cpu_usec-$s.origin_cpu_usec)/1000000),wall_s:($w/1000),concurrency:$c,bound_percent:$mix}])' \
-				--argjson s "$start" --argjson e "$end" --argjson w "$wall" --argjson c "$c" --argjson mix "$mix"
+			bench_json_set "$SUP_RAW/$key-spec.json" '.resource_windows = ((.resource_windows // []) + [{egress_start:$s,egress_end:$e,origin_cpu_s:(($e.origin_cpu_usec-$s.origin_cpu_usec)/1000000),wall_s:($w/1000),concurrency:$c,bound_percent:$mix,group:$group}])' \
+				--argjson s "$start" --argjson e "$end" --argjson w "$wall" --argjson c "$c" --argjson mix "$mix" --argjson group "$SUP_SEQ"
 		fi
 	done
 	SUP_SEQ=$((SUP_SEQ+1))
@@ -271,7 +272,8 @@ sup_time() { # m6 or m8 on both modes
 }
 
 sup_m7() {
-	local mode burst name since denials t0 key=m7
+	local mode burst name since denials t0 key=m7 leaf p_ok bad
+	SUP_TOTAL_CONCURRENCY=0
 	for mode in all credential-bound; do
 		sup_spec m7; sup_pool "$mode" 500m; sup_pair
 		for burst in $SUP_BURSTS; do
@@ -281,9 +283,14 @@ sup_m7() {
 			bench_wait "$SUP_CLIENT_ATTEMPTS" bench_guest_fetch "$BENCH_B" "$CB_GUEST_DIR/$name-ready.json" "$SUP_RAW/$name-ready.json" || fail "M7 burst readiness missing"
 			# An established successful bound socket remains held during the U probe.
 			cb_guest_once "$BENCH_U" m7-passthrough
-			bench_json_set "$SUP_RAW/m7-spec.json" '.passthrough_ok=$ok' --argjson ok "$([[ "$CB_RC" == 0 ]] && echo true || echo false)"
+			leaf=mitm; [[ "$mode" != credential-bound ]] || leaf=origin
+			bad="$(jq --arg origin "$CB_ORIGIN_LEAF" --arg leaf "$leaf" 'if (.last.origin.cred != null and .last.origin.cred != "absent") or (.leaf_sha256 != null and ((.leaf_sha256==$origin) != ($leaf=="origin"))) then 1 else 0 end' <<< "${CB_RESULT:-{}}")"
+			p_ok=false
+			if [[ "$CB_RC" == 0 && "$bad" == 0 ]]; then p_ok=true; fi
+			bench_json_set "$SUP_RAW/m7-spec.json" '.passthrough_ok=$ok | .passthrough_contradictions=$bad' --argjson ok "$p_ok" --argjson bad "$bad"
 			osb_api command run "$BENCH_B" -- touch "$CB_GUEST_DIR/$name-go" >/dev/null
 			sup_fetch "$BENCH_B" "$name"
+			SUP_TOTAL_CONCURRENCY="$burst"
 			sup_append_run m7 "$SUP_RAW/$name.json" bound "$burst" keep-alive 0 1 500m
 			denials="$(kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress --since-time="$since" | grep -c 'tls-admission-v1 deny registry_exhausted' || true)"
 			bench_json_set "$SUP_RAW/m7-spec.json" '.server_budget_denials=((.server_budget_denials // 0)+$n) | .established_alive=$a' \
@@ -371,7 +378,7 @@ supplemental_bench() {
 	SUP_CLIENT_ATTEMPTS="${SUP_CLIENT_ATTEMPTS:-7200}"
 	SUP_LOAD_GUESTS="${SUP_LOAD_GUESTS:-4}"; SUP_LOAD_IDS=()
 	SUP_CHURN_EVERY=0; SUP_RATE_U="${SUP_RATE_U:-0}"; SUP_RATE_B="${SUP_RATE_B:-0}"; SUP_SEQ=0
-	export SUP_SMOKE SUP_MEASUREMENTS SUP_CPU_LIMITS SUP_CONCURRENCIES SUP_BODY_BYTES SUP_REPEATS SUP_LOAD_S SUP_WARMUP_S SUP_IDLE_S SUP_CHURN_S SUP_SOAK_S SUP_SOAK_ANALYSIS_S SUP_SOAK_CONCURRENCY SUP_RECOVERY_S SUP_BURSTS SUP_SUBJECT_STEPS SUP_SCALE_PROBES SUP_BLOCKS SUP_CLIENT_ATTEMPTS
+	export SUP_SMOKE SUP_MEASUREMENTS SUP_CPU_LIMITS SUP_CONCURRENCIES SUP_BODY_BYTES SUP_REPEATS SUP_LOAD_S SUP_WARMUP_S SUP_IDLE_S SUP_CHURN_S SUP_SOAK_S SUP_SOAK_ANALYSIS_S SUP_SOAK_CONCURRENCY SUP_RECOVERY_S SUP_BURSTS SUP_SUBJECT_STEPS SUP_SCALE_PROBES SUP_BLOCKS SUP_CLIENT_ATTEMPTS SUP_RATE_B SUP_LOAD_GUESTS
 	python3 "$SUP_SELF_DIR/supplemental-tools.py" validate || die "invalid supplemental parameters"
 	bench_validate_knobs
 	load_mitm_ca_fingerprint; bench_load_template_id

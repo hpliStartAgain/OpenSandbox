@@ -11,6 +11,7 @@ import copy
 import asyncio
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import ssl
@@ -41,6 +42,14 @@ def save(path, result):
     tmp = str(path)+'.tmp'
     Path(tmp).write_text(json.dumps(result, separators=(',', ':')))
     os.replace(tmp, path)
+
+
+def summarize(values):
+    ordered = sorted(values)
+    n = len(ordered)
+    if not n:
+        return {'n': 0}
+    return dict(n=n, mean=sum(ordered)/n, **{'p'+str(p).replace('.', '_'): ordered[max(0, math.ceil(n*p/100)-1)] for p in [50, 90, 99, 99.9]})
 
 
 class Session:
@@ -97,10 +106,18 @@ async def execute(args):
     gate = asyncio.Event()
     held = []
     request_sequence = 0
+    minute_windows = {}
+    hist = {}
+    long_run = args.duration > 120
 
     async def once(session):
         result['attempted'] += 1
         t0 = time.monotonic()
+        minute = int((t0-start)//60)
+        window = minute_windows.setdefault(minute, {'minute': minute, 'success': 0, 'failed': 0, 'request_ms': []})
+        for old_minute, old in minute_windows.items():
+            if old_minute < minute-1 and 'latency_ms' not in old:
+                old['latency_ms'] = summarize(old.pop('request_ms'))
         phase = 'handshake'
         try:
             if session.writer is None:
@@ -114,12 +131,20 @@ async def execute(args):
                 result['contradictions'] += 1
             result['success'] += 1
             result['verified'] += int(good)
-            result['request_ms'].append(round((time.monotonic()-t0)*1000, 3))
+            latency = round((time.monotonic()-t0)*1000, 3)
+            window['success'] += 1
+            window['request_ms'].append(latency)
+            if long_run:
+                bin_ms = str(round(latency, 1))
+                hist[bin_ms] = hist.get(bin_ms, 0)+1
+            else:
+                result['request_ms'].append(latency)
             return good
         except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError) as exc:
             key = error_kind(exc, phase)
             result['errors'][key] = result['errors'].get(key, 0)+1
             result['failed'] += 1
+            window['failed'] += 1
             await session.close()
             return False
 
@@ -150,7 +175,8 @@ async def execute(args):
                     await once(session)
                     count += 1
                     if args.connection == 'new' or (args.churn_every and count % args.churn_every == 0):
-                        await session.close()
+                        for current in sessions.values():
+                            await current.close()
                     if args.rate:
                         # Per-worker fixed offered rate, no catch-up bursts.
                         await asyncio.sleep(args.concurrency/args.rate)
@@ -177,6 +203,10 @@ async def execute(args):
                 pass
             finally:
                 await session.close()
+    result['minute_windows'] = [dict(minute=w['minute'], success=w['success'], failed=w['failed'], latency_ms=w.get('latency_ms') or summarize(w.get('request_ms', []))) for w in minute_windows.values()]
+    if long_run:
+        result['request_histogram_ms'] = hist
+        result['latency_resolution_ms'] = .1
     result['wall_s'] = time.monotonic()-start
     result['cpu_s'] = time.process_time()-cpu
     save(args.out, result)

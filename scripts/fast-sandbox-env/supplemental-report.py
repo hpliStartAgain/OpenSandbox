@@ -76,12 +76,28 @@ def burst_rejections(errors, server_denials):
     return {"budget": attributed, "unattributed": sum(errors.values())-attributed}
 
 
+def histogram_summary(hist):
+    points = sorted((float(k), v) for k, v in hist.items())
+    n = sum(v for _, v in points)
+    if not n:
+        return {"n": 0}
+    out = {"n": n, "mean": sum(k*v for k, v in points)/n}
+    for pct, label in [(50, "p50"), (90, "p90"), (99, "p99"), (99.9, "p99_9")]:
+        rank = math.ceil(n*pct/100); count = 0
+        for value, number in points:
+            count += number
+            if count >= rank:
+                out[label] = value
+                break
+    return out
+
+
 def run_row(raw):
     fields = ("attempted", "success", "failed", "wall_s", "cpu_s", "concurrency", "connection",
               "body_bytes", "bound_percent", "repeat", "mode", "cpu_limit", "path", "errors",
-              "contradictions", "verified", "leaf", "cred", "connections", "released_alive")
+              "contradictions", "verified", "leaf", "cred", "connections", "released_alive", "group", "total_concurrency", "latency_resolution_ms", "minute_windows")
     row = {k: raw[k] for k in fields if k in raw}
-    row["latency_ms"] = quantiles(raw.get("request_ms", []))
+    row["latency_ms"] = histogram_summary(raw["request_histogram_ms"]) if raw.get("request_histogram_ms") else quantiles(raw.get("request_ms", []))
     row["handshake_ms"] = quantiles(raw.get("handshake_ms", []))
     wall = raw.get("wall_s", 0)
     row["rps"] = raw.get("success", 0)/wall if wall > 0 else None
@@ -122,14 +138,66 @@ def build_m3x(spec):
     return {"status": base.worst(statuses), "paths": paths, "mixtures": mixtures}
 
 
+def saturation_points(groups):
+    configurations = {}
+    for g in groups:
+        config = tuple(g.get(k) for k in ("mode", "cpu_limit", "connection", "body_bytes", "bound_percent"))
+        if g.get("concurrency") is not None:
+            configurations.setdefault(config, {}).setdefault(g["concurrency"], []).append(g)
+    results = []
+    for config, levels in configurations.items():
+        ordered = sorted(levels)
+        row = dict(zip(("mode", "cpu_limit", "connection", "body_bytes", "bound_percent"), config))
+        row.update(status="NOT_ESTABLISHED", concurrency=None, rps=None, bottleneck=[])
+        for previous, current in zip(ordered, ordered[1:]):
+            low = statistics.mean(g["rps"] for g in levels[previous])
+            high = statistics.mean(g["rps"] for g in levels[current])
+            if current >= previous*2 and low > 0 and high/low < 1.1:
+                row.update(status="OBSERVED_PLATEAU", concurrency=previous, rps=low,
+                           next_concurrency=current, throughput_gain=high/low-1,
+                           bottleneck=sorted({v for g in levels[current] for v in g["cpu_bottleneck_candidates"]}))
+                break
+        results.append(row)
+    return results
+
+
 def build_m5(spec):
     runs = spec.get("runs", [])
     # Saturation attribution requires independent CPU evidence; preserve only
     # measured counters, never guess from RPS alone.
-    windows = [{k: x.get(k) for k in ("egress_start", "egress_end", "origin_cpu_s", "client_cpu_s", "wall_s")}
+    windows = [{k: x.get(k) for k in ("egress_start", "egress_end", "origin_cpu_s", "client_cpu_s", "wall_s", "group", "concurrency", "bound_percent")}
                for x in spec.get("resource_windows", [])]
+    groups = []
+    for group in sorted({x.get("group", 0) for x in runs}):
+        members = [x for x in runs if x.get("group", 0)==group]
+        first = members[0]
+        window = next((w for w in windows if w.get("group")==group), {})
+        wall = window.get("wall_s") or max([x.get("wall_s", 0) for x in members] or [0])
+        cpu = sum(x.get("cpu_s", 0) for x in members)
+        e0, e1 = window.get("egress_start") or {}, window.get("egress_end") or {}
+        egress_cores = (e1.get("usage_usec", 0)-e0.get("usage_usec", 0))/1e6/wall if wall else None
+        candidates = []
+        limit = .5 if first.get("cpu_limit")=="500m" else 2
+        throttled = e1.get("nr_throttled", 0)-e0.get("nr_throttled", 0)
+        if egress_cores is not None and egress_cores >= .9*limit and throttled>0:
+            candidates.append("egress")
+        if wall and (window.get("origin_cpu_s") or 0)/wall >= .9:
+            candidates.append("origin")
+        if wall and cpu/wall >= .9*len(members):
+            candidates.append("client")
+        groups.append({"group": group, "mode": first.get("mode"), "cpu_limit": first.get("cpu_limit"),
+                       "concurrency": first.get("total_concurrency"), "connection": first.get("connection"),
+                       "body_bytes": first.get("body_bytes"), "bound_percent": first.get("bound_percent"), "repeat": first.get("repeat"),
+                       "success": sum(x.get("success", 0) for x in members),
+                       "rps": sum(x.get("success", 0)/x["wall_s"] for x in members if x.get("wall_s", 0)>0),
+                       "egress_cpu_cores": egress_cores, "client_cpu_cores": cpu/wall if wall else None,
+                       "origin_cpu_cores": (window.get("origin_cpu_s") or 0)/wall if wall else None,
+                       "cpu_bottleneck_candidates": candidates,
+                       "latency_ms": quantiles([v for x in members for v in x.get("request_ms", [])]),
+                       "errors": sum(x.get("failed", 0) for x in members)})
     return {"status": base.worst([run_status(r) for r in runs]), "runs": [run_row(r) for r in runs],
-            "resource_windows": windows, "bottleneck": "requires CPU and concurrency curve analysis"}
+            "groups": groups, "saturation": saturation_points(groups), "resource_windows": windows,
+            "bottleneck_method": "CPU >=90% of limit (egress also throttled); origin/client >=90% of one core per Python process; candidates require a throughput plateau for attribution"}
 
 
 def build_time(spec):
@@ -151,7 +219,10 @@ def build_time(spec):
     recovery = spec.get("recovery") or {}
     delta = {f: recovery[f]-samples[0][f] for f in ("memory_current", "anon", "fd")
              if samples and isinstance(recovery.get(f), (int, float)) and isinstance(samples[0].get(f), (int, float))}
-    return {"status": status, "samples": samples, "analysis_start_s": spec.get("analysis_start_s", 0),
+    minute_windows = [w for raw in runs for w in raw.get("minute_windows", [])]
+    usable = [w.get("latency_ms", {}).get("p50") for w in minute_windows if w.get("latency_ms", {}).get("n", 0)>0]
+    drift = ((usable[-1]-usable[0])/usable[0]*100) if len(usable)>1 and usable[0] else None
+    return {"status": status, "samples": samples, "latency_p50_drift_percent": drift, "analysis_start_s": spec.get("analysis_start_s", 0),
             "trend": trend, "recovery_delta": delta, "runs": [run_row(r) for r in runs],
             "slope_unit": "bytes/second for memory, descriptors/second for FD"}
 
@@ -164,8 +235,14 @@ def build_m7(spec):
             errors[k] = errors.get(k, 0)+v
     status = base.worst([run_status(r) for r in runs])
     refusal = burst_rejections(errors, spec.get("server_budget_denials", 0))
-    if status != "INVALID" and runs and not spec.get("recovered"):
-        status = base.worst([status, "PARTIAL"])
+    if status != "INVALID" and runs:
+        if spec.get("passthrough_contradictions", 0):
+            status = "INVALID"
+        elif (not spec.get("recovered") or spec.get("passthrough_ok") is False
+              or any(r.get("released_alive", r.get("success")) != r.get("success") for r in runs)):
+            status = base.worst([status, "PARTIAL"])
+        elif not refusal["unattributed"] and spec.get("recovered"):
+            status = "OK"
     return {"status": status, "runs": [run_row(r) for r in runs], "rejections": refusal,
             "server_budget_denials": spec.get("server_budget_denials", 0),
             "established_alive": spec.get("established_alive"), "passthrough_ok": spec.get("passthrough_ok"),
@@ -190,8 +267,16 @@ def build_m9(spec):
         points.append(row); statuses.append(status)
     if points and not spec.get("cleanup_ok"):
         statuses.append("PARTIAL")
-    return {"status": base.worst(statuses), "points": points, "cleanup_ok": bool(spec.get("cleanup_ok")),
+    real = spec.get("real_connections") or {}
+    if real.get("status") in ("INVALID", "FAILED", "MISSING", "PARTIAL"):
+        statuses.append(real["status"])
+    if spec.get("recovery_ok") is False:
+        statuses.append("PARTIAL")
+    return {"status": base.worst(statuses), "recovery_ok": spec.get("recovery_ok"), "points": points, "cleanup_ok": bool(spec.get("cleanup_ok")),
             "real_connections": spec.get("real_connections", {"status": "NOT_RUN"}),
+            "per_subject_fit": {field: base.least_squares([(p["acked"], p[field]) for p in points
+                if p["status"]=="OK" and p["target"]<=4096 and isinstance(p.get(field), (int, float))])
+                for field in ("memory_current", "anon")},
             "ack_method": "successful data-plane-ready is gated by the current registration/fence/generation/digest ACK"}
 
 

@@ -99,6 +99,116 @@ class Reports(unittest.TestCase):
         self.assertEqual(out['status'], 'PARTIAL')
         self.assertIsNone(out['paths'][0]['fit']['anon']['slope'])
 
+# Real TLS fixtures: exercise the supplemental client on disposable loopback.
+import os
+import subprocess
+import sys
+import time
+from test_credential_bound_helpers import OriginFixture, der_sha256, wait_json
+from test_credential_bound import ShellCase
+
+
+class SupplementalClientTest(OriginFixture):
+    def probe(self, mode='load', **kwargs):
+        out = os.path.join(self.tmp, 'supplemental-out.json')
+        args = [sys.executable, str(ROOT/'supplemental-client.py'), mode, '--host', 'echo.test',
+                '--ip', '127.0.0.1', '--port', str(self.port), '--cafile', self.ca,
+                '--origin-leaf', der_sha256(self.leaf), '--expect-leaf', 'origin',
+                '--expect-cred', 'absent', '--out', out, '--duration', '.2', '--timeout', '2']
+        for k, v in kwargs.items():
+            args += ['--'+k.replace('_', '-'), str(v)]
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=15)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(Path(out).read_text())
+
+    def test_new_connections_and_keepalive(self):
+        for connection in ['new', 'keep-alive']:
+            out = self.probe(connection=connection, concurrency=2)
+            self.assertGreater(out['success'], 0)
+            self.assertEqual(out['verified'], out['success'])
+            self.assertEqual(out['failed'], 0)
+            if connection == 'new':
+                self.assertEqual(out['connections'], out['success'])
+            else:
+                self.assertEqual(out['connections'], 2)
+
+    def test_burst_release_uses_the_held_connections(self):
+        out = self.probe(mode='burst', concurrency=4, hold_s=.1)
+        self.assertEqual(out['attempted'], 4)
+        self.assertEqual(out['success'], 4)
+        self.assertEqual(out['released_alive'], 4)
+
+    def test_wrong_leaf_invalid_and_bad_ca_is_classified(self):
+        out = self.probe(expect_leaf='mitm')
+        self.assertGreater(out['contradictions'], 0)
+        out = self.probe(cafile=self.other_ca)
+        self.assertEqual(out['success'], 0)
+        self.assertGreater(out['errors']['handshake/verify_failed'], 0)
+
+    def test_mixed_hostnames_are_selected_and_classified(self):
+        out = self.probe(bound_percent=5, unbound_host='echo.test', unbound_leaf='origin')
+        self.assertGreater(out['success'], 0)
+        self.assertEqual(out['contradictions'], 0)
+
+
+class SupplementalShellTest(ShellCase):
+    def test_source_does_not_change_default_pool_render(self):
+        body = 'TEMPLATE_ID=tpl-1; render_pool; cp "$GEN_DIR/$POOL_PROFILE.yaml" "$WORK/before"; source "$SCRIPT_DIR/supplemental-bench.sh"; render_pool; cmp "$WORK/before" "$GEN_DIR/$POOL_PROFILE.yaml"'
+        self.assertEqual(self.sourced(body, OCI_STACK='0').returncode, 0)
+
+    def test_measurements_are_opt_in(self):
+        workflow = (ROOT.parents[1]/'.github/workflows/fast-sandbox-test.yml').read_text()
+        self.assertNotIn('bench-supplemental', workflow)
+        source = (ROOT/'integration-env.sh').read_text()
+        self.assertIn('bench-supplemental)', source)
+
+
+class SupplementalGlueTest(unittest.TestCase):
+    def test_segments_pair_by_subject_and_discard_identity(self):
+        sp = importlib.util.spec_from_file_location('supplemental_tools', ROOT/'supplemental-tools.py')
+        tools = importlib.util.module_from_spec(sp); sp.loader.exec_module(tools)
+        out = tools.segments('subject s-private: SET_BINDING applied (state=ready) total=8ms denyFirstInstall=3ms policyCommit=5ms\nsubject s-private: data-plane-ready, policy active applyPolicy=4ms\nsubject s-other: data-plane-ready, policy active applyPolicy=99ms')
+        self.assertEqual(out['matched_subjects'], 1)
+        self.assertEqual(out['incomplete_subjects'], 1)
+        self.assertEqual(out['distributions']['total']['p50'], 8)
+        self.assertNotIn('s-private', json.dumps(out))
+
+    def test_synthetic_identity_uniqueness_and_fences(self):
+        sp = importlib.util.spec_from_file_location('supplemental_subjects', ROOT/'supplemental-subjects.py')
+        m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+        a, b = m.envelope('run', 0, 'SET_BINDING'), m.envelope('run', 1, 'SET_BINDING')
+        self.assertNotEqual(a['sandbox']['uid'], b['sandbox']['uid'])
+        self.assertNotEqual(a['attachment']['network']['ip'], b['attachment']['network']['ip'])
+        self.assertNotEqual(a['revision']['attachmentId'], b['revision']['attachmentId'])
+
+class AdditionalStatistics(unittest.TestCase):
+    def test_histogram_nearest_rank(self):
+        out = r.histogram_summary({'1.0': 2, '10.0': 1})
+        self.assertEqual(out['p50'], 1)
+        self.assertEqual(out['p99_9'], 10)
+        self.assertEqual(out['mean'], 4)
+
+    def test_plateau_requires_a_concurrency_increase(self):
+        groups = [dict(mode='all', cpu_limit='500m', connection='new', body_bytes=0, bound_percent=100,
+                       concurrency=c, rps=v, cpu_bottleneck_candidates=['egress']) for c, v in [(1, 100), (4, 400), (16, 410)]]
+        out = r.saturation_points(groups)
+        self.assertEqual(out[0]['status'], 'OBSERVED_PLATEAU')
+        self.assertEqual(out[0]['concurrency'], 4)
+        self.assertEqual(out[0]['bottleneck'], ['egress'])
+
+    def test_m9_real_contradiction_propagates(self):
+        out = r.build('m9', {'points': [{'target': 4, 'registered': 4, 'acked': 4, 'active': 4}],
+                             'cleanup_ok': True, 'real_connections': {'status': 'INVALID'}})
+        self.assertEqual(out['status'], 'INVALID')
+
+    def test_expected_burst_denial_and_release_failure(self):
+        run = dict(attempted=4, success=2, failed=2, errors={'handshake/tls_closed': 2},
+                   contradictions=0, released_alive=2, request_ms=[1, 2])
+        s = dict(runs=[run], recovered=True, passthrough_ok=True, server_budget_denials=2)
+        self.assertEqual(r.build('m7', s)['status'], 'OK')
+        run['released_alive'] = 1
+        self.assertEqual(r.build('m7', s)['status'], 'PARTIAL')
+
 
 if __name__ == '__main__':
     unittest.main()
