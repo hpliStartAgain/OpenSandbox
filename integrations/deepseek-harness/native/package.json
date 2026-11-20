@@ -35,7 +35,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "node scripts/build.mjs --check",
-    "test": "node scripts/stage.mjs && vitest run --config vitest.config.ts",
+    "test": "node scripts/stage.mjs && vitest run --config vitest.config.ts && node --test scripts/check-live-web.test.mjs",
     "pack:check": "pnpm run build && node scripts/pack-check.mjs",
     "test:profile": "pnpm run build && node scripts/profile-check.mjs",
     "prepack": "pnpm run build",

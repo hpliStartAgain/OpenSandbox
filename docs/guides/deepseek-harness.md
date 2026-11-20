@@ -201,3 +201,30 @@ pnpm run test:browser
 ```
 
 `pack:check` validates the artifact allowlist and unchanged shared source/Python helper bytes. `test:profile` starts with an ordinary actual native CLI installation and exercises the host entry with offline fixtures; it is not a browser test. `test:browser` separately loads the real Web UI from an ordinary installed tarball. Browser binaries are a development/CI prerequisite, not part of the published bundle. The native bundle intentionally receives framework peers from the DSH host; this is not a standalone npm Agent application. No special peer-resolution flags or consumer overrides are used. The separate embedded package retains its strict standalone npm tarball-consumer check. Registry access is required; these checks do not provision a sandbox or call a real model.
+
+### Check an installed native Web profile on ACK
+
+Use the actual Web UI and configured model for tool calls, and a second terminal for independent SDK observations. From the native package directory, run `pnpm install --frozen-lockfile && pnpm run build`. Give the terminal the same `OPENSANDBOX_DOMAIN`, `OPENSANDBOX_API_KEY`, `OPENSANDBOX_TEMPLATE_ID`, protocol (`OPENSANDBOX_PROTOCOL`, default HTTPS) and workspace (`DSH_REMOTE_CWD`, default `/tmp`) as the profile. Confirm with the operator that the template and the SDK-returned execd endpoint use the target ACK deployment and its normal Ingress. Record DSH, plugin, SDK and deployed execd versions. The checker connects only to IDs you supply; selecting the deployment and creating or deleting sandboxes remain operator actions.
+
+1. Take a disposable sandbox provisioned from that template. Run `node scripts/check-live-web.mjs preflight "$PROBE_ID"`. This sends a harmless argv command with one argument containing spaces and checks the returned bytes as text. An HTTP 400 at this stage warrants checking the deployed execd. Clean up the probe before the session checks.
+2. Set `RUN=$(node scripts/check-live-web.mjs new-run)` and print its value for the Web prompts. Substitute its literal value for `RUN` below, including in filenames. Open a new Web session A with preset `opensandbox`. Check the lifecycle API or the deployment audit log for zero creates attributable to A before using tools. Have the Agent use **write first** to create `dsh-RUN.a` containing exactly `A RUN` followed by one newline. Ask for `opensandbox_status` and record the ID as `A`. Run `node scripts/check-live-web.mjs seed "$RUN" "$A"`. It verifies the marker, uploads a small input and reads it back.
+3. In the same session, ask the Agent to run `tr '[:lower:]' '[:upper:]' < dsh-RUN.in > dsh-RUN.out` in the remote workspace. Confirm status still reports A. In a separate new Web session B, write `dsh-RUN.b` containing `B RUN` and one newline, check that A’s marker is absent and record B’s ID. Exercise explicit reconnect to A in its original session and read its original marker again. Retain these Web observations alongside the SDK output.
+4. Run `node scripts/check-live-web.mjs verify "$RUN" "$A" "$B"`. It independently reads A’s marker and output, checks the output bytes, reports SHA-256, verifies B’s marker and checks that A’s files are absent in B. After it prints the cleanup prompt, explicitly delete each sandbox in its own Web session with the matching confirmation ID. The checker polls both previously verified IDs for up to three minutes (plus an in-flight request) and requires a lifecycle 404 for each. Save its output with the observation of the two explicit delete requests. A 404 alone can also result from TTL expiry. If a stage fails, independently inspect and clean up the known test IDs.
+
+### Record native first-tool latency
+
+Use fresh sessions on the same deployed path. Record one sample per first tool attempt, including failed attempts. For each session use timestamps from one monotonic clock in the DSH host. An operator with a Node debugger attached locally to the test host can use non-pausing logpoints on the installed plugin: capture `performance.now()` immediately before `route.acquire(exec.signal)` in the native tool wrapper, immediately after the SDK's `waitUntilReady` resolves in `core/binding.js`, and after the first stock tool finishes successfully. Correlate the wrapper's `route.status().sessionId` with the binding's `options.sessionId`; record a tool error, timeout or unconfirmed result as failed. Use one first tool per session and run separate sessions concurrently to measure concurrency. The timing excludes model deliberation before the first tool. Verify actual cache state and prewarmed capacity with the operator; use `unknown` and `null` when unavailable.
+
+Run `node scripts/summarize-web-startup.mjs samples.json` for each deployment/template/cache/concurrency condition. Keep the raw samples and the profile and runtime versions with the report. The input below illustrates the format using synthetic timestamps:
+
+```json
+{
+  "templateId": "test-template", "cache": "warm", "concurrency": 1, "prewarmedCapacity": 2,
+  "samples": [
+    { "session": "a", "startMs": 100, "readyMs": 190, "successMs": 250, "outcome": "passed" },
+    { "session": "b", "startMs": 500, "outcome": "failed" }
+  ]
+}
+```
+
+The report includes attempts and failures, plus count, nearest-rank p50/p95 and maximum for each observed latency. A failed tool may still contribute a readiness observation. Collect multiple samples per condition and report the sample counts with the percentiles.
