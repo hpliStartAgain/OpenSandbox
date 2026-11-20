@@ -33,7 +33,8 @@ def wait_until(at):
 
 
 def run(a):
-    with urllib.request.urlopen(a.gate_url+'/wait/'+a.gate_key+'/'+a.participant,timeout=300) as response:
+    opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(a.gate_url+'/wait/'+a.gate_key+'/'+a.participant,timeout=300) as response:
         release=json.load(response)
     # All containers on this host share CLOCK_REALTIME. Guests use the
     # fixture timestamp to translate the gate into their monotonic clock.

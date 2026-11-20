@@ -98,7 +98,8 @@ def lifetime_readback(payload, required, now=None):
 
 def gate_call(url, operation, key, participant='host'):
     import urllib.request
-    with urllib.request.urlopen(url+'/'+operation+'/'+key+'/'+participant,timeout=300) as response:
+    opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(url+'/'+operation+'/'+key+'/'+participant,timeout=300) as response:
         return json.load(response)
 
 

@@ -194,6 +194,17 @@ class Readback(unittest.TestCase):
         self.assertIn('SUP_CONCURRENCIES:-1 16 64 256',source)
         self.assertIn('seq 1 "$SUP_BURST_REPEATS"',source)
 
+    def test_fixture_gate_uses_direct_transport(self):
+        import os,threading
+        from unittest.mock import patch
+        origin=module('supplemental-origin');tools=module('supplemental-tools')
+        server=origin.build_gate_server(0,host='127.0.0.1');thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        try:
+            with patch.dict(os.environ,{'http_proxy':'http://127.0.0.1:9','HTTP_PROXY':'http://127.0.0.1:9','no_proxy':'','NO_PROXY':''}):
+                result=tools.gate_call('http://127.0.0.1:'+str(server.server_address[1]),'status','test')
+                self.assertEqual(result['ready'],0)
+        finally:server.shutdown();server.server_close();thread.join(5)
+
     def test_sample_guard_writes_invalid_and_stops(self):
         import subprocess,sys
         with tempfile.TemporaryDirectory() as d:
