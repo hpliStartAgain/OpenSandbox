@@ -30,6 +30,10 @@ class Reports(unittest.TestCase):
     def test_wrong_sequence_invalid(self):
         self.assertEqual(r.build('m10', {'blocks': [{'mode': 'B', 'p50_ms': 1}]})['status'], 'INVALID')
 
+    def test_m10_live_mode_mismatch_is_invalid(self):
+        out = r.build('m10', {'blocks': [{'mode': 'A', 'p50_ms': 1, 'live_mode': 'credential-bound'}]})
+        self.assertEqual(out['status'], 'INVALID')
+
     def test_soak_slope_window(self):
         rows = [{'t_s': t, 'memory_current': 100 + t * 2, 'anon': 50 + t,
                  'fd': 10, 'oom_kill': 0, 'restarts': 0} for t in [0, 1800, 3600, 7200]]
@@ -146,7 +150,7 @@ class SupplementalClientTest(OriginFixture):
         self.assertGreater(out['errors']['handshake/verify_failed'], 0)
 
     def test_mixed_hostnames_are_selected_and_classified(self):
-        out = self.probe(bound_percent=5, unbound_host='echo.test', unbound_leaf='origin')
+        out = self.probe(bound_percent=0, unbound_host='echo.test', unbound_leaf='origin')
         self.assertGreater(out['success'], 0)
         self.assertEqual(out['contradictions'], 0)
 
@@ -189,7 +193,7 @@ bench_m1() { printf '{"status":"OK","pooled_latency_ms":{"p50":2}}' > "$BENCH_DI
 kubectl() {
   case "$*" in
     *logs*) echo 'subject s-test: SET_BINDING applied (state=ready) total=2ms denyFirstInstall=1ms policyCommit=1ms';;
-    *jsonpath*) printf 'pod-test';;
+    *jsonpath*) printf 'pod-%s' "$BENCH_LEG";;
     *) printf '{"items":[{"spec":{"containers":[{"name":"egress","env":[{"name":"OPENSANDBOX_EGRESS_FSB_INTERCEPTION_MODE","value":"%s"}]}]}}]}' "$BENCH_LEG";;
   esac
 }

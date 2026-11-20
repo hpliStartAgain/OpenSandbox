@@ -298,6 +298,10 @@ sup_m7() {
 			p_ok=false
 			if [[ "$CB_RC" == 0 && "$bad" == 0 ]]; then p_ok=true; fi
 			bench_json_set "$SUP_RAW/m7-spec.json" '.passthrough_ok=((.passthrough_ok // true) and $ok) | .passthrough_contradictions=((.passthrough_contradictions // 0)+$bad)' --argjson ok "$p_ok" --argjson bad "$bad"
+			# Exercise passthrough in the exhausted subject as well as in U.
+			sup_start "$BENCH_B" "$name-same-unbound" bound 1 new 1 0 load --bound-percent 0
+			sup_fetch "$BENCH_B" "$name-same-unbound"
+			bench_json_set "$SUP_RAW/m7-spec.json" '.same_subject_passthrough_runs=((.same_subject_passthrough_runs // [])+[$r])' --argjson r "$(cat "$SUP_RAW/$name-same-unbound.json")"
 			osb_api command run "$BENCH_B" -- touch "$CB_GUEST_DIR/$name-go" >/dev/null
 			sup_fetch "$BENCH_B" "$name"
 			SUP_TOTAL_CONCURRENCY="$burst"

@@ -80,7 +80,7 @@ def main(argv):
                     continue
                 classified = r.base.classify_run(raw, origin, 'origin' if path=='u' else 'mitm', 'absent' if path=='u' else code)
                 probes.append({'scale': point['target'], 'path': path,
-                               'status': 'INVALID' if classified['contradictions'] else 'PARTIAL' if raw.get('failed') else 'OK',
+                               'status': 'INVALID' if classified['contradictions'] else 'FAILED' if not raw.get('ok') else 'PARTIAL' if raw.get('failed') else 'OK',
                                'latency_ms': raw.get('handshake_ms', {}), 'success': raw.get('ok', 0)})
         payload['real_connections'] = {'status': r.base.worst([p['status'] for p in probes]),
                                       'topology': 'two real colocated guests, synthetic deny-first attachments have no VM or veth',

@@ -220,7 +220,7 @@ def parse_args(argv=None):
     p.add_argument('mode', choices=['load', 'burst'])
     for key in ['host', 'ip', 'cafile', 'origin-leaf', 'expect-leaf', 'expect-cred', 'out']:
         p.add_argument('--'+key, required=True)
-    p.add_argument('--bound-percent', type=int, choices=[5, 100], default=100)
+    p.add_argument('--bound-percent', type=int, choices=[0, 5, 100], default=100)
     p.add_argument('--unbound-host', default='')
     p.add_argument('--unbound-leaf', choices=['origin', 'mitm'], default='origin')
     p.add_argument('--port', type=int, default=443)

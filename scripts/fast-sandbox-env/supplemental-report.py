@@ -243,7 +243,10 @@ def build_m7(spec):
             status = base.worst([status, "PARTIAL"])
         elif not refusal["unattributed"] and spec.get("recovered"):
             status = "OK"
-    return {"status": status, "runs": [run_row(r) for r in runs], "rejections": refusal,
+    same_subject = spec.get("same_subject_passthrough_runs", [])
+    if same_subject:
+        status = base.worst([status]+[run_status(r) for r in same_subject])
+    return {"status": status, "same_subject_passthrough_runs": [run_row(r) for r in same_subject], "runs": [run_row(r) for r in runs], "rejections": refusal,
             "server_budget_denials": spec.get("server_budget_denials", 0),
             "established_alive": spec.get("established_alive"), "passthrough_ok": spec.get("passthrough_ok"),
             "recovered": spec.get("recovered", False), "recovery_ms": spec.get("recovery_ms")}
@@ -286,6 +289,13 @@ def build_m10(spec):
     sequence = ''.join(b.get("mode") or '?' for b in blocks)
     paired = paired_blocks(blocks)
     status = "MISSING" if not blocks else "INVALID" if not "ABBAABBA".startswith(sequence) else "OK"
+    if any(b.get("live_mode") is not None and b["live_mode"] != ("all" if b["mode"]=="A" else "credential-bound") for b in blocks):
+        status = "INVALID"
+    uids = [b["pod_uid"] for b in blocks if b.get("pod_uid")]
+    if len(uids) != len(set(uids)):
+        status = "INVALID"
+    if status == "OK" and any(b.get("warm_ready") is False for b in blocks):
+        status = "PARTIAL"
     if status == "OK" and (len(blocks)!=8 or paired["n_pairs"]!=4 or any(b.get("status", "OK")!="OK" for b in blocks)):
         status = "PARTIAL"
     return {"status": status, "blocks": blocks, "paired": paired,
