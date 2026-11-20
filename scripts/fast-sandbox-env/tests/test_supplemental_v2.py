@@ -147,6 +147,23 @@ cb_create_sandbox supplement /tmp/policy
         self.assertIn('--timeout 22200s ',calls)
         self.assertEqual(calls.count('readback id'),1)
 
+    def test_matrix_is_288_actual_load_calls(self):
+        body=r'''
+source "$SCRIPT_DIR/supplemental-bench.sh"
+SUP_RAW="$WORK";SUP_CPU_LIMITS='500m 2';SUP_CONCURRENCIES='1 16 64 256';SUP_BODY_BYTES='0 65536';SUP_REPEATS=3;SUP_LOAD_S=60
+sup_spec() { :; };sup_pair() { :; };sup_load_guests() { :; };sup_report() { :; };bench_json_set() { :; }
+sup_pool() { BENCH_LEG="$1"; }
+sup_load_pair() { printf '%s\n' "$BENCH_LEG|$7|$2|$3|$8|$5|$6" >> "$CALLS"; }
+sup_m5
+'''
+        self.sourced(body,OCI_STACK='0')
+        rows=self.calls_made().splitlines()
+        expected={'|'.join(map(str,(m,cpu,c,conn,mix,body,rep)))
+                  for m in ('all','credential-bound') for cpu in ('500m','2') for c in (1,16,64,256)
+                  for conn in ('new','keep-alive') for mix,body in ((5,0),(5,65536),(100,0)) for rep in (1,2,3)}
+        self.assertEqual(len(rows),288)
+        self.assertEqual(set(rows),expected)
+
     def test_sampler_failure_terminates_owner(self):
         body=r'''
 source "$SCRIPT_DIR/supplemental-bench.sh"
