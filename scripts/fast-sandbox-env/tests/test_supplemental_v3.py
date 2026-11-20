@@ -123,7 +123,10 @@ sup_gate_ready() { return 0; }
 sup_gate() { printf '{"start_at_s":100}'; }
 bench_egress_identity() { echo same; };bench_egress_restarts() { echo 0; }
 kubectl() { cat "$SAMPLER_JSON"; };docker() { cat "$SAMPLER_JSON"; }
-trap 'echo cleaned >> "$CALLS"' EXIT
+SUP_ORIGINAL_MODE=all;SUP_ORIGINAL_WARM=1
+cb_cleanup() { echo cleaned >> "$CALLS"; }
+bench_pool_restore() { echo restored >> "$CALLS"; }
+trap 'sup_cleanup' EXIT
 sup_m5
 echo continued >> "$CALLS"
 '''.replace('PHASE',phase)
@@ -132,6 +135,7 @@ echo continued >> "$CALLS"
             self.assertNotEqual(out.returncode,0)
             calls=self.calls_made()
             self.assertIn('cleaned',calls)
+            self.assertIn('restored',calls)
             self.assertNotIn('continued',calls)
             self.assertEqual(calls.count('start '),1 if phase=='warm' else 2)
             report=json.loads((Path(self.work)/('report-'+phase)/'m5.json').read_text())
