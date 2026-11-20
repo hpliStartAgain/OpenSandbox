@@ -1,3 +1,5 @@
+# Copyright 2026 The OpenSandbox Authors
+# SPDX-License-Identifier: Apache-2.0
 """Supplemental statistics and evidence classification, no live services."""
 import importlib.util
 import json
@@ -267,6 +269,19 @@ cat "$SUP_DIR/m7-credential-bound.json"
         out = json.loads(result.stdout[result.stdout.index('{'):])
         self.assertEqual(out['status'], 'OK')
         self.assertTrue(out['passthrough_ok'])
+
+    def test_large_latency_payload_does_not_enter_argv(self):
+        raw = Path(self.tmp)/'large.json'
+        raw.write_text(json.dumps({'v':1, 'success':50000, 'request_ms':[123.456]*50000}))
+        body = r'''
+source "$SCRIPT_DIR/supplemental-bench.sh"
+SUP_RAW="$WORK"; SUP_SEQ=1; SUP_TOTAL_CONCURRENCY=64; BENCH_LEG=all
+printf '{"runs":[]}' > "$WORK/m5-spec.json"
+sup_append_run m5 "$LARGE_RAW" mixed 16 keep-alive 0 1 500m
+jq '.runs[0].request_ms | length' "$WORK/m5-spec.json"
+'''
+        out = self.sourced(body, LARGE_RAW=str(raw), OCI_STACK='0')
+        self.assertEqual(out.stdout.strip(), '50000')
 
     def test_measurements_are_opt_in(self):
         workflow = (ROOT.parents[1]/'.github/workflows/fast-sandbox-test.yml').read_text()

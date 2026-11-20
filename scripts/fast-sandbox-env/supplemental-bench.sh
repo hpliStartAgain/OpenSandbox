@@ -103,8 +103,8 @@ sup_fetch() { # id name -> file
 }
 
 sup_append_run() { # key raw-file path concurrency connection body repeat cpu
-	bench_json_set "$SUP_RAW/$1-spec.json" '.runs += [$raw + {path:$path,mode:$mode,concurrency:$c,connection:$conn,body_bytes:$body,repeat:$rep,cpu_limit:$cpu,group:$group,total_concurrency:$total}]' \
-		--argjson raw "$(cat "$2")" --arg path "$3" --arg mode "$BENCH_LEG" --argjson c "$4" --arg conn "$5" \
+	bench_json_set "$SUP_RAW/$1-spec.json" '.runs += [$raw[0] + {path:$path,mode:$mode,concurrency:$c,connection:$conn,body_bytes:$body,repeat:$rep,cpu_limit:$cpu,group:$group,total_concurrency:$total}]' \
+		--slurpfile raw "$2" --arg path "$3" --arg mode "$BENCH_LEG" --argjson c "$4" --arg conn "$5" \
 		--argjson body "$6" --argjson rep "$7" --arg cpu "$8" --argjson group "$SUP_SEQ" --argjson total "$SUP_TOTAL_CONCURRENCY"
 }
 
@@ -270,7 +270,7 @@ sup_time() { # m6 or m8 on both modes
 			sup_load_pair "$key" "$SUP_SOAK_CONCURRENCY" keep-alive "$seconds" 0 1 500m 5
 		fi
 		touch "$stop"; wait "$sampler" || fail "supplemental sampler failed"; SUP_SAMPLER=""
-		bench_json_set "$SUP_RAW/$key-spec.json" '.samples=$samples' --argjson samples "$(jq -s . "$SUP_RAW/$key-samples.jsonl")"
+		bench_json_set "$SUP_RAW/$key-spec.json" '.samples=$samples' --slurpfile samples "$SUP_RAW/$key-samples.jsonl"
 		reading="$(sup_sample)"
 		bench_json_set "$SUP_RAW/$key-spec.json" '.samples += [$s + {t_s:($t/1000)}]' --argjson s "$reading" --argjson t "$(bench_elapsed_ms "$t0")"
 		sleep "$SUP_RECOVERY_S"
@@ -303,7 +303,7 @@ sup_m7() {
 			# Exercise passthrough in the exhausted subject as well as in U.
 			sup_start "$BENCH_B" "$name-same-unbound" bound 1 new 1 0 load --bound-percent 0
 			sup_fetch "$BENCH_B" "$name-same-unbound"
-			bench_json_set "$SUP_RAW/m7-spec.json" '.same_subject_passthrough_runs=((.same_subject_passthrough_runs // [])+[$r])' --argjson r "$(cat "$SUP_RAW/$name-same-unbound.json")"
+			bench_json_set "$SUP_RAW/m7-spec.json" '.same_subject_passthrough_runs=((.same_subject_passthrough_runs // [])+$r)' --slurpfile r "$SUP_RAW/$name-same-unbound.json"
 			osb_api command run "$BENCH_B" -- touch "$CB_GUEST_DIR/$name-go" >/dev/null
 			sup_fetch "$BENCH_B" "$name"
 			SUP_TOTAL_CONCURRENCY="$burst"
