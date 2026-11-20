@@ -96,7 +96,7 @@ def histogram_summary(hist):
 def run_row(raw):
     fields = ("attempted", "success", "failed", "wall_s", "cpu_s", "concurrency", "connection",
               "body_bytes", "bound_percent", "repeat", "mode", "cpu_limit", "path", "errors",
-              "contradictions", "verified", "leaf", "cred", "connections", "released_alive", "group", "total_concurrency", "latency_resolution_ms", "minute_windows", "start_at_s", "end_at_s", "scheduled_start_s", "start_lag_s")
+              "contradictions", "verified", "leaf", "cred", "connections", "released_alive", "group", "total_concurrency", "latency_resolution_ms", "minute_windows", "max_requests", "start_at_s", "end_at_s", "scheduled_start_s", "start_lag_s")
     row = {k: raw[k] for k in fields if k in raw}
     row["latency_ms"] = histogram_summary(raw["request_histogram_ms"]) if raw.get("request_histogram_ms") else quantiles(raw.get("request_ms", []))
     row["handshake_ms"] = quantiles(raw.get("handshake_ms", []))

@@ -119,7 +119,7 @@ async def execute(args):
     result = dict(v=1, attempted=0, success=0, failed=0, verified=0, connections=0, contradictions=0,
                   errors={}, leaf={'origin': 0, 'mitm': 0, 'none': 0}, cred={'expected': 0, 'absent': 0, 'other': 0},
                   request_ms=[], handshake_ms=[], concurrency=args.concurrency, connection=args.connection,
-                  body_bytes=args.body_bytes, bound_percent=args.bound_percent, released_alive=0)
+                  body_bytes=args.body_bytes, bound_percent=args.bound_percent, max_requests=args.max_requests, released_alive=0)
     start, cpu = time.monotonic(), time.process_time()
     gate = asyncio.Event()
     held = []
@@ -177,7 +177,7 @@ async def execute(args):
                     return
             else:
                 count = 0
-                while time.monotonic()-start < args.duration:
+                while time.monotonic()-start < args.duration and (not args.max_requests or result['attempted']<args.max_requests):
                     nonlocal request_sequence
                     bound = request_sequence % 100 < args.bound_percent
                     request_sequence += 1
@@ -255,6 +255,7 @@ def parse_args(argv=None):
     p.add_argument('--concurrency', type=int, default=1)
     p.add_argument('--connection', choices=['new', 'keep-alive'], default='new')
     p.add_argument('--body-bytes', type=int, choices=[0, 65536], default=0)
+    p.add_argument('--max-requests',type=int,default=0)
     p.add_argument('--churn-every', type=int, default=0)
     p.add_argument('--rate', type=float, default=0)
     p.add_argument('--timeout', type=float, default=20)
@@ -262,7 +263,7 @@ def parse_args(argv=None):
     p.add_argument('--ready-file', default='')
     p.add_argument('--release-file', default='')
     a = p.parse_args(argv)
-    if not 1 <= a.concurrency <= 5000 or a.duration <= 0 or a.timeout <= 0 or a.rate < 0 or a.churn_every < 0:
+    if not 1 <= a.concurrency <= 5000 or a.duration <= 0 or a.timeout <= 0 or a.rate < 0 or a.churn_every < 0 or a.max_requests < 0:
         p.error('invalid load bounds')
     return a
 

@@ -188,6 +188,12 @@ class SupplementalClientTest(OriginFixture):
         self.assertGreater(out['success'], 0)
         self.assertEqual(out['contradictions'], 0)
 
+    def test_fixed_probe_sends_one_request(self):
+        out=self.probe(max_requests=1,connection='new')
+        self.assertEqual(out['attempted'],1)
+        self.assertEqual(out['verified'],1)
+        self.assertEqual(out['connections'],1)
+
     def test_two_guests_wait_at_common_gate(self):
         import threading
         sp=importlib.util.spec_from_file_location('gate_origin',ROOT/'supplemental-origin.py')

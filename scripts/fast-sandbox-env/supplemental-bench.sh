@@ -382,7 +382,7 @@ sup_m7() {
 				bad="$(jq --arg origin "$CB_ORIGIN_LEAF" --arg leaf "$leaf" 'if (.last.origin.cred != null and .last.origin.cred != "absent") or (.leaf_sha256 != null and ((.leaf_sha256==$origin) != ($leaf=="origin"))) then 1 else 0 end' <<< "$probe_json")"
 				p_ok=false; if [[ "$CB_RC" == 0 && "$bad" == 0 ]]; then p_ok=true; fi
 				bench_json_set "$SUP_RAW/m7-tier.json" '.passthrough_ok=$ok | .passthrough_contradictions=$bad' --argjson ok "$p_ok" --argjson bad "$bad"
-				sup_start "$BENCH_B" "$name-same-unbound" bound 1 new 1 0 load --bound-percent 0
+				sup_start "$BENCH_B" "$name-same-unbound" bound 1 new 1 0 load --bound-percent 0 --max-requests 1
 				sup_fetch "$BENCH_B" "$name-same-unbound"
 				p_ok="$(python3 - "$SUP_SELF_DIR" "$SUP_RAW/$name-same-unbound.json" <<'PROBE'
 import importlib.util,json,sys
