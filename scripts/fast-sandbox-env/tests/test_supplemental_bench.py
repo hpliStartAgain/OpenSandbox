@@ -223,7 +223,7 @@ SUP_BLOCKS=2; SUP_SEQUENCE=ABBAABBA; SUP_SMOKE=true; SUP_LOAD_GUESTS=1; SUP_LOAD
 bench_ns() { echo 1000000000; }
 bench_elapsed_ms() { echo 1; }
 sup_pool() { BENCH_LEG="$1"; }
-bench_m1() { printf '{"status":"OK","pooled_latency_ms":{"p50":2}}' > "$BENCH_DIR/m1-create.json"; }
+bench_m1() { printf '{"status":"OK","pooled_latency_ms":{"p50":2}}' > "$BENCH_DIR/m1-create.json"; printf '{"rounds":[]}' > "$BENCH_RAW/m1-spec.json"; }
 kubectl() {
   case "$*" in
     *logs*) echo 'subject s-test: SET_BINDING applied (state=ready) total=2ms denyFirstInstall=1ms policyCommit=1ms';;
@@ -323,6 +323,12 @@ class AdditionalStatistics(unittest.TestCase):
         self.assertEqual(out['p50'], 1)
         self.assertEqual(out['p99_9'], 10)
         self.assertEqual(out['mean'], 4)
+
+    def test_report_latency_inputs_recompute_percentiles(self):
+        out = r.run_row({'request_ms':[1,1,5,10], 'handshake_ms':[.1,.2], 'success':4, 'wall_s':1})
+        recomputed = r.histogram_summary(out['latency_inputs']['request_histogram_ms'])
+        for key in ('n','mean','p50','p90','p99','p99_9'):
+            self.assertEqual(recomputed[key], out['latency_ms'][key])
 
     def test_plateau_requires_a_concurrency_increase(self):
         groups = [dict(mode='all', cpu_limit='500m', connection='new', body_bytes=0, bound_percent=100,

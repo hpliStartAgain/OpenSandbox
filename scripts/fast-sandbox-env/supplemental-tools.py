@@ -30,7 +30,7 @@ def segments(text):
     complete = [v for v in records.values() if len(v) == 3]
     return {'matched_subjects': len(complete), 'incomplete_subjects': len(records)-len(complete),
             'unit': 'ms, integer log precision',
-            'distributions': {k: r.quantiles([v[k] for v in complete]) for k in ('total', 'policy_commit', 'apply_policy')}}
+            'paired_timings_ms': complete, 'distributions': {k: r.quantiles([v[k] for v in complete]) for k in ('total', 'policy_commit', 'apply_policy')}}
 
 
 def make_origin_certificate(ca_dir, out_dir, host):
@@ -51,6 +51,15 @@ def make_origin_certificate(ca_dir, out_dir, host):
         ['openssl', 'ca', '-batch', '-notext', '-config', str(config), '-in', str(out/'echo.csr'), '-out', str(out/'echo.crt'), '-startdate', start, '-enddate', end, '-extensions', 'leaf']]
     for command in commands:
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def create_inputs(spec_file):
+    payload = json.loads(Path(spec_file).read_text())
+    values = []
+    for row in payload.get('rounds', []):
+        report = r.base.load_json(row.get('report')) or {}
+        values.extend(a['ready_seconds']*1000 for a in report.get('attempts', []) if a.get('success'))
+    return values
 
 
 def budget_denials(text):
@@ -98,6 +107,8 @@ def main(argv):
     elif command == 'classify':
         raw, origin, leaf, cred = a
         print(r.base.classify_run(json.loads(Path(raw).read_text()), origin, leaf, cred)['contradictions'])
+    elif command == 'create-inputs':
+        Path(a[1]).write_text(json.dumps(create_inputs(a[0])))
     elif command == 'segments':
         src, out = a
         Path(out).write_text(json.dumps(segments(Path(src).read_text())))

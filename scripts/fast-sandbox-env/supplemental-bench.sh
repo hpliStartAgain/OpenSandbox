@@ -288,7 +288,7 @@ sup_m7() {
 	for mode in all credential-bound; do
 		sup_spec m7; sup_pool "$mode" 500m; sup_pair
 		for burst in $SUP_BURSTS; do
-			name="m7-$burst"; since="$(date -u +%FT%TZ)"
+			name="m7-$mode-$burst"; since="$(date -u +%FT%TZ)"
 			sup_start "$BENCH_B" "$name" bound "$burst" keep-alive 1 0 burst \
 				--ready-file "$CB_GUEST_DIR/$name-ready.json" --release-file "$CB_GUEST_DIR/$name-go" --hold-s 120
 			bench_wait "$SUP_CLIENT_ATTEMPTS" bench_guest_fetch "$BENCH_B" "$CB_GUEST_DIR/$name-ready.json" "$SUP_RAW/$name-ready.json" || fail "M7 burst readiness missing"
@@ -316,6 +316,7 @@ sup_m7() {
 			bench_json_set "$SUP_RAW/m7-spec.json" '.recovered=true | .recovery_ms=$t' --argjson t "$(bench_elapsed_ms "$t0")"
 		done
 		sup_report m7; mv "$SUP_DIR/m7.json" "$SUP_DIR/m7-$mode.json"
+		cp "$SUP_RAW/m7-spec.json" "$SUP_RAW/m7-$mode-spec.json"
 	done
 }
 
@@ -359,12 +360,13 @@ sup_m10() {
 		since="$(date -u +%FT%TZ)"
 		BENCH_DIR="$SUP_RAW/m10-block-$block"; BENCH_RAW="$BENCH_DIR/raw"; mkdir -p "$BENCH_RAW"
 		bench_m1
+		python3 "$SUP_SELF_DIR/supplemental-tools.py" create-inputs "$BENCH_RAW/m1-spec.json" "$BENCH_RAW/create-inputs.json"
 		uid="$(kubectl -n "$RESOURCE_NS" get pods -l "app=sandbox-fastlet,fast-sandbox.io/pool=$POOL_NAME" -o jsonpath='{.items[0].metadata.uid}')"
 		live="$(kubectl -n "$RESOURCE_NS" get pods -l "app=sandbox-fastlet,fast-sandbox.io/pool=$POOL_NAME" -o json | jq -r '.items[0].spec.containers[] | select(.name=="egress") | .env[] | select(.name=="OPENSANDBOX_EGRESS_FSB_INTERCEPTION_MODE") | .value')"
 		kubectl -n "$RESOURCE_NS" logs -l "app=sandbox-fastlet,fast-sandbox.io/pool=$POOL_NAME" -c egress --since-time="$since" --tail=-1 > "$BENCH_RAW/egress.log"
 		python3 "$SUP_SELF_DIR/supplemental-tools.py" segments "$BENCH_RAW/egress.log" "$BENCH_RAW/segments.json"
-		bench_json_set "$SUP_RAW/m10-spec.json" '.blocks += [{mode:$block_mode,p50_ms:$r.pooled_latency_ms.p50,status:$r.status,switch_ms:$switch,pod_uid:$uid,live_mode:$mode,warm_ready:true,segments:$segments}]' \
-			--arg block_mode "$label" --argjson r "$(cat "$BENCH_DIR/m1-create.json")" --argjson switch "$switch" --arg uid "$uid" --arg mode "$live" --argjson segments "$(cat "$BENCH_RAW/segments.json")"
+		bench_json_set "$SUP_RAW/m10-spec.json" '.blocks += [{mode:$block_mode,p50_ms:$r.pooled_latency_ms.p50,status:$r.status,switch_ms:$switch,pod_uid:$uid,live_mode:$mode,warm_ready:true,segments:$segments,create_latency_ms_inputs:$inputs[0]}]' \
+			--arg block_mode "$label" --argjson r "$(cat "$BENCH_DIR/m1-create.json")" --argjson switch "$switch" --arg uid "$uid" --arg mode "$live" --argjson segments "$(cat "$BENCH_RAW/segments.json")" --slurpfile inputs "$BENCH_RAW/create-inputs.json"
 		BENCH_DIR="$original_dir"; BENCH_RAW="$original_raw"
 	done
 	sup_report m10

@@ -62,4 +62,4 @@ bash -n scripts/fast-sandbox-env/supplemental-bench.sh
 shellcheck -S warning scripts/fast-sandbox-env/supplemental-bench.sh
 ```
 
-原始 specs、连接摘要和进程日志保留在私有 `raw/` 目录，不作为公开报告。顶层报告采用闭集字段，保留统计输入与状态，不复制凭据、证书 digest、subject UID 或对端名称。
+原始 specs、连接摘要和进程日志保留在私有 `raw/` 目录，不作为公开报告。顶层报告采用闭集字段，保留延迟数值直方图、M10 创建样本及日志分段数值配对，支持独立重算；不复制凭据、证书 digest、subject UID 或对端名称。

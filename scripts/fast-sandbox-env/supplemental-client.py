@@ -8,6 +8,7 @@ credential. Never emits digests, peer names or arbitrary exception messages.
 """
 import argparse
 import copy
+from collections import Counter
 import asyncio
 import hashlib
 import json
@@ -50,7 +51,7 @@ def summarize(values):
     n = len(ordered)
     if not n:
         return {'n': 0}
-    return dict(n=n, mean=sum(ordered)/n, **{'p'+str(p).replace('.', '_'): ordered[max(0, math.ceil(n*p/100)-1)] for p in [50, 90, 99, 99.9]})
+    return dict(n=n, mean=sum(ordered)/n, input_histogram_ms=dict(Counter(str(v) for v in ordered)), **{'p'+str(p).replace('.', '_'): ordered[max(0, math.ceil(n*p/100)-1)] for p in [50, 90, 99, 99.9]})
 
 
 class Session:

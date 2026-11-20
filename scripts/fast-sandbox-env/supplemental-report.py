@@ -19,6 +19,7 @@ M10 uses adjacent A/B blocks as paired experimental units (B minus A),
 Student t 95% intervals, never individual sandbox creates as replicates.
 """
 import importlib.util
+from collections import Counter
 import json
 import math
 from pathlib import Path
@@ -99,6 +100,9 @@ def run_row(raw):
     row = {k: raw[k] for k in fields if k in raw}
     row["latency_ms"] = histogram_summary(raw["request_histogram_ms"]) if raw.get("request_histogram_ms") else quantiles(raw.get("request_ms", []))
     row["handshake_ms"] = quantiles(raw.get("handshake_ms", []))
+    row["latency_inputs"] = {"request_histogram_ms": raw.get("request_histogram_ms") or dict(Counter(str(v) for v in raw.get("request_ms", []))),
+                             "handshake_histogram_ms": dict(Counter(str(v) for v in raw.get("handshake_ms", []))),
+                             "resolution_ms": raw.get("latency_resolution_ms", .001)}
     wall = raw.get("wall_s", 0)
     row["rps"] = raw.get("success", 0)/wall if wall > 0 else None
     return row
@@ -289,7 +293,7 @@ def build_m9(spec):
 
 
 def build_m10(spec):
-    blocks = [{k: b.get(k) for k in ("mode", "p50_ms", "status", "switch_ms", "pod_uid", "live_mode", "warm_ready", "segments")}
+    blocks = [{k: b.get(k) for k in ("mode", "p50_ms", "status", "switch_ms", "pod_uid", "live_mode", "warm_ready", "segments", "create_latency_ms_inputs")}
               for b in spec.get("blocks", [])]
     sequence = ''.join(b.get("mode") or '?' for b in blocks)
     paired = paired_blocks(blocks)
