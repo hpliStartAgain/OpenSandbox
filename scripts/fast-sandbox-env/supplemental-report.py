@@ -300,6 +300,8 @@ def build_time(spec):
     if runs:
         status = base.worst([status] + [run_status(r) for r in runs])
     recovery = spec.get("recovery") or {}
+    if recovery:
+        status=base.worst([status,resource_status(samples+[recovery])])
     delta = {f: recovery[f]-samples[0][f] for f in ("memory_current", "anon", "fd")
              if samples and isinstance(recovery.get(f), (int, float)) and isinstance(samples[0].get(f), (int, float))}
     minute_windows = [w for raw in runs for w in raw.get("minute_windows", [])]
@@ -362,7 +364,7 @@ def build_m9(spec):
     points, statuses = [], []
     for p in spec.get("points", []):
         row = {k: p.get(k) for k in ("target", "registered", "acked", "active", "capacity_rejections",
-                    "registration_ms", "activation_ms", "memory_current", "anon", "usage_usec", "nft_rules", "nft_enumeration", "driver_cost", "resource_sample")}
+                    "registration_ms", "activation_ms", "memory_current", "anon", "usage_usec", "nft_rules", "nft_enumeration", "driver_cost", "resource_sample", "usage_excluding_prior_enumeration_usec")}
         counts = [p.get(k, 0) for k in ("registered", "acked", "active")]
         target = p["target"]
         expected = min(target, 4096)
@@ -372,6 +374,10 @@ def build_m9(spec):
             status = "PARTIAL"
         else:
             status = "OK"
+        if spec.get("resource_scope")=="egress_only_external_driver":
+            evidence = [q.get("resource_sample",{}) for q in spec.get("points",[]) if q.get("target",0)<=target]
+            evidence_status=resource_status(evidence)
+            status=base.worst([status,"PARTIAL" if evidence_status=="MISSING" else evidence_status])
         row["status"] = status
         points.append(row); statuses.append(status)
     if points and not spec.get("cleanup_ok"):

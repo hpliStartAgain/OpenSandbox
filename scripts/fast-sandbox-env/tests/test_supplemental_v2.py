@@ -91,6 +91,13 @@ class Regressions(unittest.TestCase):
         s['resource_scope']='egress_only_external_driver'
         self.assertIn('egress_per_subject_fit',r.build_m9(s))
 
+    def test_m9_sample_rollback_invalidates_point(self):
+        a=dict(target=4,registered=4,acked=4,active=4,memory_current=100,anon=50,resource_sample=sample(10))
+        b=dict(a,target=8,registered=8,acked=8,active=8,resource_sample=sample(1))
+        out=r.build_m9(dict(points=[a,b],cleanup_ok=True,resource_scope='egress_only_external_driver'))
+        self.assertEqual(out['status'],'INVALID')
+        self.assertEqual(out['egress_per_subject_fit']['anon']['n'],1)
+
     def test_full_group_lifetime_exceeds_hour(self):
         tools=module('supplemental-tools')
         env=dict(SUP_CONCURRENCIES='1 16 64 256',SUP_REPEATS='3',SUP_BODY_BYTES='0 65536',SUP_LOAD_S='60',SUP_WARMUP_S='10',SUP_SOAK_S='7200',SUP_RECOVERY_S='30',SUP_CHURN_S='1800',SUP_IDLE_S='20')

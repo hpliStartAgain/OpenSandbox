@@ -455,7 +455,7 @@ sup_m9() {
 			--argjson prior "$nft_cpu" --argjson wall "$(bench_elapsed_ms "$t0")" \
 			'{target:$target,resource_sample:$s,memory_current:$s.memory_current,anon:$s.anon,usage_usec:$s.usage_usec,
 			usage_excluding_prior_enumeration_usec:($s.usage_usec-$prior),nft_rules:$n,
-			nft_enumeration:{wall_ms:$wall,cpu_before_usec:$s.usage_usec,cpu_after_usec:$e.usage_usec,cpu_delta_usec:($e.usage_usec-$s.usage_usec)}}' >> "$SUP_RAW/m9-resources.jsonl"
+			nft_enumeration:{wall_ms:$wall,cpu_before_usec:$s.usage_usec,cpu_after_usec:$e.usage_usec,memory_current_before:$s.memory_current,memory_current_after:$e.memory_current,anon_before:$s.anon,anon_after:$e.anon,cpu_delta_usec:($e.usage_usec-$s.usage_usec)}}' >> "$SUP_RAW/m9-resources.jsonl"
 		nft_cpu=$((nft_cpu+$(jq -n --argjson a "$reading" --argjson b "$after" '$b.usage_usec-$a.usage_usec')))
 		bench_handshakes "$BENCH_U" "m9-u-$step" "$SUP_SCALE_PROBES" "$SUP_RAW/m9-u-$step.json"
 		bench_handshakes "$BENCH_B" "m9-b-$step" "$SUP_SCALE_PROBES" "$SUP_RAW/m9-b-$step.json"
