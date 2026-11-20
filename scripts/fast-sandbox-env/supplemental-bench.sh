@@ -281,7 +281,7 @@ sup_time() { # m6 or m8 on both modes
 }
 
 sup_m7() {
-	local mode burst name since denials t0 key=m7 leaf p_ok bad
+	local mode burst name since denials t0 key=m7 leaf p_ok bad probe_json
 	SUP_TOTAL_CONCURRENCY=0
 	for mode in all credential-bound; do
 		sup_spec m7; sup_pool "$mode" 500m; sup_pair
@@ -293,10 +293,11 @@ sup_m7() {
 			# An established successful bound socket remains held during the U probe.
 			cb_guest_once "$BENCH_U" m7-passthrough
 			leaf=mitm; [[ "$mode" != credential-bound ]] || leaf=origin
-			bad="$(jq --arg origin "$CB_ORIGIN_LEAF" --arg leaf "$leaf" 'if (.last.origin.cred != null and .last.origin.cred != "absent") or (.leaf_sha256 != null and ((.leaf_sha256==$origin) != ($leaf=="origin"))) then 1 else 0 end' <<< "${CB_RESULT:-{}}")"
+			probe_json="$CB_RESULT"; [[ -n "$probe_json" ]] || probe_json='{}'
+			bad="$(jq --arg origin "$CB_ORIGIN_LEAF" --arg leaf "$leaf" 'if (.last.origin.cred != null and .last.origin.cred != "absent") or (.leaf_sha256 != null and ((.leaf_sha256==$origin) != ($leaf=="origin"))) then 1 else 0 end' <<< "$probe_json")"
 			p_ok=false
 			if [[ "$CB_RC" == 0 && "$bad" == 0 ]]; then p_ok=true; fi
-			bench_json_set "$SUP_RAW/m7-spec.json" '.passthrough_ok=$ok | .passthrough_contradictions=$bad' --argjson ok "$p_ok" --argjson bad "$bad"
+			bench_json_set "$SUP_RAW/m7-spec.json" '.passthrough_ok=((.passthrough_ok // true) and $ok) | .passthrough_contradictions=((.passthrough_contradictions // 0)+$bad)' --argjson ok "$p_ok" --argjson bad "$bad"
 			osb_api command run "$BENCH_B" -- touch "$CB_GUEST_DIR/$name-go" >/dev/null
 			sup_fetch "$BENCH_B" "$name"
 			SUP_TOTAL_CONCURRENCY="$burst"
@@ -356,8 +357,8 @@ sup_m10() {
 		live="$(kubectl -n "$RESOURCE_NS" get pods -l "app=sandbox-fastlet,fast-sandbox.io/pool=$POOL_NAME" -o json | jq -r '.items[0].spec.containers[] | select(.name=="egress") | .env[] | select(.name=="OPENSANDBOX_EGRESS_FSB_INTERCEPTION_MODE") | .value')"
 		kubectl -n "$RESOURCE_NS" logs -l "app=sandbox-fastlet,fast-sandbox.io/pool=$POOL_NAME" -c egress --since-time="$since" --tail=-1 > "$BENCH_RAW/egress.log"
 		python3 "$SUP_SELF_DIR/supplemental-tools.py" segments "$BENCH_RAW/egress.log" "$BENCH_RAW/segments.json"
-		bench_json_set "$SUP_RAW/m10-spec.json" '.blocks += [{mode:$label,p50_ms:$r.pooled_latency_ms.p50,status:$r.status,switch_ms:$switch,pod_uid:$uid,live_mode:$mode,warm_ready:true,segments:$segments}]' \
-			--arg label "$label" --argjson r "$(cat "$BENCH_DIR/m1-create.json")" --argjson switch "$switch" --arg uid "$uid" --arg mode "$live" --argjson segments "$(cat "$BENCH_RAW/segments.json")"
+		bench_json_set "$SUP_RAW/m10-spec.json" '.blocks += [{mode:$block_mode,p50_ms:$r.pooled_latency_ms.p50,status:$r.status,switch_ms:$switch,pod_uid:$uid,live_mode:$mode,warm_ready:true,segments:$segments}]' \
+			--arg block_mode "$label" --argjson r "$(cat "$BENCH_DIR/m1-create.json")" --argjson switch "$switch" --arg uid "$uid" --arg mode "$live" --argjson segments "$(cat "$BENCH_RAW/segments.json")"
 		BENCH_DIR="$original_dir"; BENCH_RAW="$original_raw"
 	done
 	sup_report m10

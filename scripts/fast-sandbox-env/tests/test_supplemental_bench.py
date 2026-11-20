@@ -176,6 +176,62 @@ sup_pool all 2
         self.assertEqual(egress['resources']['limits']['cpu'], 2)
         self.assertEqual(egress['resources']['requests']['cpu'], '100m')
 
+    def test_m10_shell_assembles_a_block_report(self):
+        body = r'''
+source "$SCRIPT_DIR/supplemental-bench.sh"
+SUP_DIR="$WORK/report"; SUP_RAW="$SUP_DIR/raw"; mkdir -p "$SUP_RAW"
+BENCH_DIR="$SUP_DIR"; BENCH_RAW="$SUP_RAW"
+SUP_BLOCKS=2; SUP_SEQUENCE=ABBAABBA; SUP_SMOKE=true; SUP_LOAD_GUESTS=1; SUP_LOAD_S=1; SUP_IDLE_S=1
+bench_ns() { echo 1000000000; }
+bench_elapsed_ms() { echo 1; }
+sup_pool() { BENCH_LEG="$1"; }
+bench_m1() { printf '{"status":"OK","pooled_latency_ms":{"p50":2}}' > "$BENCH_DIR/m1-create.json"; }
+kubectl() {
+  case "$*" in
+    *logs*) echo 'subject s-test: SET_BINDING applied (state=ready) total=2ms denyFirstInstall=1ms policyCommit=1ms';;
+    *jsonpath*) printf 'pod-test';;
+    *) printf '{"items":[{"spec":{"containers":[{"name":"egress","env":[{"name":"OPENSANDBOX_EGRESS_FSB_INTERCEPTION_MODE","value":"%s"}]}]}}]}' "$BENCH_LEG";;
+  esac
+}
+sup_m10
+cat "$SUP_DIR/m10.json"
+'''
+        result = self.sourced(body, OCI_STACK='0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The report writer pretty-prints JSON after its one status line.
+        out = json.loads(result.stdout[result.stdout.index('{'):])
+        self.assertEqual(out['status'], 'PARTIAL')
+        self.assertEqual(out['paired']['n_pairs'], 1)
+
+    def test_m7_shell_projects_the_unbound_probe(self):
+        body = r'''
+source "$SCRIPT_DIR/supplemental-bench.sh"
+SUP_DIR="$WORK/report"; SUP_RAW="$SUP_DIR/raw"; mkdir -p "$SUP_RAW"
+SUP_SMOKE=true; SUP_LOAD_GUESTS=1; SUP_LOAD_S=1; SUP_IDLE_S=1; SUP_BURSTS=2; SUP_SEQ=0; SUP_CLIENT_ATTEMPTS=1
+SUP_CRED=unused; SUP_CODE=unused; CB_ORIGIN_LEAF=origin; SUP_SINCE=unused; RESOURCE_NS=unused; CB_GUEST_DIR=/tmp
+sup_pool() { BENCH_LEG="$1"; }
+sup_pair() { BENCH_B=b; BENCH_U=u; BENCH_POD=p; }
+sup_start() { :; }
+bench_wait() { :; }
+bench_ns() { echo 1; }
+bench_elapsed_ms() { echo 1; }
+cb_until() { :; }
+osb_api() { :; }
+kubectl() { :; }
+cb_guest_once() {
+ CB_RC=0; leaf=mitm; [[ "$BENCH_LEG" != credential-bound ]] || leaf=origin
+ CB_RESULT="$(printf '{"ok":true,"leaf_sha256":"%s","last":{"status":200,"origin":{"cred":"absent"}}}' "$leaf")"
+}
+sup_fetch() { printf '{"success":2,"attempted":2,"failed":0,"contradictions":0,"released_alive":2,"errors":{},"request_ms":[1,2]}' > "$SUP_RAW/$2.json"; }
+sup_m7
+cat "$SUP_DIR/m7-credential-bound.json"
+'''
+        result = self.sourced(body, OCI_STACK='0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout[result.stdout.index('{'):])
+        self.assertEqual(out['status'], 'OK')
+        self.assertTrue(out['passthrough_ok'])
+
     def test_measurements_are_opt_in(self):
         workflow = (ROOT.parents[1]/'.github/workflows/fast-sandbox-test.yml').read_text()
         self.assertNotIn('bench-supplemental', workflow)
