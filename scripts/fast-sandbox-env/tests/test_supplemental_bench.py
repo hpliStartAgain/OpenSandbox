@@ -309,6 +309,20 @@ class SupplementalGlueTest(unittest.TestCase):
         self.assertEqual(module.budget_denials(log), 1)
         self.assertEqual(module.budget_denials(log+ '\ncredential proxy: tls decision deny reason=registry_exhausted'), 2)
 
+    def test_m9_keeps_numeric_connection_inputs(self):
+        sp = importlib.util.spec_from_file_location('supplemental_tools_m9', ROOT/'supplemental-tools.py')
+        module = importlib.util.module_from_spec(sp); sp.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            d = Path(directory); src=d/'spec.json'
+            src.write_text(json.dumps({'points':[{'target':4}]}))
+            for path,leaf,cred in [('u','origin','absent'),('b','mitm','code')]:
+                (d/('m9-%s-4.json' % path)).write_text(json.dumps({'ok':2,'failed':0,'leaf_sha256':{leaf:2},'origin_cred':{cred:2},'handshake_ms_raw':[1,2],'handshake_ms':{'n':2},'private':'DO_NOT_COPY'}))
+            module.main(['m9-probes',str(src),str(d),'origin','code'])
+            out=json.loads(src.read_text())
+            self.assertEqual(out['real_connections']['status'],'OK')
+            self.assertEqual(out['real_connections']['probes'][0]['latency_inputs']['handshake_ms'],[1,2])
+            self.assertNotIn('DO_NOT_COPY',json.dumps(out))
+
     def test_synthetic_identity_uniqueness_and_fences(self):
         sp = importlib.util.spec_from_file_location('supplemental_subjects', ROOT/'supplemental-subjects.py')
         m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
