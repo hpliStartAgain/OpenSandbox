@@ -71,8 +71,8 @@ class Reports(unittest.TestCase):
 
     def test_m9_capacity_4097(self):
         points = [{'target': 4096, 'registered': 4096, 'acked': 4096, 'active': 4096},
-                  {'target': 4097, 'registered': 4097, 'acked': 4096, 'active': 4096, 'capacity_rejections': 1}]
-        self.assertEqual(r.build('m9', {'points': points, 'cleanup_ok': True})['status'], 'OK')
+                  {'target': 4097, 'registered': 4096, 'acked': 4096, 'active': 4096, 'capacity_rejections': 1, 'rejection_reason': 'subject_capacity_exhausted'}]
+        self.assertEqual(r.build('m9', {'points': points, 'cleanup_ok': True, 'recovery_ok': True})['status'], 'OK')
 
     def test_m5_quantiles_and_failure(self):
         run = {'attempted': 4, 'success': 4, 'failed': 0, 'wall_s': 2,
@@ -294,9 +294,9 @@ SUP_CRED=unused; SUP_CODE=unused; CB_ORIGIN_LEAF=origin; SUP_SINCE=unused; RESOU
 sup_pool() { BENCH_LEG="$1"; }
 sup_pair() { BENCH_B=b; BENCH_U=u; BENCH_POD=p; }
 sup_start() { :; }
-bench_wait() { :; }
+bench_wait() { if [[ "$2" == bench_guest_fetch ]]; then printf '{"contradictions":0}' > "$5"; fi; }
 bench_ns() { echo 1; }
-bench_elapsed_ms() { echo 1; }
+bench_elapsed_ms() { echo 1000; }
 cb_until() { :; }
 osb_api() { :; }
 kubectl() { printf '{"spec":{"containers":[{"name":"egress","env":[{"name":"OPENSANDBOX_EGRESS_FSB_TLS_CAPACITY","value":"2"}]}]}}'; }

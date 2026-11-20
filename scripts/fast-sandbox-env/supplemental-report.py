@@ -103,8 +103,8 @@ def run_row(raw):
     row["latency_inputs"] = {"request_histogram_ms": raw.get("request_histogram_ms") or dict(Counter(str(v) for v in raw.get("request_ms", []))),
                              "handshake_histogram_ms": dict(Counter(str(v) for v in raw.get("handshake_ms", []))),
                              "resolution_ms": raw.get("latency_resolution_ms", .001)}
-    wall = raw.get("wall_s", 0)
-    row["rps"] = raw.get("success", 0)/wall if wall > 0 else None
+    wall = raw.get("wall_s") or 0
+    row["rps"] = (raw.get("success") or 0)/wall if wall > 0 else None
     return row
 
 
@@ -197,17 +197,19 @@ def resource_status(samples):
 
 
 def resource_recovery(tier):
-    samples = [{k:s.get(k) for k in RESOURCE_FIELDS+("identity","captured_at_s","t_s","phase","release_elapsed_s","origin_cpu_usec") if k in s} for s in tier.get("resource_samples", [])]
+    samples = [{k:s.get(k) for k in RESOURCE_FIELDS+("identity","captured_at_s","t_s","phase","release_elapsed_s","origin_cpu_usec") if k in s} for s in (tier.get("resource_samples") or [])]
     status = resource_status(samples)
     fields = ("memory_current", "anon", "fd", "conntrack")
     baseline = next((s for s in samples if s.get("phase")=="baseline"), None)
     held = [s for s in samples if s.get("phase")=="held"]
     released = [s for s in samples if s.get("phase")=="released"]
-    tolerances = tier.get("resource_tolerances", {})
+    tolerances = tier.get("resource_tolerances") or {}
     recovered = None
-    if baseline and held and released and all(k in tolerances for k in fields):
-        recovered = next((s for s in released if all(isinstance(s.get(k),(int,float)) and
-            isinstance(baseline.get(k),(int,float)) and s[k]-baseline[k] <= tolerances[k] for k in fields)), None)
+    if baseline and held and released and all(type(tolerances.get(k)) in (int,float) for k in fields):
+        final = released[-1]
+        if all(isinstance(final.get(k),(int,float)) and isinstance(baseline.get(k),(int,float)) and
+               final[k]-baseline[k] <= tolerances[k] for k in fields):
+            recovered = final
     if status == "OK" and recovered is None:
         status = "PARTIAL"
     delta = {k: released[-1][k]-baseline[k] for k in fields if baseline and released and
@@ -309,41 +311,51 @@ def build_time(spec):
     if runs:
         status = base.worst([status] + [run_status(r) for r in runs])
     recovery = spec.get("recovery") or {}
-    idle=(spec.get("resource_windows") or [{}])[0].get("egress_start") or (samples[0] if samples else {})
+    idle=spec.get("idle_baseline") or {}
     baseline={k:idle.get(k) for k in RESOURCE_FIELDS+("identity","captured_at_s","origin_cpu_usec") if k in idle}
     if recovery:
         status=base.worst([status,resource_status([baseline]+samples+[recovery])])
+        if not baseline:
+            status=base.worst([status,"PARTIAL"])
     delta = {f: recovery[f]-baseline[f] for f in ("memory_current", "anon", "fd")
              if baseline and isinstance(recovery.get(f), (int, float)) and isinstance(baseline.get(f), (int, float))}
     minute_windows = [w for raw in runs for w in raw.get("minute_windows", [])]
     usable = [w.get("latency_ms", {}).get("p50") for w in minute_windows if w.get("latency_ms", {}).get("n", 0)>0]
     drift = ((usable[-1]-usable[0])/usable[0]*100) if len(usable)>1 and usable[0] else None
-    return {"status": status, "samples": samples, "latency_p50_drift_percent": drift, "analysis_start_s": spec.get("analysis_start_s", 0),
+    groups = {x.get("group",0) for x in runs}
+    active_s = sum(max([x.get("wall_s",0) for x in runs if x.get("group",0)==g] or [0]) for g in groups)
+    actual_rps = sum(x.get("success",0) for x in runs)/active_s if active_s>0 else None
+    target_rate = spec.get("settings",{}).get("rate_rps")
+    return {"status": status, "samples": samples, "actual_rps":actual_rps,
+            "actual_to_target_rate_ratio":actual_rps/target_rate if actual_rps is not None and isinstance(target_rate,(int,float)) and target_rate>0 else None,
+            "latency_p50_drift_percent": drift, "analysis_start_s": spec.get("analysis_start_s", 0),
             "trend": trend, "baseline":baseline, "recovery_delta": delta, "runs": [run_row(r) for r in runs],
             "slope_unit": "bytes/second for memory, descriptors/second for FD"}
 
 
 def build_m7(spec):
-    runs, tiers = spec.get("runs", []), spec.get("tiers", [])
+    runs, tiers = spec.get("runs") or [], spec.get("tiers") or []
     rows, statuses = [], []
     total_refusal = dict(budget=0, unattributed=0)
     for i, raw in enumerate(runs):
         tier = next((t for t in tiers if t.get("group")==raw.get("group",i)), {})
-        refusal = burst_rejections(raw.get("errors",{}),tier.get("server_budget_denials",0))
+        errors=raw.get("errors")
+        errors_complete=isinstance(errors,dict) and all(type(v) is int and v>=0 for v in errors.values())
+        refusal = burst_rejections(errors if errors_complete else {},tier.get("server_budget_denials") or 0)
         for k in total_refusal:
             total_refusal[k] += refusal[k]
         status = run_status(raw)
         expected, rejects = tier.get("expected_success"), tier.get("expected_rejections")
         recovery = resource_recovery(tier)
-        success, failed = raw.get("success",0), raw.get("failed",0)
-        budget=tier.get("budget",{})
-        attempted=raw.get("attempted",0)
+        success, failed = raw.get("success") or 0, raw.get("failed") or 0
+        budget=tier.get("budget") or {}
+        attempted=raw.get("attempted") or 0
         numeric_budget=all(type(budget.get(k)) is int and budget[k]>0 for k in ("per_subject","process","available"))
         available=min(budget['per_subject'],budget['process']) if numeric_budget and budget.get('admission_enabled') is True else attempted
         expected_count=min(attempted,available)
         budget_matches=(numeric_budget and budget.get('available')==available and
                         expected==[expected_count,expected_count] and rejects==[attempted-expected_count,attempted-expected_count])
-        good = (expected and rejects and success>0 and expected[0]<=success<=expected[1] and
+        good = (errors_complete and expected and rejects and success>0 and expected[0]<=success<=expected[1] and
                 rejects[0]<=failed<=rejects[1] and raw.get("attempted")==success+failed and
                 raw.get("verified")==success and raw.get("released_alive")==success and
                 not refusal["unattributed"] and refusal["budget"]==failed and
@@ -375,13 +387,14 @@ def build_m9(spec):
     points, statuses = [], []
     for p in spec.get("points", []):
         row = {k: p.get(k) for k in ("target", "registered", "acked", "active", "capacity_rejections",
-                    "registration_ms", "activation_ms", "memory_current", "anon", "usage_usec", "nft_rules", "nft_enumeration", "driver_cost", "resource_sample", "usage_excluding_prior_enumeration_usec")}
+                    "registration_ms", "activation_ms", "rejection_reason", "memory_current", "anon", "usage_usec", "nft_rules", "nft_enumeration", "driver_cost", "resource_sample", "usage_excluding_prior_enumeration_usec")}
         counts = [p.get(k, 0) for k in ("registered", "acked", "active")]
         target = p["target"]
         expected = min(target, 4096)
         if any(type(n) is not int or n < 0 for n in counts) or counts[2] > counts[1] or counts[1] > counts[0] or counts[0] > target:
             status = "INVALID"
-        elif counts[0] != target or counts[1:] != [expected, expected] or (target>4096 and not p.get("capacity_rejections")):
+        elif counts != [expected]*3 or (target>4096 and (p.get("capacity_rejections") != target-4096 or
+                p.get("rejection_reason") != "subject_capacity_exhausted" or spec.get("recovery_ok") is not True)):
             status = "PARTIAL"
         else:
             status = "OK"
@@ -390,6 +403,7 @@ def build_m9(spec):
             evidence_status=resource_status(evidence)
             status=base.worst([status,"PARTIAL" if evidence_status=="MISSING" else evidence_status])
         row["status"] = status
+        row["outcome"] = "expected_overflow" if target>4096 and status=="OK" else "within_capacity" if status=="OK" else "incomplete"
         points.append(row); statuses.append(status)
     if points and not spec.get("cleanup_ok"):
         statuses.append("PARTIAL")

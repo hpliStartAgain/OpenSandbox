@@ -93,9 +93,9 @@ def run(args):
             victim = min(active)
             removed = request(args.url, envelope(prefix, victim, 'REMOVE_BINDING')) == 200
             active.discard(victim)
-            overflow = max(registered)
+            overflow = max(set(attempted)-registered) if set(attempted)-registered else None
             result['recovery_ok'] = False
-            if removed:
+            if removed and overflow is not None:
                 # Removal publishes asynchronously; retry the same fence.
                 for attempt in range(50):
                     if request(args.url, envelope(prefix, overflow, 'SET_BINDING')) == 200 and request(args.url, envelope(prefix, overflow, 'LIFECYCLE_HOOK')) == 200:

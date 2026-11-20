@@ -110,7 +110,7 @@ class Regressions(unittest.TestCase):
         rows=[dict(sample(t),memory_current=150) for t in (1,10)]
         recovery=dict(sample(20),memory_current=105)
         out=r.build_time(dict(samples=rows,recovery=recovery,duration_s=10,
-                             resource_windows=[dict(egress_start=sample())]))
+                             idle_baseline=sample(),resource_windows=[dict(egress_start=sample())]))
         self.assertEqual(out['recovery_delta']['memory_current'],5)
 
     def test_m9_cost_requires_external_driver(self):

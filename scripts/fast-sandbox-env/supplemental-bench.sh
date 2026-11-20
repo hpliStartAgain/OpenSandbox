@@ -12,6 +12,7 @@ sup_report() {
 }
 
 sup_spec() {
+	SUP_ACTIVE_KEY="$1"
 	jq -n --argjson smoke "$SUP_SMOKE" --arg mem "$BENCH_EGRESS_MEMORY_LIMIT" --argjson cap "$BENCH_FSB_TLS_CAPACITY" \
 		--argjson guests "$SUP_LOAD_GUESTS" --argjson load "$SUP_LOAD_S" --argjson idle "$SUP_IDLE_S" \
 		'{smoke:$smoke, settings:{egress_memory_limit:$mem,per_subject_tls_capacity:$cap,load_guests:$guests,load_seconds:$load,idle_seconds:$idle}, runs:[], samples:[], paths:[], blocks:[], points:[]}'  > "$SUP_RAW/$1-spec.json"
@@ -109,9 +110,20 @@ sup_start() { # id name path concurrency connection duration body [extra args]
 	[[ -n "$(jq -r '.execution_id // empty' <<< "$out")" ]] || fail "supplemental: no execution id"
 }
 
+sup_path_check() { # measurement raw-file [classified contradiction count]
+	local key="$1" raw="$2" bad="${3:-}"
+	[[ -n "$bad" ]] || bad="$(jq -r '.contradictions // 0' "$raw")"
+	if (( bad > 0 )); then
+		jq -n --arg key "$key" --arg evidence "$(basename "$raw")" --argjson bad "$bad" \
+			'{measurement:($key|ascii_upcase),status:"INVALID",reason:"guest path contradiction",contradictions:$bad,raw_evidence:$evidence}' > "$SUP_DIR/$key.json"
+		fail "supplemental $key path contradiction"
+	fi
+}
+
 sup_fetch() { # id name -> file
 	bench_wait "$SUP_CLIENT_ATTEMPTS" bench_guest_fetch "$1" "$CB_GUEST_DIR/$2.json" "$SUP_RAW/$2.json" \
 		|| fail "supplemental: no client result for $2"
+	sup_path_check "$SUP_ACTIVE_KEY" "$SUP_RAW/$2.json"
 }
 
 sup_append_run() { # key raw-file path concurrency connection body repeat cpu
@@ -136,7 +148,7 @@ sup_gate_ready() {
 
 sup_load_pair() { # measurement concurrency connection seconds body repeat cpu mix
 	local key="$1" c="$2" conn="$3" seconds="$4" body="$5" rep="$6" cpu="$7" mix="$8" \
-		i n name phase duration rate gate expected e_pid o_pid identity egress origin window time_pid time_start stop
+		i n name phase duration rate gate expected e_pid o_pid identity egress origin window time_pid time_start stop restarts_start
 	local -a ids=("$BENCH_B") names=() counts=()
 	if [[ "$key" == m5 ]]; then ids=("${SUP_LOAD_IDS[@]}"); fi
 	SUP_TOTAL_CONCURRENCY="$c"
@@ -165,6 +177,7 @@ sup_load_pair() { # measurement concurrency connection seconds body repeat cpu m
 			SUP_WINDOW_PIDS="$e_pid $o_pid"; expected=$((expected+2))
 		fi
 		bench_wait "$SUP_CLIENT_ATTEMPTS" sup_gate_ready "$gate" "$expected" || fail "supplemental: common gate readiness missing"
+		if [[ "$phase" == measured ]]; then restarts_start="$(bench_egress_restarts "$BENCH_POD")"; fi
 		sup_gate release "$gate" > "$SUP_RAW/$gate-release.json"
 		if [[ "$phase" == measured && -n "${SUP_TIME_KEY:-}" ]]; then
 			time_start="$(jq -r '.start_at_s*1000000000 | floor' "$SUP_RAW/$gate-release.json")"; stop="$SUP_RAW/$gate-stop"
@@ -178,9 +191,9 @@ sup_load_pair() { # measurement concurrency connection seconds body repeat cpu m
 			fi
 			egress=initial; [[ "$identity" == "$(bench_egress_identity "$BENCH_POD")" ]] || egress=changed
 			origin="$(cat "$SUP_RAW/$gate-origin.json")"
-			window="$(jq --arg identity "$egress" --argjson r "$(bench_egress_restarts "$BENCH_POD")" --argjson origin "$origin" \
+			window="$(jq --arg identity "$egress" --argjson r0 "$restarts_start" --argjson r "$(bench_egress_restarts "$BENCH_POD")" --argjson origin "$origin" \
 				--argjson c "$c" --argjson mix "$mix" --argjson group "$SUP_SEQ" \
-				'{egress_start:(.start+{identity:"initial",restarts:$r}),egress_end:(.end+{identity:$identity,restarts:$r}),
+				'{egress_start:(.start+{identity:"initial",restarts:$r0}),egress_end:(.end+{identity:$identity,restarts:$r}),
 				origin_cpu_s:(($origin.end.usage_usec-$origin.start.usage_usec)/1000000),
 				wall_s:(.end.captured_at_s-.start.captured_at_s),scheduled_start_s:.scheduled_start_s,
 				origin_start_s:$origin.start.captured_at_s,origin_end_s:$origin.end.captured_at_s,concurrency:$c,bound_percent:$mix,group:$group}' "$SUP_RAW/$gate-egress.json")"
@@ -242,7 +255,8 @@ sup_m3x_path() { # bound or unbound on the current mode
 			bench_wait "$SUP_CLIENT_ATTEMPTS" bench_guest_fetch "${ids[$i]}" "$CB_GUEST_DIR/m3x-$target-$k/status.json" "$raw" || fail "M3x holder result missing"
 			got=$((got+$(jq -r .held "$raw")))
 			# classify with the existing closed evidence vocabulary, privately.
-			contrad=$((contrad+$(python3 "$SUP_SELF_DIR/supplemental-tools.py" classify "$raw" "$CB_ORIGIN_LEAF" "$leaf" "${codes[$i]}")))
+			contrad="$(python3 "$SUP_SELF_DIR/supplemental-tools.py" classify "$raw" "$CB_ORIGIN_LEAF" "$leaf" "${codes[$i]}")"
+			sup_path_check m3x "$raw" "$contrad"
 		done
 		held_total=$((held_total+got)); sleep "$BENCH_MEM_SETTLE_SECONDS"
 		reading="$(bench_egress_cgroup "$BENCH_POD")"
@@ -321,6 +335,7 @@ sup_time() { # m6 or m8 on both modes
 		sup_spec "$key"
 		bench_json_set "$SUP_RAW/$key-spec.json" '.duration_s=$d | .analysis_start_s=$a | .settings.mode=$mode' --argjson d "$seconds" --argjson a "$analysis" --arg mode "$mode"
 		sup_pool "$mode" 500m; sup_pair
+		bench_json_set "$SUP_RAW/$key-spec.json" '.idle_baseline=$s' --argjson s "$(sup_sample)"
 		SUP_TIME_KEY="$key"; SUP_TIME_OFFSET=0
 		if [[ "$key" == m6 ]]; then
 			SUP_CHURN_EVERY=1
@@ -374,12 +389,15 @@ sup_m7() {
 				sup_start "$BENCH_B" "$name" bound "$burst" keep-alive 1 0 burst \
 					--ready-file "$CB_GUEST_DIR/$name-ready.json" --release-file "$CB_GUEST_DIR/$name-go" --hold-s 120
 				bench_wait "$SUP_CLIENT_ATTEMPTS" bench_guest_fetch "$BENCH_B" "$CB_GUEST_DIR/$name-ready.json" "$SUP_RAW/$name-ready.json" || fail "M7 burst readiness missing"
+				sup_path_check m7 "$SUP_RAW/$name-ready.json"
 				reading="$(sup_sample)"
 				bench_json_set "$SUP_RAW/m7-tier.json" '.resource_samples+=[$s+{phase:"held",t_s:($t/1000)}]' --argjson s "$reading" --argjson t "$(bench_elapsed_ms "$tier_start")"
 				cb_guest_once "$BENCH_U" m7-passthrough
 				leaf=mitm; [[ "$mode" != credential-bound ]] || leaf=origin
 				probe_json="$CB_RESULT"; [[ -n "$probe_json" ]] || probe_json='{}'
 				bad="$(jq --arg origin "$CB_ORIGIN_LEAF" --arg leaf "$leaf" 'if (.last.origin.cred != null and .last.origin.cred != "absent") or (.leaf_sha256 != null and ((.leaf_sha256==$origin) != ($leaf=="origin"))) then 1 else 0 end' <<< "$probe_json")"
+				printf '%s\n' "$probe_json" > "$SUP_RAW/$name-passthrough.json"
+				sup_path_check m7 "$SUP_RAW/$name-passthrough.json" "$bad"
 				p_ok=false; if [[ "$CB_RC" == 0 && "$bad" == 0 ]]; then p_ok=true; fi
 				bench_json_set "$SUP_RAW/m7-tier.json" '.passthrough_ok=$ok | .passthrough_contradictions=$bad' --argjson ok "$p_ok" --argjson bad "$bad"
 				sup_start "$BENCH_B" "$name-same-unbound" bound 1 new 1 0 load --bound-percent 0 --max-requests 1
@@ -406,7 +424,7 @@ PROBE
 					reading="$(sup_sample)"
 					bench_json_set "$SUP_RAW/m7-tier.json" '.resource_samples+=[$s+{phase:"released",t_s:($t/1000),release_elapsed_s:($r/1000)}]' \
 						--argjson s "$reading" --argjson t "$(bench_elapsed_ms "$tier_start")" --argjson r "$(bench_elapsed_ms "$released_start")"
-					if sup_m7_resources_ready; then recovered=true; break; fi
+					if sup_m7_resources_ready; then recovered=true; else recovered=false; fi
 					(( $(bench_elapsed_ms "$released_start") < SUP_RESOURCE_RECOVERY_S*1000 )) || break
 					sleep "$SUP_RESOURCE_INTERVAL_S"
 				done
@@ -460,7 +478,9 @@ sup_m9() {
 			nft_enumeration:{wall_ms:$wall,cpu_before_usec:$s.usage_usec,cpu_after_usec:$e.usage_usec,memory_current_before:$s.memory_current,memory_current_after:$e.memory_current,anon_before:$s.anon,anon_after:$e.anon,cpu_delta_usec:($e.usage_usec-$s.usage_usec)}}' >> "$SUP_RAW/m9-resources.jsonl"
 		nft_cpu=$((nft_cpu+$(jq -n --argjson a "$reading" --argjson b "$after" '$b.usage_usec-$a.usage_usec')))
 		bench_handshakes "$BENCH_U" "m9-u-$step" "$SUP_SCALE_PROBES" "$SUP_RAW/m9-u-$step.json"
+		sup_path_check m9 "$SUP_RAW/m9-u-$step.json" "$(python3 "$SUP_SELF_DIR/supplemental-tools.py" classify "$SUP_RAW/m9-u-$step.json" "$CB_ORIGIN_LEAF" origin absent)"
 		bench_handshakes "$BENCH_B" "m9-b-$step" "$SUP_SCALE_PROBES" "$SUP_RAW/m9-b-$step.json"
+		sup_path_check m9 "$SUP_RAW/m9-b-$step.json" "$(python3 "$SUP_SELF_DIR/supplemental-tools.py" classify "$SUP_RAW/m9-b-$step.json" "$CB_ORIGIN_LEAF" mitm "$SUP_CODE")"
 		touch "$control/continue-$step"
 	done
 	wait "$pid" || fail "M9 synthetic driver failed"; SUP_SUBJECT_PID=""
@@ -469,7 +489,7 @@ sup_m9() {
 		--slurpfile d "$out" --slurpfile r "$SUP_RAW/m9-resources.jsonl"
 	local denials
 	denials="$(kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress --since-time="$SUP_SINCE" | grep -c subject_capacity_exhausted || true)"
-	bench_json_set "$SUP_RAW/m9-spec.json" '.points |= map(if .target>4096 then .capacity_rejections=$n else . end)' --argjson n "$denials"
+	bench_json_set "$SUP_RAW/m9-spec.json" '.points |= map(if .target>4096 then .capacity_rejections=$n | .rejection_reason="subject_capacity_exhausted" else . end)' --argjson n "$denials"
 	python3 "$SUP_SELF_DIR/supplemental-tools.py" m9-probes "$SUP_RAW/m9-spec.json" "$SUP_RAW" "$CB_ORIGIN_LEAF" "$SUP_CODE"
 	sup_report m9
 }
@@ -511,7 +531,7 @@ supplemental_bench() {
 	SUP_OWNER_PID="$BASHPID"
 	[[ "$-" != *x* ]] || fail "supplemental refuses xtrace"
 	SUP_SMOKE="${SUP_SMOKE:-false}"
-	SUP_MEASUREMENTS="${SUP_MEASUREMENTS:-m10 m3x m5 m6 m7 m9 m8}"
+	SUP_MEASUREMENTS="${SUP_MEASUREMENTS:-m10 m3x m5 m6 m7 m9}"
 	SUP_CPU_LIMITS="${SUP_CPU_LIMITS:-500m 2}"
 	SUP_CONCURRENCIES="${SUP_CONCURRENCIES:-1 16 64 256}"
 	SUP_BODY_BYTES="${SUP_BODY_BYTES:-0 65536}"
