@@ -300,15 +300,17 @@ def build_time(spec):
     if runs:
         status = base.worst([status] + [run_status(r) for r in runs])
     recovery = spec.get("recovery") or {}
+    idle=(spec.get("resource_windows") or [{}])[0].get("egress_start") or (samples[0] if samples else {})
+    baseline={k:idle.get(k) for k in RESOURCE_FIELDS+("identity","captured_at_s","origin_cpu_usec") if k in idle}
     if recovery:
-        status=base.worst([status,resource_status(samples+[recovery])])
-    delta = {f: recovery[f]-samples[0][f] for f in ("memory_current", "anon", "fd")
-             if samples and isinstance(recovery.get(f), (int, float)) and isinstance(samples[0].get(f), (int, float))}
+        status=base.worst([status,resource_status([baseline]+samples+[recovery])])
+    delta = {f: recovery[f]-baseline[f] for f in ("memory_current", "anon", "fd")
+             if baseline and isinstance(recovery.get(f), (int, float)) and isinstance(baseline.get(f), (int, float))}
     minute_windows = [w for raw in runs for w in raw.get("minute_windows", [])]
     usable = [w.get("latency_ms", {}).get("p50") for w in minute_windows if w.get("latency_ms", {}).get("n", 0)>0]
     drift = ((usable[-1]-usable[0])/usable[0]*100) if len(usable)>1 and usable[0] else None
     return {"status": status, "samples": samples, "latency_p50_drift_percent": drift, "analysis_start_s": spec.get("analysis_start_s", 0),
-            "trend": trend, "recovery_delta": delta, "runs": [run_row(r) for r in runs],
+            "trend": trend, "baseline":baseline, "recovery_delta": delta, "runs": [run_row(r) for r in runs],
             "slope_unit": "bytes/second for memory, descriptors/second for FD"}
 
 

@@ -92,6 +92,13 @@ class Regressions(unittest.TestCase):
         self.assertEqual(out['trend']['memory_current']['slope'],0)
         self.assertEqual(out['trend']['memory_current']['n'],3)
 
+    def test_time_recovery_uses_idle_gate_snapshot(self):
+        rows=[dict(sample(t),memory_current=150) for t in (1,10)]
+        recovery=dict(sample(20),memory_current=105)
+        out=r.build_time(dict(samples=rows,recovery=recovery,duration_s=10,
+                             resource_windows=[dict(egress_start=sample())]))
+        self.assertEqual(out['recovery_delta']['memory_current'],5)
+
     def test_m9_cost_requires_external_driver(self):
         s=dict(points=[dict(target=4,registered=4,acked=4,active=4,memory_current=20,anon=10)],cleanup_ok=True)
         self.assertNotIn('per_subject_fit',r.build_m9(s))
