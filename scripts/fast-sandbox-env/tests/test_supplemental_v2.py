@@ -27,7 +27,7 @@ def run():
                 start_at_s=100, end_at_s=160)
 
 def burst():
-    return dict(runs=[run()], tiers=[dict(group=0, budget=dict(admission_enabled=True,per_subject=2, process=8, available=2),
+    return dict(recovered=True,passthrough_ok=True,server_budget_denials=2,established_alive=0,runs=[run()], tiers=[dict(group=0, budget=dict(admission_enabled=True,per_subject=2, process=8, available=2),
         expected_success=[2,2], expected_rejections=[2,2], server_budget_denials=2,
         passthrough_ok=True, same_subject_passthrough_ok=True, recovered=True, injection_recovery_ms=1,
         resource_samples=[dict(sample(), phase='baseline'),dict(sample(1), phase='held'),dict(sample(2), phase='released')],
@@ -36,11 +36,11 @@ def burst():
 class Regressions(unittest.TestCase):
     def test_low_budget_all_rejected_fails(self):
         s=burst(); s['runs'][0].update(success=0, verified=0, failed=4, released_alive=0, errors={'handshake/tls_closed':4})
-        s['tiers'][0]['server_budget_denials']=4
+        s['tiers'][0]['server_budget_denials']=4; s['server_budget_denials']=4
         self.assertNotEqual(r.build_m7(s)['status'], 'OK')
 
     def test_no_held_connection_cannot_pass(self):
-        s=burst(); s['runs'][0]['released_alive']=0
+        s=burst(); del s['runs'][0]['released_alive']
         self.assertNotEqual(r.build_m7(s)['status'], 'OK')
 
     def test_unattributed_errors_degrade_independently(self):
