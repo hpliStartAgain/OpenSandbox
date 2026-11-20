@@ -256,7 +256,7 @@ def build_m5(spec):
             start = max(start, e0.get("captured_at_s",start))
             end = min(end, e1.get("captured_at_s",end))
             overlap = max(0,end-start)
-            if not wall or overlap/wall < .90:
+            if not wall or overlap/max([wall]+[b-a for a,b in times]) < .90:
                 status = base.worst([status,"PARTIAL"])
         else:
             status = base.worst([status,"PARTIAL"])

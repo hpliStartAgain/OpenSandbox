@@ -90,6 +90,10 @@ class Regressions(unittest.TestCase):
         b=dict(a,start_at_s=160,end_at_s=220)
         s=dict(runs=[a,b],resource_windows=[dict(group=0,wall_s=60,egress_start=sample(),egress_end=sample(60),origin_cpu_s=60,origin_start_s=100,origin_end_s=160)])
         self.assertEqual(r.build_m5(s)['status'],'PARTIAL')
+        # A long client drain must not turn a shorter counter window into
+        # an apparently complete common window.
+        s['runs']=[dict(a,end_at_s=180,wall_s=80)]
+        self.assertEqual(r.build_m5(s)['status'],'PARTIAL')
 
     def test_time_counter_rollback_is_invalid(self):
         rows=[sample(),sample(10),sample(20)]; rows[1]['usage_usec']=-1
