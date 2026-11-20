@@ -287,7 +287,7 @@ def build_time(spec):
     samples = [{k: x.get(k) for k in ("t_s", "memory_current", "anon", "usage_usec", "nr_throttled",
                "throttled_usec", "fd", "conntrack", "oom_kill", "restarts", "origin_cpu_usec", "identity", "captured_at_s")}
                for x in spec.get("samples", [])]
-    window = [s for s in samples if s["t_s"] >= spec.get("analysis_start_s", 0)]
+    window = [s for s in samples if spec.get("analysis_start_s", 0) <= s["t_s"] <= spec.get("duration_s", math.inf)]
     trend = {f: base.least_squares([(s["t_s"], s[f]) for s in window if isinstance(s.get(f), (int, float))])
              for f in ("memory_current", "anon", "fd")}
     status = "MISSING"

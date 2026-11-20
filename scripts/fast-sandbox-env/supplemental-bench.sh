@@ -190,7 +190,7 @@ sup_load_pair() { # measurement concurrency connection seconds body repeat cpu m
 			bench_json_set "$SUP_RAW/$key-spec.json" '.resource_windows=((.resource_windows // [])+[$w])' --argjson w "$window"
 		fi
 		if [[ "$phase" == measured && -n "${SUP_TIME_KEY:-}" ]]; then
-			bench_json_set "$SUP_RAW/$key-spec.json" '.samples+=$s' --slurpfile s "$SUP_RAW/$key-samples.jsonl"
+			bench_json_set "$SUP_RAW/$key-spec.json" '.samples+=[$s[] | select(.t_s<=$end)]' --argjson end "$((SUP_TIME_OFFSET+duration))" --slurpfile s "$SUP_RAW/$key-samples.jsonl"
 			bench_json_set "$SUP_RAW/$key-spec.json" '.samples+=[$w.egress_end+{origin_cpu_usec:$o.end.usage_usec,t_s:$t}]' \
 				--argjson w "$window" --argjson o "$origin" --argjson t "$((SUP_TIME_OFFSET+duration))"
 			SUP_TIME_OFFSET=$((SUP_TIME_OFFSET+duration))

@@ -85,6 +85,13 @@ class Regressions(unittest.TestCase):
         rows=[sample(),sample(10),sample(20)]; rows[1]['usage_usec']=-1
         self.assertEqual(r.build_time(dict(samples=rows,duration_s=20))['status'],'INVALID')
 
+    def test_time_trend_excludes_control_tail(self):
+        rows=[sample(t) for t in (0,10,20,30)];rows[-1]['memory_current']=10000
+        out=r.build_time(dict(samples=rows,duration_s=20))
+        self.assertEqual(out['status'],'OK')
+        self.assertEqual(out['trend']['memory_current']['slope'],0)
+        self.assertEqual(out['trend']['memory_current']['n'],3)
+
     def test_m9_cost_requires_external_driver(self):
         s=dict(points=[dict(target=4,registered=4,acked=4,active=4,memory_current=20,anon=10)],cleanup_ok=True)
         self.assertNotIn('per_subject_fit',r.build_m9(s))
