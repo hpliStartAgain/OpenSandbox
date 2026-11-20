@@ -393,6 +393,8 @@ PROBE
 )"
 				bench_json_set "$SUP_RAW/m7-tier.json" '.same_subject_passthrough_ok=$ok' --argjson ok "$p_ok"
 				bench_json_set "$SUP_RAW/m7-spec.json" '.same_subject_passthrough_runs=((.same_subject_passthrough_runs // [])+$r)' --slurpfile r "$SUP_RAW/$name-same-unbound.json"
+				reading="$(sup_sample)"
+				bench_json_set "$SUP_RAW/m7-tier.json" '.resource_samples+=[$s+{phase:"held",t_s:($t/1000)}]' --argjson s "$reading" --argjson t "$(bench_elapsed_ms "$tier_start")"
 				osb_api command run "$BENCH_B" -- touch "$CB_GUEST_DIR/$name-go" >/dev/null
 				released_start="$(bench_ns)"; sup_fetch "$BENCH_B" "$name"
 				SUP_TOTAL_CONCURRENCY="$burst"; sup_append_run m7 "$SUP_RAW/$name.json" bound "$burst" keep-alive 0 "$rep" 500m

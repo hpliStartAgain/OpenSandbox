@@ -309,6 +309,7 @@ cat "$SUP_DIR/m7-credential-bound.json"
         self.assertEqual(out['status'], 'OK')
         self.assertTrue(out['passthrough_ok'])
         self.assertEqual(len(out['tiers']),3)
+        self.assertTrue(all(sum(s['phase']=='held' for s in t['resource_recovery']['samples'])==2 for t in out['tiers']))
 
     def test_large_latency_payload_does_not_enter_argv(self):
         raw = Path(self.tmp)/'large.json'
