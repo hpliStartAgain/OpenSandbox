@@ -156,6 +156,26 @@ class SupplementalShellTest(ShellCase):
         body = 'TEMPLATE_ID=tpl-1; render_pool; cp "$GEN_DIR/$POOL_PROFILE.yaml" "$WORK/before"; source "$SCRIPT_DIR/supplemental-bench.sh"; render_pool; cmp "$WORK/before" "$GEN_DIR/$POOL_PROFILE.yaml"'
         self.assertEqual(self.sourced(body, OCI_STACK='0').returncode, 0)
 
+    def test_cpu_limit_override_preserves_requests(self):
+        body = r'''
+TEMPLATE_ID=tpl-1
+source "$SCRIPT_DIR/supplemental-bench.sh"
+SUP_CRED=unused; SUP_CODE=unused; SUP_IDLE_S=1
+sup_scan() { :; }
+bench_pool_apply() { cat "$1"; }
+kubectl() { printf '{"items":[{"spec":{"containers":[{"name":"egress","env":[{"name":"OPENSANDBOX_EGRESS_FSB_INTERCEPTION_MODE","value":"all"}],"resources":{"limits":{"cpu":"2"}}}]}}]}'; }
+wait_for() { :; }
+sleep() { :; }
+sup_pool all 2
+'''
+        import yaml
+        out = self.sourced(body, OCI_STACK='0', WARM_IMAGES='0').stdout
+        doc = yaml.safe_load(out)
+        containers = doc['spec']['fastletTemplate']['spec']['containers']
+        egress = next(c for c in containers if c['name']=='egress')
+        self.assertEqual(egress['resources']['limits']['cpu'], 2)
+        self.assertEqual(egress['resources']['requests']['cpu'], '100m')
+
     def test_measurements_are_opt_in(self):
         workflow = (ROOT.parents[1]/'.github/workflows/fast-sandbox-test.yml').read_text()
         self.assertNotIn('bench-supplemental', workflow)

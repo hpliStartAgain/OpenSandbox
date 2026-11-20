@@ -22,7 +22,7 @@ SUP_REPORT_DIR=/path/to/new-report-dir \
 | M9 | `SUP_SUBJECT_STEPS='256 1024 2048 4096 4097'`、`SUP_SCALE_PROBES=20` | `m9.json` |
 | M10 | `SUP_BLOCKS=8`、固定 ABBAABBA 前缀；`BENCH_CREATE_ROUNDS=3`、`BENCH_CREATE_N=200`、`BENCH_CREATE_CONCURRENCY=10` | `m10.json` |
 
-`SUP_IDLE_S=20` 为 Pool warm 判据通过后的等待。`SUP_CLIENT_ATTEMPTS=7200` 是每两秒一次的结果轮询上限。M8 默认包含在完整选择中，未指定正数 `SUP_RATE_B` 时预检拒绝执行；只执行其他项目时，用 `SUP_MEASUREMENTS` 选择。
+补测显式设置 `WARM_IMAGES=1`，等待模板缓存覆盖全部 `POOL_MIN` 个 Fastlet；收尾恢复原 warm 设置。`SUP_IDLE_S=20` 为 Pool warm 判据通过后的等待。`SUP_CLIENT_ATTEMPTS=7200` 是每两秒一次的结果轮询上限。M8 默认包含在完整选择中，未指定正数 `SUP_RATE_B` 时预检拒绝执行；只执行其他项目时，用 `SUP_MEASUREMENTS` 选择。
 
 M3x 对 all/cb × bound/unbound 四条路径分别取 cgroup `memory.current` 与 `anon`，按实际完整持有数拟合 OLS。最终在同一批连接上请求并释放，释放不完整的点不参与拟合。混合比例表由实测斜率推导。
 

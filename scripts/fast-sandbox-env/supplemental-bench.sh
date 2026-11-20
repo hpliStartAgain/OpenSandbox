@@ -53,6 +53,7 @@ sup_pool() { # mode cpu-limit; each block gets a new Pool and live env readback
 	awk -v cpu="$cpu" '
 		/^      - name: / { e=($0=="      - name: egress"); l=0 }
 		e && /^          limits:$/ { l=1 }
+		e && /^          requests:$/ { l=0 }
 		e && l && /^            cpu:/ { print "            cpu: " cpu; next }
 		{ print }
 	' "$GEN_DIR/$POOL_PROFILE.bench.yaml" > "$GEN_DIR/supplemental-pool.yaml"
@@ -63,8 +64,13 @@ sup_pool() { # mode cpu-limit; each block gets a new Pool and live env readback
 		| jq -e --arg m "$mode" --arg cpu "$cpu" 'all(.items[]; (.spec.containers[] | select(.name=="egress")) as $e |
 			([$e.env[]? | select(.name=="OPENSANDBOX_EGRESS_FSB_INTERCEPTION_MODE") | .value] == [$m]) and $e.resources.limits.cpu==$cpu)' >/dev/null \
 		|| fail "supplemental: live mode/CPU mismatch"
-	wait_for "supplemental: identical warm-image readiness criterion" 300 warm_images_ready
+	wait_for "supplemental: template cached on every warm Fastlet" 300 sup_warm_ready
 	sleep "$SUP_IDLE_S"
+}
+
+sup_warm_ready() {
+	kubectl -n "$RESOURCE_NS" get sandboxpool "$POOL_NAME" -o json | jq -e --argjson n "$POOL_MIN" \
+		'(.status.warmImages | length)>0 and all(.status.warmImages[]; .cachedFastlets >= $n)' >/dev/null
 }
 
 sup_pair() {
@@ -361,7 +367,7 @@ sup_cleanup() {
 	[[ -z "${SUP_SAMPLER:-}" ]] || { kill "$SUP_SAMPLER" 2>/dev/null || true; wait "$SUP_SAMPLER" 2>/dev/null || true; }
 	[[ -z "${SUP_SUBJECT_PID:-}" ]] || { kill "$SUP_SUBJECT_PID" 2>/dev/null || true; wait "$SUP_SUBJECT_PID" 2>/dev/null || true; }
 	cb_cleanup
-	EGRESS_INTERCEPTION_MODE="$SUP_ORIGINAL_MODE"
+	EGRESS_INTERCEPTION_MODE="$SUP_ORIGINAL_MODE"; WARM_IMAGES="$SUP_ORIGINAL_WARM"
 	bench_pool_restore
 }
 
@@ -390,11 +396,13 @@ supplemental_bench() {
 	[[ ! -e "$SUP_DIR" ]] || die "supplemental output exists; choose a fresh SUP_REPORT_DIR"
 	mkdir -p "$SUP_RAW" "$GEN_DIR"
 	# shellcheck disable=SC2034 # read by sourced bench helpers
-	BENCH_DIR="$SUP_DIR"; BENCH_RAW="$SUP_RAW"; SUP_ORIGINAL_MODE="$EGRESS_INTERCEPTION_MODE"
+	BENCH_DIR="$SUP_DIR"; BENCH_RAW="$SUP_RAW"; SUP_ORIGINAL_MODE="$EGRESS_INTERCEPTION_MODE"; SUP_ORIGINAL_WARM="$WARM_IMAGES"; WARM_IMAGES=1
 	# shellcheck disable=SC2034 # array read by bench_bind
 	BENCH_BIND_MS=()
 	CB_WORK_DIR="$(mktemp -d "$GEN_DIR/supplemental.XXXXXX")"
 	trap 'sup_cleanup' EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
 	SUP_SINCE="$(date -u +%FT%TZ)"; SUP_CRED="$(cb_fake_value supplemental)"; SUP_CODE="$(cb_digest "$SUP_CRED")"
 	(umask 077; printf '%s\n' "$SUP_CRED" > "$CB_WORK_DIR/values")
 	# shellcheck disable=SC2034 # read by cb_origin_up
@@ -422,5 +430,5 @@ supplemental_bench() {
 		# INVALID is a stop gate even when a report was written by a subshell.
 		if jq -e 'select(.status=="INVALID")' "$SUP_DIR/"*.json >/dev/null; then fail "INVALID supplemental report"; fi
 	done
-	sup_cleanup; trap - EXIT
+	sup_cleanup; trap - EXIT INT TERM
 }
