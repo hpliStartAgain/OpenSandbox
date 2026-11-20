@@ -127,6 +127,11 @@ def build_m3x(spec):
         paths.append({"mode": raw.get("mode"), "target": raw.get("target"), "status": status,
                       "points": points, "fit": fit})
         statuses.append(status)
+    identities = [(p["mode"], p["target"]) for p in paths]
+    if len(identities) != len(set(identities)):
+        statuses.append("INVALID")
+    elif paths and set(identities) != {(mode, target) for mode in ("all", "credential-bound") for target in ("bound", "unbound")}:
+        statuses.append("PARTIAL")
     mixtures = []
     indexed = {(p["mode"], p["target"]): p for p in paths if p["status"] == "OK"}
     for mode in ("all", "credential-bound"):

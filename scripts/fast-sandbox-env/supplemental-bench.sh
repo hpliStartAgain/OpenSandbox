@@ -415,11 +415,7 @@ supplemental_bench() {
 	# shellcheck disable=SC2034 # read by cb_origin_up
 	CB_ORIGIN_SRC="$SUP_SELF_DIR/supplemental-origin.py"
 	local original_ca="$MITM_CA_DIR"
-	mkdir "$CB_WORK_DIR/ca"
-	cp "$MITM_CA_DIR/tls.crt" "$CB_WORK_DIR/ca/tls.crt"
-	openssl req -new -newkey rsa:2048 -nodes -keyout "$CB_WORK_DIR/ca/echo.key" -out "$CB_WORK_DIR/ca/echo.csr" -subj "/CN=$MITM_ECHO_DOMAIN" >/dev/null 2>&1
-	printf 'subjectAltName=DNS:%s,DNS:unbound.%s\nextendedKeyUsage=serverAuth\n' "$MITM_ECHO_DOMAIN" "$MITM_ECHO_DOMAIN" > "$CB_WORK_DIR/ca/echo.ext"
-	openssl x509 -req -in "$CB_WORK_DIR/ca/echo.csr" -CA "$MITM_CA_DIR/tls.crt" -CAkey "$MITM_CA_DIR/tls.key" -set_serial "0x$(openssl rand -hex 12)" -out "$CB_WORK_DIR/ca/echo.crt" -days 2 -extfile "$CB_WORK_DIR/ca/echo.ext" >/dev/null 2>&1
+	python3 "$SUP_SELF_DIR/supplemental-tools.py" certificate "$MITM_CA_DIR" "$CB_WORK_DIR/ca" "$MITM_ECHO_DOMAIN"
 	MITM_CA_DIR="$CB_WORK_DIR/ca"; cb_origin_up; MITM_CA_DIR="$original_ca"
 	# Fixture FD limit: no product limit is changed.
 	docker exec "$CB_ORIGIN_CONTAINER" python3 -c 'from pathlib import Path; assert int([x for x in Path("/proc/1/limits").read_text().splitlines() if x.startswith("Max open files")][0].split()[3]) >= 65536' || fail "origin FD limit is below 65536"

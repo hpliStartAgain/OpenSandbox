@@ -3,6 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Private runner glue: validation, path classification and log projection."""
 import importlib.util
+import datetime
+import shutil
+import subprocess
 import json
 import os
 from pathlib import Path
@@ -28,6 +31,26 @@ def segments(text):
     return {'matched_subjects': len(complete), 'incomplete_subjects': len(records)-len(complete),
             'unit': 'ms, integer log precision',
             'distributions': {k: r.quantiles([v[k] for v in complete]) for k in ('total', 'policy_commit', 'apply_policy')}}
+
+
+def make_origin_certificate(ca_dir, out_dir, host):
+    """Backdate fixture leafs for guests resumed from an older warm snapshot."""
+    ca, out = Path(ca_dir), Path(out_dir)
+    out.mkdir(exist_ok=True)
+    shutil.copyfile(str(ca/'tls.crt'), str(out/'tls.crt'))
+    (out/'index').write_text('')
+    (out/'serial').write_text('01\n')
+    config = out/'ca.cnf'
+    config.write_text('[ca]\ndefault_ca=bench\n[bench]\ndatabase=%s\nnew_certs_dir=%s\nserial=%s\ncertificate=%s\nprivate_key=%s\ndefault_md=sha256\npolicy=policy\nunique_subject=no\n[policy]\ncommonName=supplied\n[leaf]\nsubjectAltName=DNS:%s,DNS:unbound.%s\nextendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n' %
+                      (out/'index', out, out/'serial', ca/'tls.crt', ca/'tls.key', host, host))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    start = (now-datetime.timedelta(days=2)).strftime('%y%m%d%H%M%SZ')
+    end = (now+datetime.timedelta(days=2)).strftime('%y%m%d%H%M%SZ')
+    commands = [
+        ['openssl', 'req', '-new', '-newkey', 'rsa:2048', '-nodes', '-keyout', str(out/'echo.key'), '-out', str(out/'echo.csr'), '-subj', '/CN='+host],
+        ['openssl', 'ca', '-batch', '-notext', '-config', str(config), '-in', str(out/'echo.csr'), '-out', str(out/'echo.crt'), '-startdate', start, '-enddate', end, '-extensions', 'leaf']]
+    for command in commands:
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def validate(env):
@@ -62,6 +85,8 @@ def main(argv):
     command, *a = argv
     if command == 'validate':
         validate(os.environ)
+    elif command == 'certificate':
+        make_origin_certificate(*a)
     elif command == 'classify':
         raw, origin, leaf, cred = a
         print(r.base.classify_run(json.loads(Path(raw).read_text()), origin, leaf, cred)['contradictions'])

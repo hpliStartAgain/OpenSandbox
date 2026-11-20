@@ -26,7 +26,7 @@ SUP_REPORT_DIR=/path/to/new-report-dir \
 
 M3x 对 all/cb × bound/unbound 四条路径分别取 cgroup `memory.current` 与 `anon`，按实际完整持有数拟合 OLS。最终在同一批连接上请求并释放，释放不完整的点不参与拟合。混合比例表由实测斜率推导。
 
-M5 的客户端按 100 次请求周期选择 5 次 bound、95 次 unbound，或全部 bound。两个 SNI 使用同一 origin 和 CA，只有主名称绑定 Vault；每次响应核对证书路径与 origin 凭据类别。不同路径的 keep-alive session 分开持有。并发分摊到同一 Fastlet Pod 上的多个 guest，报告保留实际响应计数。`body_bytes=65536` 表示完整 64 KiB JSON 响应。吞吐按 guest 的成功请求数与实际负载时长计算后相加；资源窗口保留 egress、origin 和 client CPU。CPU 候选瓶颈还须结合并发曲线的平台段判断。
+M5 的客户端按 100 次请求周期选择 5 次 bound、95 次 unbound，或全部 bound。两个 SNI 使用同一 origin 和 CA，测试叶证书的有效期起点提前 2 天，以覆盖 warm snapshot 恢复后的 guest 时钟；只有主名称绑定 Vault；每次响应核对证书路径与 origin 凭据类别。不同路径的 keep-alive session 分开持有。并发分摊到同一 Fastlet Pod 上的多个 guest，报告保留实际响应计数。`body_bytes=65536` 表示完整 64 KiB JSON 响应。吞吐按 guest 的成功请求数与实际负载时长计算后相加；资源窗口保留 egress、origin 和 client CPU。CPU 候选瓶颈还须结合并发曲线的平台段判断。
 
 M6/M8 的时间轴在每个模式单独开始，采样 memory、CPU、throttling、FD、Pod 重启及 OOM。FD 是该 egress 容器中所有进程的 FD 总和，conntrack 是 Pod 网络命名空间可读到的计数。采样写入独立文件，主进程在采样结束后组装报告。M8 每 100 次请求关闭连接，保存分钟级请求数、错误和延迟分位；长跑的总体延迟使用 0.1 ms 分箱。内存斜率单位为 B/s，后 90 分钟窗口由 `SUP_SOAK_ANALYSIS_S` 选择。
 

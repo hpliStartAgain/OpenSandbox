@@ -92,7 +92,7 @@ class Reports(unittest.TestCase):
                 {'k': k, 'held': k, 'alive': k, 'anon': 100 + 20*k,
                  'memory_current': 200 + 30*k, 'same_process': True} for k in [0, 5, 10]]}
         out = r.build('m3x', {'paths': [path]})
-        self.assertEqual(out['status'], 'OK')
+        self.assertEqual(out['status'], 'PARTIAL')
         self.assertEqual(out['paths'][0]['fit']['anon']['slope'], 20)
         self.assertEqual(r.memory_mix(10, 20, .25), 12.5)
 
@@ -135,6 +135,20 @@ class SupplementalClientTest(OriginFixture):
                 self.assertEqual(out['connections'], out['success'])
             else:
                 self.assertEqual(out['connections'], 2)
+
+    def test_fixture_certificate_covers_warm_snapshot_clock(self):
+        import shutil
+        import ssl
+        sp = importlib.util.spec_from_file_location('supplemental_tools_cert', ROOT/'supplemental-tools.py')
+        module = importlib.util.module_from_spec(sp); sp.loader.exec_module(module)
+        ca_dir = Path(self.tmp)/'cert-ca'; ca_dir.mkdir(exist_ok=True)
+        shutil.copyfile(self.ca, str(ca_dir/'tls.crt'))
+        shutil.copyfile(str(Path(self.tmp)/'main-ca.key'), str(ca_dir/'tls.key'))
+        out = Path(self.tmp)/'backdated'
+        module.make_origin_certificate(str(ca_dir), str(out), 'echo.test')
+        line = subprocess.check_output(['openssl','x509','-in',str(out/'echo.crt'),'-noout','-startdate'], text=True)
+        self.assertLess(ssl.cert_time_to_seconds(line.strip().split('=', 1)[1]), time.time()-86400)
+        subprocess.run(['openssl','verify','-CAfile',self.ca,str(out/'echo.crt')], check=True, capture_output=True)
 
     def test_large_body_is_verified_against_the_supplemental_origin(self):
         import threading
