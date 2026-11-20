@@ -84,7 +84,7 @@ class Session:
         cred = parsed.get('cred')
         cred_class = 'absent' if cred == 'absent' else 'expected' if cred == self.args.expect_cred else 'other'
         expected_headers = [] if self.args.expect_cred == 'absent' else ['x-api-key']
-        good = parsed.get('credential_headers') == expected_headers and status == 200 and self.leaf == self.args.expect_leaf and cred_class == ('absent' if self.args.expect_cred == 'absent' else 'expected')
+        good = (self.args.body_bytes != 65536 or length == 65536) and parsed.get('credential_headers') == expected_headers and status == 200 and self.leaf == self.args.expect_leaf and cred_class == ('absent' if self.args.expect_cred == 'absent' else 'expected')
         return good, cred_class
 
     async def close(self):

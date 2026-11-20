@@ -38,8 +38,8 @@ def validate(env):
             raise ValueError(k)
     if not 1 <= int(env['SUP_LOAD_GUESTS']) <= 6:
         raise ValueError('load guests')
-    if 'm8' in env['SUP_MEASUREMENTS'].split() and env['SUP_SMOKE']=='false' and float(env['SUP_RATE_B'])<=0:
-        raise ValueError('M8 requires a positive calibrated SUP_RATE_B')
+    if 'm8' in env['SUP_MEASUREMENTS'].split() and env['SUP_SMOKE']=='false' and any(float(env[k])<=0 for k in ('SUP_SOAK_RATE_ALL','SUP_SOAK_RATE_CB')):
+        raise ValueError('M8 requires positive calibrated SUP_SOAK_RATE_ALL and SUP_SOAK_RATE_CB')
     if env['SUP_SMOKE'] not in ('true', 'false') or not 1 <= int(env['SUP_BLOCKS']) <= 8:
         raise ValueError('smoke/blocks')
     for k in ['SUP_CONCURRENCIES', 'SUP_BURSTS', 'SUP_SUBJECT_STEPS']:

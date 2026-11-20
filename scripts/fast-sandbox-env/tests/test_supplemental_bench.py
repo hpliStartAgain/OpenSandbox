@@ -136,6 +136,24 @@ class SupplementalClientTest(OriginFixture):
             else:
                 self.assertEqual(out['connections'], 2)
 
+    def test_large_body_is_verified_against_the_supplemental_origin(self):
+        import threading
+        sp = importlib.util.spec_from_file_location('supplemental_origin', ROOT/'supplemental-origin.py')
+        origin = importlib.util.module_from_spec(sp); sp.loader.exec_module(origin)
+        server = origin.build_server(0, self.leaf, self.key, host='127.0.0.1')
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        old = self.port
+        try:
+            self.port = server.server_address[1]
+            result = self.probe(body_bytes=65536)
+            self.assertGreater(result['success'], 0)
+            self.assertEqual(result['contradictions'], 0)
+        finally:
+            self.port = old
+            server.shutdown(); server.server_close(); thread.join(5)
+        # A normal small-body origin must not be mislabeled as a 64 KiB run.
+        self.assertGreater(self.probe(body_bytes=65536)['contradictions'], 0)
+
     def test_burst_release_uses_the_held_connections(self):
         out = self.probe(mode='burst', concurrency=4, hold_s=.1)
         self.assertEqual(out['attempted'], 4)
