@@ -36,12 +36,23 @@ def request(url, payload):
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=30) as response:
             return response.status
     except urllib.error.HTTPError as exc:
         return exc.code
     except OSError:
         return 0
+
+
+def status_reasons(url):
+    # Closed status vocabulary; response bodies and identity fields stay private.
+    try:
+        opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url.rstrip('/')+'/status',timeout=30) as response:
+            reasons=json.load(response).get('subjectLifecycleDegraded',[])
+        return [v for v in reasons if v=='subject_capacity_exhausted']
+    except (OSError,ValueError,TypeError):
+        return None
 
 
 def driver_cost():
@@ -62,23 +73,39 @@ def run(args):
     try:
         for target in args.steps:
             registration_ms = activation_ms = 0
+            before=status_reasons(args.url)
+            rejections=[]
             for i in range(len(attempted), target-args.real_subjects):
                 attempted.append(i)
                 t = time.monotonic()
-                if request(args.url, envelope(prefix, i, 'SET_BINDING')) == 200:
+                set_code=request(args.url, envelope(prefix, i, 'SET_BINDING'))
+                if set_code == 200:
                     registered.add(i)
+                ready_codes=[]
                 registration_ms += (time.monotonic()-t)*1000
                 if i in registered:
                     t = time.monotonic()
                     for attempt in range(args.retries):
-                        if request(args.url, envelope(prefix, i, 'LIFECYCLE_HOOK')) == 200:
+                        ready_code=request(args.url, envelope(prefix, i, 'LIFECYCLE_HOOK'))
+                        ready_codes.append(ready_code)
+                        if ready_code == 200:
                             active.add(i)
                             break
                         time.sleep(.1)
                     activation_ms += (time.monotonic()-t)*1000
+                if i not in active:
+                    after=status_reasons(args.url)
+                    capacity_before='subject_capacity_exhausted' in before if before is not None else None
+                    capacity_after='subject_capacity_exhausted' in after if after is not None else None
+                    rejections.append(dict(object_index=i,phase='initial',stage='ready' if i in registered else 'SET',
+                        set_status=set_code,ready_status=ready_codes[-1] if ready_codes else None,
+                        ready_attempt_statuses=ready_codes,capacity_before=capacity_before,capacity_after=capacity_after,
+                        reason='subject_capacity_exhausted' if capacity_before is False and capacity_after is True else None,
+                        attribution='isolated_serial_action_status_transition'))
             points.append(dict(target=target, registered=len(registered)+args.real_subjects,
                                acked=len(active)+args.real_subjects, active=len(active)+args.real_subjects,
-                               registration_ms=registration_ms, activation_ms=activation_ms, driver_cost=driver_cost()))
+                               registration_ms=registration_ms, activation_ms=activation_ms, driver_cost=driver_cost(),
+                               rejections=rejections,capacity_rejections=sum(x['reason']=='subject_capacity_exhausted' for x in rejections)))
             # A host-side probe can exercise the real pair at this exact scale.
             if args.control_dir:
                 d = Path(args.control_dir)
@@ -89,19 +116,38 @@ def run(args):
                     if time.monotonic()>deadline:
                         raise TimeoutError('probe controller missing')
                     time.sleep(.1)
-        if args.steps[-1] > 4096 and active:
-            victim = min(active)
-            removed = request(args.url, envelope(prefix, victim, 'REMOVE_BINDING')) == 200
-            active.discard(victim)
-            overflow = max(set(attempted)-registered) if set(attempted)-registered else None
-            result['recovery_ok'] = False
-            if removed and overflow is not None:
-                # Removal publishes asynchronously; retry the same fence.
+        if args.steps[-1] > 4096:
+            pending=set(attempted)-active
+            result['recovery_ok']=False
+            recovery=dict(object_index=min(pending) if len(pending)==1 else None,
+                          release_confirmed=False,release_attempts=[],attempts=[])
+            result['recovery']=recovery
+            if len(pending)==1 and active:
+                overflow=min(pending);victim=min(active)
+                recovery['released_object_index']=victim
+                # REMOVE 200 confirms local enforcement cleanup; a ready 409
+                # verifies that the same fenced victim is no longer registered.
                 for attempt in range(50):
-                    if request(args.url, envelope(prefix, overflow, 'SET_BINDING')) == 200 and request(args.url, envelope(prefix, overflow, 'LIFECYCLE_HOOK')) == 200:
-                        result['recovery_ok'] = True
+                    code=request(args.url,envelope(prefix,victim,'REMOVE_BINDING'))
+                    gone=request(args.url,envelope(prefix,victim,'LIFECYCLE_HOOK')) if code==200 else None
+                    recovery['release_attempts'].append(dict(remove_status=code,ready_status=gone))
+                    if code==200 and gone==409:
+                        recovery['release_confirmed']=True
+                        active.discard(victim);registered.discard(victim)
                         break
                     time.sleep(.1)
+                if recovery['release_confirmed']:
+                    for attempt in range(50):
+                        set_code=request(args.url,envelope(prefix,overflow,'SET_BINDING'))
+                        ready_code=request(args.url,envelope(prefix,overflow,'LIFECYCLE_HOOK')) if set_code==200 else None
+                        recovery['attempts'].append(dict(set_status=set_code,ready_status=ready_code))
+                        if set_code==200 and ready_code==200:
+                            registered.add(overflow);active.add(overflow)
+                            result['recovery_ok']=True
+                            break
+                        time.sleep(.1)
+            recovery['final_counts']=dict(registered=len(registered)+args.real_subjects,
+                acked=len(active)+args.real_subjects,active=len(active)+args.real_subjects)
     finally:
         removed = [request(args.url, envelope(prefix, i, 'REMOVE_BINDING')) == 200 for i in attempted]
         result['cleanup_ok'] = all(removed)

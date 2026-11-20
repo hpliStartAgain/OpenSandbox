@@ -45,13 +45,12 @@ class Reports(unittest.TestCase):
         self.assertEqual(out['recovery_delta'],{})
 
     def test_expected_subject_overflow(self):
-        p=dict(target=4097,registered=4096,acked=4096,active=4096,capacity_rejections=1,
-               rejection_reason='subject_capacity_exhausted')
-        s=dict(points=[p],cleanup_ok=True,recovery_ok=True)
+        from test_supplemental_v4 import overflow_spec
+        s=overflow_spec('SET')
         out=r.build_m9(s)
         self.assertEqual(out['status'],'OK')
         self.assertEqual(out['points'][0]['outcome'],'expected_overflow')
-        for field,value in [('capacity_rejections',0),('capacity_rejections',2),('rejection_reason',None),('acked',4095)]:
+        for field,value in [('capacity_rejections',0),('capacity_rejections',2),('rejections',[]),('acked',4095)]:
             bad=copy.deepcopy(s);bad['points'][0][field]=value
             self.assertNotEqual(r.build_m9(bad)['status'],'OK')
         s['recovery_ok']=False
@@ -66,22 +65,10 @@ class Reports(unittest.TestCase):
             self.assertNotEqual(r.build_m7(s)['status'],'OK')
 
     def test_overflow_retries_rejected_identity(self):
-        import tempfile
-        import argparse
-        driver=module('supplemental-subjects')
-        seen=[]; rejected=[None]; freed=[False]
-        def request(url,payload):
-            uid=payload['sandbox']['uid'];op=payload['operation']
-            if op=='SET_BINDING':
-                if rejected[0] is None: rejected[0]=uid; return 503
-                if uid==rejected[0] and not freed[0]: return 503
-                seen.append(uid)
-            elif op=='REMOVE_BINDING': freed[0]=True
-            return 200
-        with tempfile.TemporaryDirectory() as d, patch.object(driver,'request',request), patch.object(driver.time,'sleep'):
-            out=driver.run(argparse.Namespace(steps=[4097],real_subjects=4094,retries=1,url='fixture',control_dir='',out=str(Path(d)/'out')))
+        from test_supplemental_v4 import Capacity
+        out,_,_=Capacity().drive(set_rejection=True)
         self.assertTrue(out['recovery_ok'])
-        self.assertEqual(seen[-1],rejected[0])
+        self.assertEqual(out['recovery']['object_index'],2)
 
     def test_staged_entry_calibrates_m8_after_m5(self):
         tools=module('supplemental-tools')

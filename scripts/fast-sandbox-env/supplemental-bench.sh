@@ -450,7 +450,7 @@ sup_scale_is() {
 sup_m9() {
 	sup_spec m9
 	sup_pool credential-bound 500m; sup_pair
-	local control="$SUP_RAW/m9-control" out="$SUP_RAW/m9-driver.json" step pid port reading after nft t0 nft_cpu=0
+	local control="$SUP_RAW/m9-control" out="$SUP_RAW/m9-driver.json" step pid port reading after nft t0 nft_wall denials initial_denials=0 nft_cpu=0
 	mkdir "$control"; : > "$SUP_RAW/m9-resources.jsonl"
 	# The runner and port-forward have their own task cgroup, outside egress.
 	kubectl -n "$RESOURCE_NS" port-forward --address 127.0.0.1 "$BENCH_POD" 0:18080 > "$SUP_RAW/m9-port-forward.log" 2>&1 & SUP_FORWARD_PID=$!
@@ -471,9 +471,11 @@ sup_m9() {
 		t0="$(bench_ns)"
 		nft="$(kubectl -n "$RESOURCE_NS" exec "$BENCH_POD" -c egress -- nft -j list ruleset | jq '[.nftables[] | select(has("rule"))] | length')"
 		after="$(sup_sample)"
-		jq -n --argjson target "$step" --argjson s "$reading" --argjson e "$after" --argjson n "$nft" \
-			--argjson prior "$nft_cpu" --argjson wall "$(bench_elapsed_ms "$t0")" \
-			'{target:$target,resource_sample:$s,memory_current:$s.memory_current,anon:$s.anon,usage_usec:$s.usage_usec,
+		nft_wall="$(bench_elapsed_ms "$t0")"
+		initial_denials="$(kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress --since-time="$SUP_SINCE" | grep -c subject_capacity_exhausted || true)"
+		jq -n --argjson initial "$initial_denials" --argjson target "$step" --argjson s "$reading" --argjson e "$after" --argjson n "$nft" \
+			--argjson prior "$nft_cpu" --argjson wall "$nft_wall" \
+			'{target:$target,initial_capacity_log_count:$initial,resource_sample:$s,memory_current:$s.memory_current,anon:$s.anon,usage_usec:$s.usage_usec,
 			usage_excluding_prior_enumeration_usec:($s.usage_usec-$prior),nft_rules:$n,
 			nft_enumeration:{wall_ms:$wall,cpu_before_usec:$s.usage_usec,cpu_after_usec:$e.usage_usec,memory_current_before:$s.memory_current,memory_current_after:$e.memory_current,anon_before:$s.anon,anon_after:$e.anon,cpu_delta_usec:($e.usage_usec-$s.usage_usec)}}' >> "$SUP_RAW/m9-resources.jsonl"
 		nft_cpu=$((nft_cpu+$(jq -n --argjson a "$reading" --argjson b "$after" '$b.usage_usec-$a.usage_usec')))
@@ -485,11 +487,10 @@ sup_m9() {
 	done
 	wait "$pid" || fail "M9 synthetic driver failed"; SUP_SUBJECT_PID=""
 	kill "$SUP_FORWARD_PID"; wait "$SUP_FORWARD_PID" 2>/dev/null || true; SUP_FORWARD_PID=""
-	bench_json_set "$SUP_RAW/m9-spec.json" '.points=[$d[0].points[] as $p | $p+($r[] | select(.target==$p.target))] | .cleanup_ok=$d[0].cleanup_ok | .recovery_ok=$d[0].recovery_ok | .resource_scope="egress_only_external_driver"' \
+	bench_json_set "$SUP_RAW/m9-spec.json" '.points=[$d[0].points[] as $p | $p+($r[] | select(.target==$p.target))] | .cleanup_ok=$d[0].cleanup_ok | .recovery_ok=$d[0].recovery_ok | .recovery=$d[0].recovery | .resource_scope="egress_only_external_driver"' \
 		--slurpfile d "$out" --slurpfile r "$SUP_RAW/m9-resources.jsonl"
-	local denials
 	denials="$(kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress --since-time="$SUP_SINCE" | grep -c subject_capacity_exhausted || true)"
-	bench_json_set "$SUP_RAW/m9-spec.json" '.points |= map(if .target>4096 then .capacity_rejections=$n | .rejection_reason="subject_capacity_exhausted" else . end)' --argjson n "$denials"
+	bench_json_set "$SUP_RAW/m9-spec.json" '.points |= map(if .target>4096 then .recovery_capacity_log_count=($n-$initial) else . end)' --argjson n "$denials" --argjson initial "$initial_denials"
 	python3 "$SUP_SELF_DIR/supplemental-tools.py" m9-probes "$SUP_RAW/m9-spec.json" "$SUP_RAW" "$CB_ORIGIN_LEAF" "$SUP_CODE"
 	sup_report m9
 }

@@ -70,9 +70,8 @@ class Reports(unittest.TestCase):
         self.assertEqual(r.build('m9', {'points': [dict(point, acked=4097)], 'cleanup_ok': True})['status'], 'INVALID')
 
     def test_m9_capacity_4097(self):
-        points = [{'target': 4096, 'registered': 4096, 'acked': 4096, 'active': 4096},
-                  {'target': 4097, 'registered': 4096, 'acked': 4096, 'active': 4096, 'capacity_rejections': 1, 'rejection_reason': 'subject_capacity_exhausted'}]
-        self.assertEqual(r.build('m9', {'points': points, 'cleanup_ok': True, 'recovery_ok': True})['status'], 'OK')
+        from test_supplemental_v4 import overflow_spec
+        self.assertEqual(r.build('m9', overflow_spec())['status'], 'OK')
 
     def test_m5_quantiles_and_failure(self):
         run = {'attempted': 4, 'success': 4, 'failed': 0, 'wall_s': 2,

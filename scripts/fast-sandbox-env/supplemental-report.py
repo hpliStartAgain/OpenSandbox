@@ -158,13 +158,26 @@ def saturation_points(groups):
         ordered = sorted(levels)
         row = dict(zip(("mode", "cpu_limit", "connection", "body_bytes", "bound_percent"), config))
         row.update(status="NOT_ESTABLISHED", concurrency=None, rps=None, bottleneck=[])
-        for previous, current in zip(ordered, ordered[1:]):
-            low = statistics.mean(g["rps"] for g in levels[previous])
-            high = statistics.mean(g["rps"] for g in levels[current])
-            if current >= previous*2 and low > 0 and high/low < 1.1:
-                row.update(status="OBSERVED_PLATEAU", concurrency=previous, rps=low,
-                           next_concurrency=current, throughput_gain=high/low-1,
-                           bottleneck=sorted({v for g in levels[current] for v in g["cpu_bottleneck_candidates"]}))
+        if any(g.get('status','OK')!='OK' for rows in levels.values() for g in rows):
+            continue
+        means={c:statistics.mean(g['rps'] for g in levels[c]) for c in ordered}
+        row['tolerance_fraction']=.1
+        row['review_reason']='no_sustained_plateau'
+        if any(not math.isfinite(v) or v<=0 for v in means.values()):
+            results.append(row);continue
+        if any(means[b]<.9*means[a] for a,b in zip(ordered,ordered[1:])):
+            row['review_reason']='throughput_drop';results.append(row);continue
+        for previous,current in zip(ordered,ordered[1:]):
+            low,high=means[previous],means[current]
+            if current>=previous*2 and .9<=high/low<=1.1:
+                tail=[g for c in ordered if c>=previous for g in levels[c]]
+                row['checked_concurrencies']=[c for c in ordered if c>=previous]
+                if all(math.isfinite(g['rps']) and .9<=g['rps']/low<=1.1 for g in tail):
+                    row.update(status='OBSERVED_PLATEAU',concurrency=previous,rps=low,
+                        next_concurrency=current,throughput_gain=high/low-1,review_reason=None,
+                        bottleneck=sorted({v for g in tail for v in g['cpu_bottleneck_candidates']}))
+                else:
+                    row['review_reason']='later_points_or_repeats_outside_band'
                 break
         results.append(row)
     return results
@@ -290,7 +303,7 @@ def build_m5(spec):
                        "latency_ms":quantiles([v for x in members for v in x.get("request_ms",[])]),
                        "errors":sum(x.get("failed",0) for x in members)})
     return {"status":base.worst(statuses), "runs":[run_row(r) for r in runs], "groups":groups,
-            "saturation":saturation_points([g for g in groups if g["status"]=="OK"]), "resource_windows":windows,
+            "saturation":saturation_points(groups), "resource_windows":windows,
             "bottleneck_method":"same scheduled steady window; observed egress/origin boundaries within max(0.1 s, 1% of window); CPU divided by each actual counter/process window; >=90% CPU and egress throttling; only OK groups enter plateau inference"}
 
 
@@ -387,17 +400,41 @@ def build_m9(spec):
     points, statuses = [], []
     for p in spec.get("points", []):
         row = {k: p.get(k) for k in ("target", "registered", "acked", "active", "capacity_rejections",
-                    "registration_ms", "activation_ms", "rejection_reason", "memory_current", "anon", "usage_usec", "nft_rules", "nft_enumeration", "driver_cost", "resource_sample", "usage_excluding_prior_enumeration_usec")}
+                    "registration_ms", "activation_ms", "rejections", "initial_capacity_log_count", "recovery_capacity_log_count", "memory_current", "anon", "usage_usec", "nft_rules", "nft_enumeration", "driver_cost", "resource_sample", "usage_excluding_prior_enumeration_usec")}
         counts = [p.get(k, 0) for k in ("registered", "acked", "active")]
         target = p["target"]
         expected = min(target, 4096)
+        rejected=p.get('rejections') or []
+        recovery=spec.get('recovery') or {}
+        overflow_good=False
+        if target>4096 and len(rejected)==target-4096==1:
+            refusal=rejected[0]
+            index=refusal.get('object_index')
+            stage=refusal.get('stage')
+            stage_good=(stage=='SET' and refusal.get('set_status')==503 and counts[0]==expected or
+                        stage=='ready' and refusal.get('set_status')==200 and refusal.get('ready_status')==503 and
+                        bool(refusal.get('ready_attempt_statuses')) and all(c==503 for c in refusal['ready_attempt_statuses']) and counts[0]==target)
+            attempts=recovery.get('attempts') or []
+            release=recovery.get('release_attempts') or []
+            final=recovery.get('final_counts') or {}
+            overflow_good=(type(index) is int and index>=0 and stage_good and
+                refusal.get('phase')=='initial' and refusal.get('reason')=='subject_capacity_exhausted' and
+                refusal.get('capacity_before') is False and refusal.get('capacity_after') is True and
+                refusal.get('attribution')=='isolated_serial_action_status_transition' and
+                p.get('capacity_rejections')==1 and counts[1:]==[expected,expected] and
+                all(type(p.get(k)) is int and p[k]>=0 for k in ('initial_capacity_log_count','recovery_capacity_log_count')) and
+                recovery.get('object_index')==index and recovery.get('release_confirmed') is True and
+                release and release[-1].get('remove_status')==200 and release[-1].get('ready_status')==409 and
+                type(recovery.get('released_object_index')) is int and recovery['released_object_index']>=0 and
+                recovery['released_object_index']!=index and all(final.get(k)==expected for k in ('registered','acked','active')) and
+                attempts and attempts[-1].get('set_status')==200 and attempts[-1].get('ready_status')==200 and
+                spec.get('recovery_ok') is True)
         if any(type(n) is not int or n < 0 for n in counts) or counts[2] > counts[1] or counts[1] > counts[0] or counts[0] > target:
-            status = "INVALID"
-        elif counts != [expected]*3 or (target>4096 and (p.get("capacity_rejections") != target-4096 or
-                p.get("rejection_reason") != "subject_capacity_exhausted" or spec.get("recovery_ok") is not True)):
-            status = "PARTIAL"
+            status = 'INVALID'
+        elif target>4096 and not overflow_good or target<=4096 and counts!=[target]*3:
+            status = 'PARTIAL'
         else:
-            status = "OK"
+            status = 'OK'
         if spec.get("resource_scope")=="egress_only_external_driver":
             evidence = [q.get("resource_sample",{}) for q in spec.get("points",[]) if q.get("target",0)<=target]
             evidence_status=resource_status(evidence)
@@ -412,7 +449,7 @@ def build_m9(spec):
         statuses.append(real["status"])
     if spec.get("recovery_ok") is False:
         statuses.append("PARTIAL")
-    return {"status": base.worst(statuses), "recovery_ok": spec.get("recovery_ok"), "points": points, "cleanup_ok": bool(spec.get("cleanup_ok")),
+    return {"status": base.worst(statuses), "recovery_ok": spec.get("recovery_ok"), "recovery":spec.get("recovery"), "points": points, "cleanup_ok": bool(spec.get("cleanup_ok")),
             "real_connections": spec.get("real_connections", {"status": "NOT_RUN"}),
             ("egress_per_subject_fit" if spec.get("resource_scope")=="egress_only_external_driver" else "container_total_including_fixture_fit"): {field: base.least_squares([(p["acked"], p[field]) for p in points
                 if p["status"]=="OK" and p["target"]<=4096 and isinstance(p.get(field), (int, float))])
