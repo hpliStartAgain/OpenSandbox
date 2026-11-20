@@ -103,6 +103,7 @@ class Regressions(unittest.TestCase):
         env=dict(SUP_CONCURRENCIES='1 16 64 256',SUP_REPEATS='3',SUP_BODY_BYTES='0 65536',SUP_LOAD_S='60',SUP_WARMUP_S='10',SUP_SOAK_S='7200',SUP_RECOVERY_S='30',SUP_CHURN_S='1800',SUP_IDLE_S='20')
         self.assertGreater(tools.lifetime_seconds(env,'m5'),72*70)
         self.assertGreater(tools.lifetime_seconds(env,'m8'),7200)
+        self.assertGreater(tools.lifetime_seconds(env,'m9'),4*3600)
 
 
 from test_credential_bound import ShellCase

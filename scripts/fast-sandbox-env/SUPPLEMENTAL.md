@@ -22,7 +22,7 @@ SUP_REPORT_DIR=/path/to/new-report-dir \
 | M9 | `SUP_SUBJECT_STEPS='256 1024 2048 4096 4097'`、`SUP_SCALE_PROBES=20` | `m9.json` |
 | M10 | `SUP_BLOCKS=8`、固定 ABBAABBA 前缀；`BENCH_CREATE_ROUNDS=3`、`BENCH_CREATE_N=200`、`BENCH_CREATE_CONCURRENCY=10` | `m10.json` |
 
-补测为 guest 单独计算生命周期：M5 覆盖整个 mode×CPU 组的预热、负载、逐点控制余量和收尾，至少 6 小时；M8 覆盖 7200 s 浸泡、预热、恢复和收尾，至少 3 小时。创建请求再增加 600 s，并逐个经 `sandbox get -o json` 读取 `expires_at`，确认剩余时长大于所需时长。回读保存在 `lifetime-readback.jsonl`。原 M1–M4 默认 1h。
+补测为 guest 单独计算生命周期：M5 覆盖整个 mode×CPU 组的预热、负载、逐点控制余量和收尾，至少 6 小时；M8 覆盖 7200 s 浸泡、预热、恢复和收尾，至少 3 小时；M9 的整个规模序列使用至少 6 小时。创建请求再增加 600 s，并逐个经 `sandbox get -o json` 读取 `expires_at`，确认剩余时长大于所需时长。回读保存在 `lifetime-readback.jsonl`。原 M1–M4 默认 1h。
 
 补测显式设置 `WARM_IMAGES=1`，等待模板缓存覆盖全部 `POOL_MIN` 个 Fastlet；收尾恢复原 warm 设置。`SUP_IDLE_S=20` 为 Pool warm 判据通过后的等待。`SUP_CLIENT_ATTEMPTS=7200` 是每两秒一次的结果轮询上限。M8 默认包含在完整选择中，未指定两档正数浸泡限速 时预检拒绝执行；只执行其他项目时，用 `SUP_MEASUREMENTS` 选择。
 

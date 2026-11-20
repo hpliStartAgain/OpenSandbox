@@ -79,6 +79,8 @@ def lifetime_seconds(env, measurement):
     if measurement=='m5':
         points=len(env['SUP_CONCURRENCIES'].split())*2*len(m5_cases(env))*int(env['SUP_REPEATS'])
         return max(21600,points*(int(env['SUP_LOAD_S'])+warm+120)+1800)
+    if measurement=='m9':
+        return 21600
     if measurement=='m8':
         return max(10800,int(env['SUP_SOAK_S'])+warm+recovery+1800)
     return max(7200,int(env['SUP_CHURN_S'])+3*warm+recovery+1800)
