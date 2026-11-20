@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import resource
 from pathlib import Path
 import ssl
 import time
@@ -82,7 +83,8 @@ class Session:
         parsed = json.loads(body)
         cred = parsed.get('cred')
         cred_class = 'absent' if cred == 'absent' else 'expected' if cred == self.args.expect_cred else 'other'
-        good = status == 200 and self.leaf == self.args.expect_leaf and cred_class == ('absent' if self.args.expect_cred == 'absent' else 'expected')
+        expected_headers = [] if self.args.expect_cred == 'absent' else ['x-api-key']
+        good = parsed.get('credential_headers') == expected_headers and status == 200 and self.leaf == self.args.expect_leaf and cred_class == ('absent' if self.args.expect_cred == 'absent' else 'expected')
         return good, cred_class
 
     async def close(self):
@@ -239,4 +241,8 @@ def parse_args(argv=None):
 
 
 if __name__ == '__main__':
-    asyncio.run(execute(parse_args()))
+    args = parse_args()
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = max(soft, args.concurrency*2+256)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (want if hard == resource.RLIM_INFINITY else min(want, hard), hard))
+    asyncio.run(execute(args))
