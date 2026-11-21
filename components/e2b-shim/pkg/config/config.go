@@ -67,6 +67,19 @@ type TemplateMapping struct {
 	NativeTemplateID    string   `json:"native_template_id"`
 	Revision            string   `json:"revision"`
 	ExpectedEnvdVersion string   `json:"expected_envd_version"`
+	Ready               *bool    `json:"ready,omitempty"`
+	ProfileCompatible   *bool    `json:"profile_compatible,omitempty"`
+	TimeoutMaxSeconds   *int64   `json:"timeout_max_seconds,omitempty"`
+}
+
+// IsReady reports whether the mapping is marked ready (default true when omitted).
+func (t TemplateMapping) IsReady() bool {
+	return t.Ready == nil || *t.Ready
+}
+
+// IsProfileCompatible reports whether the mapping is compatible with the active profile (default true when omitted).
+func (t TemplateMapping) IsProfileCompatible() bool {
+	return t.ProfileCompatible == nil || *t.ProfileCompatible
 }
 
 // Source describes where configuration is read from.
@@ -241,16 +254,26 @@ func decodeStrict(key string, msg json.RawMessage, dst any) error {
 }
 
 func decodeTemplates(field string, data []byte, dst *[]TemplateMapping) error {
-	var entries []*TemplateMapping
-	if err := decodeStrict(field, data, &entries); err != nil {
+	var rawEntries []json.RawMessage
+	if err := decodeStrict(field, data, &rawEntries); err != nil {
 		return err
 	}
-	out := make([]TemplateMapping, len(entries))
-	for i, entry := range entries {
-		if entry == nil {
+	out := make([]TemplateMapping, len(rawEntries))
+	for i, rawEntry := range rawEntries {
+		if bytes.Equal(bytes.TrimSpace(rawEntry), []byte("null")) {
 			return fmt.Errorf("%s[%d]: must not be null", templatesKey, i)
 		}
-		out[i] = *entry
+		if err := strictUnmarshal(rawEntry, &out[i]); err != nil {
+			return fmt.Errorf("%s: %w", field, err)
+		}
+		var rawFields map[string]json.RawMessage
+		if err := json.Unmarshal(rawEntry, &rawFields); err == nil {
+			for _, k := range []string{"ready", "profile_compatible", "timeout_max_seconds"} {
+				if v, ok := rawFields[k]; ok && bytes.Equal(bytes.TrimSpace(v), []byte("null")) {
+					return fmt.Errorf("%s[%d].%s: must not be null", templatesKey, i, k)
+				}
+			}
+		}
 	}
 	*dst = out
 	return nil

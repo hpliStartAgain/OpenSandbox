@@ -47,7 +47,7 @@ const validFile = `{
       "template_id": "base",
       "aliases": ["base-envd"],
       "native_template_id": "tpl-base",
-      "revision": "tpl-base@rev-1",
+      "revision": "tpl-base.rev-1",
       "expected_envd_version": "0.8.0"
     }
   ]
@@ -171,7 +171,7 @@ func TestLoadEnvOverridesFile(t *testing.T) {
 		"E2B_SHIM_TIMEOUT_DEFAULT_SECONDS": "120",
 		"E2B_SHIM_TIMEOUT_MIN_SECONDS":     "30",
 		"E2B_SHIM_TIMEOUT_MAX_SECONDS":     "600",
-		"E2B_SHIM_TEMPLATES":               `[{"template_id":"t2","native_template_id":"tpl2","revision":"tpl2@r1","expected_envd_version":"0.8.0"}]`,
+		"E2B_SHIM_TEMPLATES":               `[{"template_id":"t2","native_template_id":"tpl2","revision":"tpl2.r1","expected_envd_version":"0.8.0"}]`,
 	})
 	cfg := mustLoad(t, config.Source{Path: writeConfig(t, validFile)}, env)
 	if cfg.Listen != "127.0.0.1:19090" || cfg.CompatPrefix != "/compat/e2b-test" || cfg.AdapterID != "adapter-2" ||
@@ -237,6 +237,53 @@ func TestLoadNullAliases(t *testing.T) {
 	cfg := mustLoad(t, config.Source{Path: writeConfig(t, file)}, nil)
 	if len(cfg.Templates) != 1 || len(cfg.Templates[0].Aliases) != 0 {
 		t.Errorf("templates = %+v, want one mapping with no aliases", cfg.Templates)
+	}
+	if !cfg.Templates[0].IsReady() || !cfg.Templates[0].IsProfileCompatible() || cfg.Templates[0].TimeoutMaxSeconds != nil {
+		t.Errorf("optional template defaults = ready:%v compat:%v tmax:%v", cfg.Templates[0].IsReady(), cfg.Templates[0].IsProfileCompatible(), cfg.Templates[0].TimeoutMaxSeconds)
+	}
+}
+
+func TestLoadTemplateOptionalFields(t *testing.T) {
+	file := `{
+  "native_api_url": "https://native.example.internal/v1",
+  "adapter_id": "a",
+  "hmac_key_version": "` + strings.Repeat("v", 63) + `",
+  "timeout_min_seconds": 60,
+  "timeout_default_seconds": 300,
+  "timeout_max_seconds": 3600,
+  "templates": [
+    {
+      "template_id": "unready",
+      "native_template_id": "tpl-1",
+      "revision": "rev-1",
+      "expected_envd_version": "0.8.0",
+      "ready": false,
+      "profile_compatible": true,
+      "timeout_max_seconds": 60
+    },
+    {
+      "template_id": "incompat",
+      "native_template_id": "tpl-2",
+      "revision": "` + strings.Repeat("r", 63) + `",
+      "expected_envd_version": "0.8.0",
+      "ready": true,
+      "profile_compatible": false,
+      "timeout_max_seconds": 1800
+    }
+  ]
+}`
+	cfg := mustLoad(t, config.Source{Path: writeConfig(t, file)}, nil)
+	if cfg.Templates[0].IsReady() || !cfg.Templates[0].IsProfileCompatible() {
+		t.Errorf("templates[0] flags = ready:%v compat:%v", cfg.Templates[0].IsReady(), cfg.Templates[0].IsProfileCompatible())
+	}
+	if cfg.Templates[0].TimeoutMaxSeconds == nil || *cfg.Templates[0].TimeoutMaxSeconds != 60 {
+		t.Errorf("templates[0].TimeoutMaxSeconds = %v, want 60", cfg.Templates[0].TimeoutMaxSeconds)
+	}
+	if !cfg.Templates[1].IsReady() || cfg.Templates[1].IsProfileCompatible() {
+		t.Errorf("templates[1] flags = ready:%v compat:%v", cfg.Templates[1].IsReady(), cfg.Templates[1].IsProfileCompatible())
+	}
+	if cfg.Templates[1].TimeoutMaxSeconds == nil || *cfg.Templates[1].TimeoutMaxSeconds != 1800 {
+		t.Errorf("templates[1].TimeoutMaxSeconds = %v, want 1800", cfg.Templates[1].TimeoutMaxSeconds)
 	}
 }
 
@@ -362,8 +409,23 @@ func TestLoadFailures(t *testing.T) {
 		{name: "template id whitespace", file: strings.Replace(validFile, `"template_id": "base"`, `"template_id": "base "`, 1), wantErr: "templates[0].template_id: must not contain whitespace or control characters"},
 		{name: "template alias control character", file: strings.Replace(validFile, `"base-envd"`, `"base-envd\u0000"`, 1), wantErr: "templates[0].aliases[0]: must not contain whitespace or control characters"},
 		{name: "native template id whitespace", file: strings.Replace(validFile, `"tpl-base"`, `"tpl base"`, 1), wantErr: "templates[0].native_template_id: must not contain whitespace or control characters"},
-		{name: "template revision control character", file: strings.Replace(validFile, `"tpl-base@rev-1"`, `"tpl-base@rev-1\u0000"`, 1), wantErr: "templates[0].revision: must not contain whitespace or control characters"},
+		{name: "template revision control character", file: strings.Replace(validFile, `"tpl-base.rev-1"`, `"tpl-base.rev-1\u0000"`, 1), wantErr: "templates[0].revision: must not contain whitespace or control characters"},
 		{name: "expected envd version whitespace", file: strings.Replace(validFile, `"0.8.0"`, `"0.8.0 "`, 1), wantErr: "templates[0].expected_envd_version: must not contain whitespace or control characters"},
+		{name: "adapter id invalid label at-sign", file: strings.Replace(validFile, `"e2b-shim-test"`, `"e2b@shim"`, 1), wantErr: "adapter_id: must be a valid label value", doNotEcho: "e2b@shim"},
+		{name: "adapter id invalid label leading hyphen", file: strings.Replace(validFile, `"e2b-shim-test"`, `"-shim"`, 1), wantErr: "adapter_id: must be a valid label value", doNotEcho: "-shim"},
+		{name: "adapter id exceeds 63 chars", file: strings.Replace(validFile, `"e2b-shim-test"`, `"`+strings.Repeat("a", 64)+`"`, 1), wantErr: "adapter_id: must be a valid label value", doNotEcho: strings.Repeat("a", 64)},
+		{name: "hmac key version invalid label at-sign", file: strings.Replace(validFile, `"hmac_key_version": "v1"`, `"hmac_key_version": "v1@bad"`, 1), wantErr: "hmac_key_version: must be a valid label value", doNotEcho: "v1@bad"},
+		{name: "hmac key version exceeds 63 chars", file: strings.Replace(validFile, `"hmac_key_version": "v1"`, `"hmac_key_version": "`+strings.Repeat("k", 64)+`"`, 1), wantErr: "hmac_key_version: must be a valid label value", doNotEcho: strings.Repeat("k", 64)},
+		{name: "template revision invalid label at-sign", file: strings.Replace(validFile, `"tpl-base.rev-1"`, `"tpl-base@rev-1"`, 1), wantErr: "templates[0].revision: must be a valid label value", doNotEcho: "tpl-base@rev-1"},
+		{name: "template revision trailing dot", file: strings.Replace(validFile, `"tpl-base.rev-1"`, `"tpl-base."`, 1), wantErr: "templates[0].revision: must be a valid label value", doNotEcho: "tpl-base."},
+		{name: "template revision exceeds 63 chars", file: strings.Replace(validFile, `"tpl-base.rev-1"`, `"`+strings.Repeat("r", 64)+`"`, 1), wantErr: "templates[0].revision: must be a valid label value", doNotEcho: strings.Repeat("r", 64)},
+		{name: "template ready null", file: strings.Replace(validFile, `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "ready": null`, 1), wantErr: "templates[0].ready: must not be null"},
+		{name: "template profile_compatible null", file: strings.Replace(validFile, `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "profile_compatible": null`, 1), wantErr: "templates[0].profile_compatible: must not be null"},
+		{name: "template timeout_max_seconds null", file: strings.Replace(validFile, `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "timeout_max_seconds": null`, 1), wantErr: "templates[0].timeout_max_seconds: must not be null"},
+		{name: "template timeout_max_seconds non-positive", file: strings.Replace(validFile, `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "timeout_max_seconds": 0`, 1), wantErr: "templates[0].timeout_max_seconds: must be at least 1"},
+		{name: "template timeout_max_seconds below min", file: strings.Replace(validFile, `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "timeout_max_seconds": 59`, 1), wantErr: "templates[0].timeout_max_seconds: must not be below timeout_min_seconds", doNotEcho: "59"},
+		{name: "template timeout_max_seconds above max", file: strings.Replace(validFile, `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "timeout_max_seconds": 3601`, 1), wantErr: "templates[0].timeout_max_seconds: must not exceed timeout_max_seconds", doNotEcho: "3601"},
+		{name: "template timeout_max_seconds overflows duration", file: strings.Replace(strings.Replace(validFile, `"timeout_max_seconds": 3600`, `"timeout_max_seconds": 9223372036`, 1), `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "timeout_max_seconds": 9223372037`, 1), wantErr: "templates[0].timeout_max_seconds: exceeds the maximum representable time.Duration", doNotEcho: "9223372037"},
 		{name: "missing secrets", file: validFile, env: map[string]string{}, wantErr: "adapter_api_key: secret is not configured"},
 		{name: "both secret sources", env: envWith(map[string]string{"E2B_SHIM_HMAC_KEY_FILE": unreadable}), wantErr: "both E2B_SHIM_HMAC_KEY and E2B_SHIM_HMAC_KEY_FILE are set"},
 		{name: "empty secret env", env: envWith(map[string]string{"E2B_SHIM_ADAPTER_API_KEY": ""}), wantErr: "adapter_api_key: secret value is empty"},
@@ -450,7 +512,7 @@ func TestConfigFormattingRedactsSecrets(t *testing.T) {
 		fmt.Sprintf("%+v", cfg),
 		fmt.Sprintf("%#v", cfg),
 		fmt.Sprintf("%v", *cfg),
-		fmt.Sprintf("%q", cfg),
+		fmt.Sprintf("%q", any(cfg)),
 		fmt.Sprintf("%v", &cfg.AdapterAPIKey),
 		fmt.Sprintf("%#v", &cfg.AdapterAPIKey),
 		fmt.Sprintf("%s %d %x", cfg.AdapterAPIKey, 1, cfg.HMACKey),

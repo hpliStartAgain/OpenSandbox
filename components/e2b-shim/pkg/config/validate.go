@@ -49,15 +49,19 @@ func (c *Config) Validate() error {
 	}
 	if c.AdapterID == "" || hasWhitespaceOrControl(c.AdapterID) {
 		add(errors.New("adapter_id: must not be empty or contain whitespace or control characters"))
+	} else if !isValidLabelValue(c.AdapterID) {
+		add(errors.New("adapter_id: must be a valid label value (1-63 ASCII alphanumeric, '-', '_' or '.', starting and ending with alphanumeric)"))
 	}
 	if c.HMACKeyVersion == "" || hasWhitespaceOrControl(c.HMACKeyVersion) {
 		add(errors.New("hmac_key_version: must not be empty or contain whitespace or control characters"))
+	} else if !isValidLabelValue(c.HMACKeyVersion) {
+		add(errors.New("hmac_key_version: must be a valid label value (1-63 ASCII alphanumeric, '-', '_' or '.', starting and ending with alphanumeric)"))
 	}
 	if strings.ContainsAny(c.Domain, "/?#@:") || hasWhitespaceOrControl(c.Domain) {
 		add(errors.New("domain: must be a host name without scheme, path, query, fragment, user info, port, whitespace or control characters"))
 	}
 	add(c.validateTimeouts())
-	add(validateTemplates(c.Templates))
+	add(c.validateTemplates())
 	for _, s := range []struct {
 		name   string
 		secret Secret
@@ -151,6 +155,30 @@ func normalizeNativeURL(raw string) (string, error) {
 	return strings.TrimRight(u.String(), "/"), nil
 }
 
+const maxDurationSeconds = math.MaxInt64 / int64(time.Second)
+
+func isASCIIAlphaNum(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// isValidLabelValue enforces Fast Sandbox label-value syntax:
+// ^[A-Za-z0-9]([-_.A-Za-z0-9]*[A-Za-z0-9])?$ with length 1..63.
+func isValidLabelValue(s string) bool {
+	if len(s) == 0 || len(s) > 63 {
+		return false
+	}
+	if !isASCIIAlphaNum(s[0]) || !isASCIIAlphaNum(s[len(s)-1]) {
+		return false
+	}
+	for i := 1; i < len(s)-1; i++ {
+		b := s[i]
+		if !isASCIIAlphaNum(b) && b != '-' && b != '_' && b != '.' {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Config) validateTimeouts() error {
 	var errs []error
 	if c.TimeoutMaxSeconds == 0 {
@@ -168,7 +196,6 @@ func (c *Config) validateTimeouts() error {
 	if c.TimeoutMaxSeconds != 0 && c.TimeoutMinSeconds > c.TimeoutMaxSeconds {
 		errs = append(errs, errors.New("timeout_min_seconds: must not exceed timeout_max_seconds"))
 	}
-	const maxDurationSeconds = math.MaxInt64 / int64(time.Second)
 	for _, f := range []struct {
 		name    string
 		seconds int64
@@ -187,11 +214,11 @@ func (c *Config) validateTimeouts() error {
 // validateTemplates requires every field and makes template IDs and aliases a
 // single unique selector namespace; revisions must be unique so a stored
 // revision reference resolves to exactly one mapping.
-func validateTemplates(ts []TemplateMapping) error {
+func (c *Config) validateTemplates() error {
 	var errs []error
 	selectors := map[string]bool{}
 	revisions := map[string]bool{}
-	for i, t := range ts {
+	for i, t := range c.Templates {
 		at := fmt.Sprintf("templates[%d]", i)
 		for _, f := range []struct{ name, v string }{
 			{"template_id", t.TemplateID},
@@ -203,6 +230,23 @@ func validateTemplates(ts []TemplateMapping) error {
 				errs = append(errs, fmt.Errorf("%s.%s: must not be empty", at, f.name))
 			} else if hasWhitespaceOrControl(f.v) {
 				errs = append(errs, fmt.Errorf("%s.%s: must not contain whitespace or control characters", at, f.name))
+			}
+		}
+		if t.Revision != "" && !hasWhitespaceOrControl(t.Revision) && !isValidLabelValue(t.Revision) {
+			errs = append(errs, fmt.Errorf("%s.revision: must be a valid label value (1-63 ASCII alphanumeric, '-', '_' or '.', starting and ending with alphanumeric)", at))
+		}
+		if t.TimeoutMaxSeconds != nil {
+			tmax := *t.TimeoutMaxSeconds
+			if tmax < 1 {
+				errs = append(errs, fmt.Errorf("%s.timeout_max_seconds: must be at least 1", at))
+			} else if c.TimeoutMinSeconds >= 1 && tmax < c.TimeoutMinSeconds {
+				errs = append(errs, fmt.Errorf("%s.timeout_max_seconds: must not be below timeout_min_seconds", at))
+			}
+			if c.TimeoutMaxSeconds > 0 && tmax > c.TimeoutMaxSeconds {
+				errs = append(errs, fmt.Errorf("%s.timeout_max_seconds: must not exceed timeout_max_seconds", at))
+			}
+			if tmax > maxDurationSeconds {
+				errs = append(errs, fmt.Errorf("%s.timeout_max_seconds: exceeds the maximum representable time.Duration in seconds", at))
 			}
 		}
 		for j, sel := range append([]string{t.TemplateID}, t.Aliases...) {
