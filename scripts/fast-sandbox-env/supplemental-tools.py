@@ -110,6 +110,8 @@ def validate(env):
     for k in positive:
         if not env[k].isdigit() or int(env[k]) < 1:
             raise ValueError(k)
+    if not 2 <= int(env.get('SUP_BURST_GUESTS','6')) <= 6:
+        raise ValueError('burst guests')
     if not 1 <= int(env['SUP_LOAD_GUESTS']) <= 6:
         raise ValueError('load guests')
     if 'm8' in env['SUP_MEASUREMENTS'].split() and env['SUP_SMOKE']=='false' and any(float(env[k])<=0 for k in ('SUP_SOAK_RATE_ALL','SUP_SOAK_RATE_CB')):

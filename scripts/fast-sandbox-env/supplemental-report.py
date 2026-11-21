@@ -74,7 +74,19 @@ def burst_rejections(errors, server_denials):
     eligible = sum(v for k, v in errors.items() if k in (
         "handshake/tls_closed", "handshake/reset", "handshake/tls_error", "recv/eof", "recv/reset"))
     attributed = min(max(0, server_denials), eligible)
-    return {"budget": attributed, "unattributed": sum(errors.values())-attributed}
+    counts = dict(budget=attributed, handshake_timeout=0, response_timeout=0,
+                  connection_refused=0, client_failure=0, unattributed=0)
+    left_budget = attributed
+    for key, count in errors.items():
+        if key in ("handshake/tls_closed", "handshake/reset", "handshake/tls_error", "recv/eof", "recv/reset"):
+            used = min(count, left_budget); left_budget -= used
+            counts["unattributed"] += count-used
+        elif key == "handshake/timeout": counts["handshake_timeout"] += count
+        elif key == "recv/timeout": counts["response_timeout"] += count
+        elif key.endswith("/refused"): counts["connection_refused"] += count
+        elif key.startswith("client/"): counts["client_failure"] += count
+        else: counts["unattributed"] += count
+    return counts
 
 
 def histogram_summary(hist):
@@ -96,7 +108,7 @@ def histogram_summary(hist):
 def run_row(raw):
     fields = ("attempted", "success", "failed", "wall_s", "cpu_s", "concurrency", "connection",
               "body_bytes", "bound_percent", "repeat", "mode", "cpu_limit", "path", "errors",
-              "contradictions", "verified", "leaf", "cred", "connections", "released_alive", "group", "total_concurrency", "latency_resolution_ms", "minute_windows", "max_requests", "start_at_s", "end_at_s", "scheduled_start_s", "start_lag_s")
+              "contradictions", "verified", "leaf", "cred", "connections", "released_alive", "group", "total_concurrency", "latency_resolution_ms", "minute_windows", "max_requests", "start_at_s", "end_at_s", "scheduled_start_s", "start_lag_s", "memory_preflight")
     row = {k: raw[k] for k in fields if k in raw}
     row["latency_ms"] = histogram_summary(raw["request_histogram_ms"]) if raw.get("request_histogram_ms") else quantiles(raw.get("request_ms", []))
     row["handshake_ms"] = quantiles(raw.get("handshake_ms", []))
@@ -119,16 +131,34 @@ def run_status(raw):
 
 
 def build_m3x(spec):
-    paths, statuses = [], []
+    paths, statuses, seen = [], [], set()
     for raw in spec.get("paths", []):
         points = [{k: p.get(k) for k in ("k", "held", "alive", "anon", "memory_current", "same_process")}
                   for p in raw.get("points", [])]
         good = [p for p in points if p["held"] == p["k"] == p["alive"] and p["same_process"]]
         fit = {f: base.least_squares([(p["k"], p[f]) for p in good if isinstance(p[f], (int, float))])
                for f in ("anon", "memory_current")}
-        status = ("INVALID" if raw.get("contradictions") else "FAILED" if not points else
+        status = ("INVALID" if raw.get("contradictions") or any(p["same_process"] is False for p in points) else "FAILED" if not points else
                   "PARTIAL" if len(good) != len(points) or any(v["slope"] is None for v in fit.values()) else "OK")
-        paths.append({"mode": raw.get("mode"), "target": raw.get("target"), "status": status,
+        identity = (raw.get("pod_uid"), raw.get("process_identity"))
+        baseline_check = {"threshold": "max(32 MiB, 20% of reference)", "comparisons": []}
+        if not all(identity) or not raw.get("fresh_baseline") or not raw.get("mode_baseline"):
+            status = base.worst([status, "PARTIAL"])
+        else:
+            if identity in seen or any(identity[0]==x[0] or identity[1]==x[1] for x in seen):
+                status = "INVALID"
+            seen.add(identity)
+            zero = next((p for p in points if p["k"]==0), {})
+            for source in ("fresh_baseline", "mode_baseline"):
+                for field in ("anon", "memory_current"):
+                    reference, actual = raw[source].get(field), zero.get(field)
+                    if not isinstance(reference,(int,float)) or not isinstance(actual,(int,float)):
+                        status=base.worst([status,"PARTIAL"]); continue
+                    threshold=max(32*1024*1024, .2*reference)
+                    ok=abs(actual-reference)<=threshold
+                    baseline_check["comparisons"].append(dict(source=source,field=field,reference=reference,actual=actual,threshold_bytes=threshold,ok=ok))
+                    if not ok: status="INVALID"
+        paths.append({"pod_uid":raw.get("pod_uid"),"process_identity":raw.get("process_identity"),"baseline_check":baseline_check,"mode": raw.get("mode"), "target": raw.get("target"), "status": status,
                       "points": points, "fit": fit})
         statuses.append(status)
     identities = [(p["mode"], p["target"]) for p in paths]
@@ -139,7 +169,7 @@ def build_m3x(spec):
     mixtures = []
     indexed = {(p["mode"], p["target"]): p for p in paths if p["status"] == "OK"}
     for mode in ("all", "credential-bound"):
-        if all((mode, t) in indexed for t in ("bound", "unbound")):
+        if len(indexed)==4 and len(paths)==4 and all(x=="OK" for x in statuses):
             for f in (0, .05, .25, .5, 1):
                 mixtures.append({"mode": mode, "bound_fraction": f, "method": "derived from measured slopes",
                                  "bytes_per_connection": {field: memory_mix(indexed[mode, "unbound"]["fit"][field]["slope"],
@@ -332,24 +362,42 @@ def build_time(spec):
             status=base.worst([status,"PARTIAL"])
     delta = {f: recovery[f]-baseline[f] for f in ("memory_current", "anon", "fd")
              if baseline and isinstance(recovery.get(f), (int, float)) and isinstance(baseline.get(f), (int, float))}
-    minute_windows = [w for raw in runs for w in raw.get("minute_windows", [])]
-    usable = [w.get("latency_ms", {}).get("p50") for w in minute_windows if w.get("latency_ms", {}).get("n", 0)>0]
-    drift = ((usable[-1]-usable[0])/usable[0]*100) if len(usable)>1 and usable[0] else None
+    latency_segments=[]
+    for raw in runs:
+        usable=[w.get("latency_ms",{}).get("p50") for w in raw.get("minute_windows",[]) if w.get("latency_ms",{}).get("n",0)>0]
+        drift=((usable[-1]-usable[0])/usable[0]*100) if len(usable)>1 and usable[0] else None
+        latency_segments.append(dict(group=raw.get("group"),concurrency=raw.get("total_concurrency",raw.get("concurrency")),
+            p50_first_ms=usable[0] if usable else None,p50_last_ms=usable[-1] if usable else None,
+            window_count=len(usable),p50_drift_percent=drift))
     groups = {x.get("group",0) for x in runs}
     active_s = sum(max([x.get("wall_s",0) for x in runs if x.get("group",0)==g] or [0]) for g in groups)
     actual_rps = sum(x.get("success",0) for x in runs)/active_s if active_s>0 else None
     target_rate = spec.get("settings",{}).get("rate_rps")
     return {"status": status, "samples": samples, "actual_rps":actual_rps,
             "actual_to_target_rate_ratio":actual_rps/target_rate if actual_rps is not None and isinstance(target_rate,(int,float)) and target_rate>0 else None,
-            "latency_p50_drift_percent": drift, "analysis_start_s": spec.get("analysis_start_s", 0),
+            "latency_segments": latency_segments, "analysis_start_s": spec.get("analysis_start_s", 0),
             "trend": trend, "baseline":baseline, "recovery_delta": delta, "runs": [run_row(r) for r in runs],
             "slope_unit": "bytes/second for memory, descriptors/second for FD"}
 
 
 def build_m7(spec):
-    runs, tiers = spec.get("runs") or [], spec.get("tiers") or []
+    source_runs, tiers = spec.get("runs") or [], spec.get("tiers") or []
+    runs=[]
+    for group in dict.fromkeys(x.get("group",i) for i,x in enumerate(source_runs)):
+        members=[x for i,x in enumerate(source_runs) if x.get("group",i)==group]
+        if len(members)==1:
+            runs.append(members[0]);continue
+        merged=dict(members[0],group=group)
+        for field in ("attempted","success","failed","verified","released_alive","contradictions","connections","cpu_s","concurrency"):
+            merged[field]=sum(x.get(field) or 0 for x in members)
+        complete=all(isinstance(x.get("errors"),dict) and all(type(v) is int and v>=0 for v in x["errors"].values()) for x in members)
+        merged["errors"]=dict(sum((Counter(x["errors"]) for x in members),Counter())) if complete else None
+        merged["wall_s"]=max(x.get("wall_s",0) for x in members)
+        for field in ("request_ms","handshake_ms"):
+            merged[field]=[v for x in members for v in x.get(field,[])]
+        runs.append(merged)
     rows, statuses = [], []
-    total_refusal = dict(budget=0, unattributed=0)
+    total_refusal = burst_rejections({},0)
     for i, raw in enumerate(runs):
         tier = next((t for t in tiers if t.get("group")==raw.get("group",i)), {})
         errors=raw.get("errors")
@@ -364,7 +412,9 @@ def build_m7(spec):
         budget=tier.get("budget") or {}
         attempted=raw.get("attempted") or 0
         numeric_budget=all(type(budget.get(k)) is int and budget[k]>0 for k in ("per_subject","process","available"))
-        available=min(budget['per_subject'],budget['process']) if numeric_budget and budget.get('admission_enabled') is True else attempted
+        allocations=tier.get("allocations")
+        subject_available=sum(min(budget['per_subject'],n) for n in allocations) if numeric_budget and allocations else budget.get('per_subject',0)
+        available=min(subject_available,budget['process']) if numeric_budget and budget.get('admission_enabled') is True else attempted
         expected_count=min(attempted,available)
         budget_matches=(numeric_budget and budget.get('available')==available and
                         expected==[expected_count,expected_count] and rejects==[attempted-expected_count,attempted-expected_count])
@@ -374,7 +424,20 @@ def build_m7(spec):
                 not refusal["unattributed"] and refusal["budget"]==failed and
                 tier.get("passthrough_ok") is True and tier.get("same_subject_passthrough_ok") is True and
                 tier.get("recovered") is True and budget_matches)
-        if raw.get("contradictions") or tier.get("passthrough_contradictions"):
+        members=[x for j,x in enumerate(source_runs) if x.get("group",j)==raw.get("group",i)]
+        synchronized=None
+        if tier.get("allocations"):
+            starts=[x.get("scheduled_start_s") for x in members]
+            synchronized=(len(members)==len(tier["allocations"]) and all(isinstance(t,(int,float)) for t in starts) and
+                          len(set(starts))==1 and all(0<=x.get("start_lag_s",-1)<=1 for x in members))
+            memory_ok=True
+            for member,count in zip(members,tier["allocations"]):
+                check=member.get("memory_preflight") or {}
+                required=count*384*1024+64*1024*1024
+                memory_ok=memory_ok and (check.get("status")=="OK" and check.get("concurrency")==count and
+                    check.get("required_bytes")==required and isinstance(check.get("available_bytes"),(int,float)) and check["available_bytes"]>=required)
+            if not synchronized or not memory_ok or sum(tier["allocations"])!=attempted:good=False
+        if raw.get("contradictions") or tier.get("passthrough_contradictions") or any(x.get("status")=="INVALID" for x in members):
             status = "INVALID"
         elif good:
             status = "OK"
@@ -382,7 +445,7 @@ def build_m7(spec):
             status = base.worst([status,"PARTIAL"])
         status = base.worst([status,recovery["status"] if tier else "PARTIAL"])
         statuses.append(status)
-        rows.append(dict(group=raw.get("group",i),status=status,budget=tier.get("budget"),
+        rows.append(dict(group=raw.get("group",i),status=status,synchronized_start=synchronized,allocations=tier.get("allocations"),client_memory_preflights=[x.get("memory_preflight") for x in members],budget=tier.get("budget"),
             expected_success=expected,expected_rejections=rejects,rejections=refusal,
             passthrough_ok=tier.get("passthrough_ok"),same_subject_passthrough_ok=tier.get("same_subject_passthrough_ok"),
             injection_recovery_ms=tier.get("injection_recovery_ms"),resource_recovery=recovery))
@@ -390,7 +453,7 @@ def build_m7(spec):
         statuses.append("INVALID")
     same_subject = spec.get("same_subject_passthrough_runs",[])
     statuses.extend(run_status(r) for r in same_subject)
-    return dict(status=base.worst(statuses),runs=[run_row(r) for r in runs],tiers=rows,
+    return dict(status=base.worst(statuses),runs=[run_row(r) for r in source_runs],tiers=rows,
                 same_subject_passthrough_runs=[run_row(r) for r in same_subject],rejections=total_refusal,
                 passthrough_ok=all(t.get("passthrough_ok") is True for t in tiers) if tiers else None,
                 recovered=all(t.get("recovered") is True for t in tiers) if tiers else False)

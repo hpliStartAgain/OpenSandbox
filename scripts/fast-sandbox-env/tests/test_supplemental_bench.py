@@ -53,9 +53,9 @@ class Reports(unittest.TestCase):
         self.assertEqual(r.build('m8', {'samples': rows, 'duration_s': 7200})['status'], 'PARTIAL')
 
     def test_budget_needs_server_evidence(self):
-        self.assertEqual(r.burst_rejections({'handshake/tls_closed': 5}, 0), {'budget': 0, 'unattributed': 5})
-        self.assertEqual(r.burst_rejections({'handshake/tls_closed': 5}, 3), {'budget': 3, 'unattributed': 2})
-        self.assertEqual(r.burst_rejections({'connect/timeout': 5}, 8), {'budget': 0, 'unattributed': 5})
+        self.assertEqual(r.burst_rejections({'handshake/tls_closed': 5}, 0), dict(r.burst_rejections({},0),budget=0,unattributed=5))
+        self.assertEqual(r.burst_rejections({'handshake/tls_closed': 5}, 3), dict(r.burst_rejections({},0),budget=3,unattributed=2))
+        self.assertEqual(r.burst_rejections({'connect/timeout': 5}, 8), dict(r.burst_rejections({},0),budget=0,unattributed=5))
 
     def test_burst_recovery_required(self):
         out = r.build('m7', {'runs': [{'attempted': 2, 'success': 2, 'failed': 0,
@@ -193,7 +193,7 @@ class SupplementalClientTest(OriginFixture):
         self.assertEqual(out['verified'],1)
         self.assertEqual(out['connections'],1)
 
-    def test_two_guests_wait_at_common_gate(self):
+    def exercise_common_gate(self,mode):
         import threading
         sp=importlib.util.spec_from_file_location('gate_origin',ROOT/'supplemental-origin.py')
         origin=importlib.util.module_from_spec(sp);sp.loader.exec_module(origin)
@@ -206,8 +206,8 @@ class SupplementalClientTest(OriginFixture):
             def call(op):
                 with urllib.request.urlopen(gate+'/'+op+'/test/host',timeout=5) as response:return json.load(response)
             for i in range(2):
-                out=str(Path(self.tmp)/('gate-%s.json'%i))
-                args=[sys.executable,str(ROOT/'supplemental-client.py'),'load','--host','echo.test','--ip','127.0.0.1',
+                out=str(Path(self.tmp)/('gate-%s-%s.json'%(mode,i)))
+                args=[sys.executable,str(ROOT/'supplemental-client.py'),mode,'--hold-s','.1','--host','echo.test','--ip','127.0.0.1',
                     '--port',str(self.port),'--cafile',self.ca,'--origin-leaf',der_sha256(self.leaf),'--expect-leaf','origin',
                     '--expect-cred','absent','--out',out,'--duration','.3','--gate-url',gate,'--gate-key','test','--participant',str(i)]
                 processes.append((subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE),out))
@@ -223,12 +223,22 @@ class SupplementalClientTest(OriginFixture):
                 self.assertEqual(process.returncode,0,stderr)
                 results.append(json.loads(Path(out).read_text()))
             self.assertLess(abs(results[0]['start_at_s']-results[1]['start_at_s']),.1)
-            self.assertGreater(min(x['wall_s'] for x in results),.29)
+            self.assertEqual(results[0]['scheduled_start_s'],results[1]['scheduled_start_s'])
+            if mode=='burst':
+                self.assertTrue(all(x['memory_preflight']['status']=='OK' and x['success']==x['released_alive']==1 for x in results))
+            if mode=='load':self.assertGreater(min(x['wall_s'] for x in results),.29)
             self.assertLess(max(x['wall_s'] for x in results),1)
         finally:
             for process,out in processes:
                 if process.poll() is None:process.kill();process.wait()
             server.shutdown();server.server_close();thread.join(5)
+
+
+    def test_two_guests_wait_at_common_gate(self):
+        self.exercise_common_gate('load')
+
+    def test_distributed_burst_waits_at_common_gate(self):
+        self.exercise_common_gate('burst')
 
 
 class SupplementalShellTest(ShellCase):
@@ -240,7 +250,7 @@ class SupplementalShellTest(ShellCase):
         body = r'''
 TEMPLATE_ID=tpl-1
 source "$SCRIPT_DIR/supplemental-bench.sh"
-SUP_CRED=unused; SUP_CODE=unused; SUP_IDLE_S=1
+SUP_GATE_URL=unused; SUP_CRED=unused; SUP_CODE=unused; SUP_IDLE_S=1
 sup_scan() { :; }
 bench_pool_apply() { cat "$1"; }
 kubectl() { printf '{"items":[{"spec":{"containers":[{"name":"egress","env":[{"name":"OPENSANDBOX_EGRESS_FSB_INTERCEPTION_MODE","value":"all"}],"resources":{"limits":{"cpu":"2"}}}]}}]}'; }
@@ -288,10 +298,12 @@ cat "$SUP_DIR/m10.json"
 source "$SCRIPT_DIR/supplemental-bench.sh"
 SUP_DIR="$WORK/report"; SUP_RAW="$SUP_DIR/raw"; mkdir -p "$SUP_RAW"
 SUP_SMOKE=true; SUP_LOAD_GUESTS=1; SUP_LOAD_S=1; SUP_IDLE_S=1; SUP_BURSTS=2; SUP_SEQ=0; SUP_CLIENT_ATTEMPTS=1
-SUP_BURST_REPEATS=3; SUP_RESOURCE_RECOVERY_S=1; SUP_RESOURCE_INTERVAL_S=1
-SUP_CRED=unused; SUP_CODE=unused; CB_ORIGIN_LEAF=origin; SUP_SINCE=unused; RESOURCE_NS=unused; CB_GUEST_DIR=/tmp
+SUP_BURST_GUESTS=2; SUP_BURST_REPEATS=3; SUP_RESOURCE_RECOVERY_S=1; SUP_RESOURCE_INTERVAL_S=1
+SUP_GATE_URL=unused; SUP_CRED=unused; SUP_CODE=unused; CB_ORIGIN_LEAF=origin; SUP_SINCE=unused; RESOURCE_NS=unused; CB_GUEST_DIR=/tmp
 sup_pool() { BENCH_LEG="$1"; }
 sup_pair() { BENCH_B=b; BENCH_U=u; BENCH_POD=p; }
+sup_burst_guests() { SUP_BURST_IDS=(b b2); }
+sup_gate() { echo '{}'; }
 sup_start() { :; }
 bench_wait() { if [[ "$2" == bench_guest_fetch ]]; then printf '{"contradictions":0}' > "$5"; fi; }
 bench_ns() { echo 1; }
@@ -304,7 +316,7 @@ cb_guest_once() {
  CB_RC=0; leaf=mitm; [[ "$BENCH_LEG" != credential-bound ]] || leaf=origin
  CB_RESULT="$(printf '{"ok":true,"leaf_sha256":"%s","last":{"status":200,"origin":{"cred":"absent"}}}' "$leaf")"
 }
-sup_fetch() { printf '{"success":2,"attempted":2,"failed":0,"contradictions":0,"released_alive":2,"verified":2,"errors":{},"request_ms":[1,2]}' > "$SUP_RAW/$2.json"; }
+sup_fetch() { printf '{"status":"OK","memory_preflight":{"status":"OK","concurrency":1,"required_bytes":67502080,"available_bytes":314572800},"scheduled_start_s":100,"start_lag_s":0,"success":1,"attempted":1,"failed":0,"contradictions":0,"released_alive":1,"verified":1,"errors":{},"request_ms":[1]}' > "$SUP_RAW/$2.json"; }
 sup_m7
 cat "$SUP_DIR/m7-credential-bound.json"
 '''

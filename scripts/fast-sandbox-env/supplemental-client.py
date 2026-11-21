@@ -8,6 +8,7 @@ credential. Never emits digests, peer names or arbitrary exception messages.
 """
 import argparse
 import copy
+import errno
 from collections import Counter
 import asyncio
 import hashlib
@@ -21,6 +22,8 @@ import time
 
 
 def error_kind(exc, phase):
+    if isinstance(exc,OSError) and exc.errno in (errno.ENOMEM,errno.EMFILE,errno.ENFILE,errno.ENOBUFS,errno.EADDRNOTAVAIL):
+        return 'client/resource_exhausted'
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         kind = 'timeout'
     elif isinstance(exc, ssl.SSLCertVerificationError):
@@ -113,13 +116,43 @@ async def gate_request(args, operation):
     return json.loads(body)
 
 
+def memory_available():
+    if Path('/proc/meminfo').exists():
+        values={line.split(':')[0]:int(line.split()[1])*1024 for line in Path('/proc/meminfo').read_text().splitlines()}
+        return values['MemAvailable']
+    # Local disposable TLS fixtures also run on macOS.
+    import subprocess,re
+    output=subprocess.check_output(['/usr/bin/vm_stat'],text=True)
+    page=int(re.search(r'page size of (\d+) bytes',output)[1])
+    return sum(int(re.search(r'^'+label+r':\s+(\d+)',output,re.M)[1]) for label in
+               ('Pages free','Pages inactive','Pages speculative'))*page
+
+
+def memory_preflight(concurrency, available):
+    # Stage-one observed ~226 KiB/connection; 384 KiB includes TLS/task margin.
+    per_connection=384*1024
+    reserve=64*1024*1024
+    required=concurrency*per_connection+reserve
+    return dict(status='OK' if available>=required else 'INVALID',available_bytes=available,
+                required_bytes=required,bytes_per_connection=per_connection,reserve_bytes=reserve,concurrency=concurrency)
+
+
 async def execute(args):
+    if args.mode in ('burst','memory-check'):
+        preflight=memory_preflight(args.concurrency,memory_available())
+        if preflight['status']!='OK' or args.mode=='memory-check':
+            result=dict(status=preflight['status'],memory_preflight=preflight,attempted=0,success=0,failed=0,contradictions=0)
+            save(args.out,result)
+            if args.ready_file:save(args.ready_file,result)
+            return result
+    else:preflight=None
     ctx = ssl.create_default_context(cafile=args.cafile)
     ctx.set_alpn_protocols(['http/1.1'])
     result = dict(v=1, attempted=0, success=0, failed=0, verified=0, connections=0, contradictions=0,
                   errors={}, leaf={'origin': 0, 'mitm': 0, 'none': 0}, cred={'expected': 0, 'absent': 0, 'other': 0},
                   request_ms=[], handshake_ms=[], concurrency=args.concurrency, connection=args.connection,
                   body_bytes=args.body_bytes, bound_percent=args.bound_percent, max_requests=args.max_requests, released_alive=0)
+    if preflight:result['memory_preflight']=preflight
     start, cpu = time.monotonic(), time.process_time()
     gate = asyncio.Event()
     held = []
@@ -241,7 +274,7 @@ async def execute(args):
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument('mode', choices=['load', 'burst'])
+    p.add_argument('mode', choices=['load', 'burst', 'memory-check'])
     for key in ['host', 'ip', 'cafile', 'origin-leaf', 'expect-leaf', 'expect-cred', 'out']:
         p.add_argument('--'+key, required=True)
     p.add_argument('--gate-url',default='')
