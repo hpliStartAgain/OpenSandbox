@@ -34,11 +34,15 @@ M5 的客户端按 100 次请求周期选择 5 次 bound、95 次 unbound，或�
 
 M6/M8 的时间轴按稳态负载阶段累计，预热、控制等待和结果下载不进入时间轴；M8 从共同测量边界开始，采样 memory、CPU、throttling、FD、Pod 重启及 OOM。FD 是该 egress 容器中所有进程的 FD 总和，conntrack 是 Pod 网络命名空间可读到的计数。采样写入独立文件，主进程在采样结束后组装报告。常驻 sampler 启动前，用 `sup_sample` 读取独立空载基线；退出后用同一路径读取恢复值，回落差值使用这两个读数。缺独立基线时不计算回落差值并降级。M8 每 100 次请求关闭连接，保存分钟级请求数、错误和延迟分位；长跑的总体延迟使用 0.1 ms 分箱。内存斜率单位为 B/s，后 90 分钟窗口由 `SUP_SOAK_ANALYSIS_S` 选择。`latency_segments` 按负载 group 和并发保存该段首尾分钟 p50 与漂移百分比；少于两个有效分钟窗口时漂移为 null。
 
-M7 将每档 burst 均分到 `SUP_BURST_GUESTS` 个同置 bound guest，默认 6 个，允许 2 至 6 个。每个 guest 的独立事件循环在共同起跑门释放后启动全部连接任务。所有 guest 在任何 burst worker 启动前完成内存预检：每连接按 384 KiB、固定余量 64 MiB 计算需求，与 live MemAvailable 比较；384 KiB 高于第一阶段约 226 KiB/连接的观测。任一不足即写 INVALID，整档不启动负载；客户端在创建 TLS 上下文与任务前再次预检。报告保存分配、每个客户端预检读数、计划起跑时间与起跑滞后，所有计划起跑时间必须一致且每个滞后在 0 至 1 s 内。
+M7 将分摊档位均分到 `SUP_BURST_GUESTS` 个同置 bound guest，默认 6 个，允许 2 至 6 个。每个 guest 使用稳定匿名 participant，报告在合并前核对 attempted、success、failed、verified、released_alive 和 allocation。每个 subject 的成功数不能超过 min(allocation, per-subject)；process 预算足够时，每个 member 精确达到各自期望。process 成为共同约束时，保留逐 subject 上界并核对合计。所有成员的计划起跑时间必须相同，各自起跑滞后在 0 至 1 s 内。
 
-成功连接持有到控制端完成 U 探针和 bound guest 的 unbound SNI 探针，释放时再次请求持有连接。每档从 live Pod 读取 per-subject/process 预算，按各 guest 分配计算可接纳数量，再应用 process 总预算；这测量多个 subject 的合计突发，默认 2049 档分摊后不会耗尽 2048 的单 subject 预算。仅同一隔离窗口的服务端 `tls decision deny reason=registry_exhausted` 日志与可匹配关闭同时存在时归为预算拒绝；握手超时、响应超时、连接拒绝和显式客户端失败分别计数，其余保留 unattributed。分类表示可观察失败阶段，不推断超时根因。成功必须非零，释放时全部连接仍可请求；只有符合期望且有服务端归因的预算拒绝可以豁免。任何其他拒绝均降级。
+任何 burst worker 启动前，全部 guest 先完成内存预检：按每连接 384 KiB 加固定 64 MiB 与 live MemAvailable 比较；不足即写 INVALID，整档不启动负载。客户端在创建 TLS 上下文与任务前再次预检。共同起跑门的每轮等待同时检查 ready/终态文件，发现 INVALID 或释放前提前终止即写 M7 INVALID 并清理。报告保留逐 member 预检和核对结果。
 
-注入恢复时间与资源恢复时间分列；每档保存基线、持有期及释放后 memory.current/anon、FD、conntrack、重启和 OOM 序列。回落容差为 memory.current 32 MiB、anon 16 MiB、FD 4、conntrack 64；持续观察完整的有界等待窗口 240 s，以最后样本判定恢复及恢复时间。最终资源未回落时报告 PARTIAL，收齐序列后重建 Pool，再进入下一档。
+分摊档之后，独立执行 credential-bound 的单 subject 超预算档：per-subject=2048、B=2049，构建 2 GiB bound guest，配一个原规格 unbound guest；读回 guest MemTotal、live Pool 资源策略和 Sandbox 限额/同 Pod 运行状态，计算 CPU 与内存承诺预算，并对 2049 条连接做 384 KiB/连接加 64 MiB 的预检。只有实测 2 GiB guest 不可调度时，才按已授权裁决准备低容量替代，并保存不可行证据。默认入口保留 2048/2049。`SUP_SMOKE=true` 时可显式用 `SUP_OVERFLOW_SMOKE_CAPACITY=8` 缩小边界为 8/9；guest 仍为 2 GiB，并保存完整 2049 预检作为可行性证据。
+
+超预算档持有现有连接，单独启动同 subject 的 unbound SNI 探针和新 bound 连接探针。两个探针使用独立 participant/结果对象，不进入负载组汇总；前者必须可通，后者须有匹配服务端 registry_exhausted 的预算拒绝。释放时用原 Session 验证全部既有连接存活，再确认 bound 注入恢复。M7 顶层保存 `overflow_coverage`，该独立档缺失或非 OK 时，分摊结果不能使顶层成为 OK。
+
+拒绝分为 budget、handshake_timeout、response_timeout、connection_refused、client_failure 与 unattributed；budget 需要同一隔离窗口的服务端事件及可匹配关闭。分类表示可观察失败阶段，不推断超时根因。每档保留资源基线、持有期与释放后的 memory.current/anon、FD、conntrack、重启和 OOM 序列；容差和完整恢复等待沿用原配置，以最后样本判定恢复。
 
 M9 的总数包含两个真实同置 guest，其余由 Actions v1 合成注册；每个合成对象都有独立 UID、fence、源 IP 和 attachment。SET 成功、ready Hook 成功分开计数；ready Hook 的成功受当前快照 ACK 门保护，因此 ACK 数由该门间接确认。每个规模暂停合成驱动，使用真实 guest 发 U/B 连接。合成 attachment 不创建 VM 或 veth，不能证明 4096 个真实流量源。4097 档分别保留注册数、ACK 数和激活数。产品容量门允许 SET=200、ready=503，因此 4097/4096/4096 可以构成预期溢出。每个未激活对象保存匿名序号、SET/ready 阶段和状态码；在独占、串行操作中，以操作前后 actions/status 的容量原因变化归因恰好一个对象。初始容量日志条数在恢复开始前保存，恢复期条数另计，条数与对象数分别报告。释放已激活对象后，REMOVE=200 且该对象 ready=409 确认本地注销；对未 ACK 或注册失败的同一对象重新 SET 并验证 ready=200。对象、阶段、原因及恢复证据齐全时标为 `OK`、`outcome=expected_overflow`，其余按实际证据降级。驱动在宿主的任务 runner cgroup 中运行，经仅绑定 127.0.0.1 的 kubectl port-forward 调用 action endpoint；与 egress cgroup 分离。每级暂停后先读取 egress 资源，再枚举 nft；枚举的 CPU 计数差和墙钟单列，累计 CPU 可扣除前序枚举成本重算。报告使用 `egress_per_subject_fit`，仅拟合 egress 内存计数；夹具自身 RSS/CPU 为独立字段。驱动在 `finally` 中清除全部尝试注册的对象，Pool 重建是异常中断后的清理边界。
 

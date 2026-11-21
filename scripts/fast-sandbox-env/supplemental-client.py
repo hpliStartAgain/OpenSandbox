@@ -141,14 +141,14 @@ async def execute(args):
     if args.mode in ('burst','memory-check'):
         preflight=memory_preflight(args.concurrency,memory_available())
         if preflight['status']!='OK' or args.mode=='memory-check':
-            result=dict(v=1,status=preflight['status'],memory_preflight=preflight,attempted=0,success=0,failed=0,contradictions=0)
+            result=dict(v=1,participant=args.participant,status=preflight['status'],memory_preflight=preflight,attempted=0,success=0,failed=0,contradictions=0)
             save(args.out,result)
             if args.ready_file:save(args.ready_file,result)
             return result
     else:preflight=None
     ctx = ssl.create_default_context(cafile=args.cafile)
     ctx.set_alpn_protocols(['http/1.1'])
-    result = dict(v=1, attempted=0, success=0, failed=0, verified=0, connections=0, contradictions=0,
+    result = dict(v=1, participant=args.participant, attempted=0, success=0, failed=0, verified=0, connections=0, contradictions=0,
                   errors={}, leaf={'origin': 0, 'mitm': 0, 'none': 0}, cred={'expected': 0, 'absent': 0, 'other': 0},
                   request_ms=[], handshake_ms=[], concurrency=args.concurrency, connection=args.connection,
                   body_bytes=args.body_bytes, bound_percent=args.bound_percent, max_requests=args.max_requests, released_alive=0)

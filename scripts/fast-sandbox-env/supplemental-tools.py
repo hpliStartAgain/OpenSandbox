@@ -110,6 +110,9 @@ def validate(env):
     for k in positive:
         if not env[k].isdigit() or int(env[k]) < 1:
             raise ValueError(k)
+    if env['SUP_SMOKE']=='true':
+        cap=env.get('SUP_OVERFLOW_SMOKE_CAPACITY','8')
+        if not cap.isdigit() or not 1<=int(cap)<=2048:raise ValueError('overflow smoke capacity')
     if not 2 <= int(env.get('SUP_BURST_GUESTS','6')) <= 6:
         raise ValueError('burst guests')
     if not 1 <= int(env['SUP_LOAD_GUESTS']) <= 6:
@@ -134,9 +137,37 @@ def validate(env):
         raise ValueError('analysis window')
 
 
+def m7_pool(pool, sandboxes):
+    import math
+    def quantity(value):
+        match=re.fullmatch(r"([0-9.]+)(Ki|Mi|Gi|Ti)?",str(value))
+        if not match:raise ValueError("unexpected memory quantity")
+        return int(float(match[1])*dict(Ki=1024,Mi=1024**2,Gi=1024**3,Ti=1024**4).get(match[2],1))
+    spec=pool["spec"];policy=spec["sandboxResources"];ratio=float(policy["overcommitRatio"]["memory"])
+    default=quantity(policy["memory"]);slots=spec["maxSandboxesPerPod"]
+    def cpu(value):return float(str(value)[:-1]) if str(value).endswith("m") else float(value)*1000
+    cpu_ratio=float(policy["overcommitRatio"].get("cpu","2"));default_cpu=cpu(policy.get("cpu","1"))
+    cpu_budget=max(default_cpu,math.ceil(default_cpu/cpu_ratio)*slots)
+    budget=max(default,math.ceil(default/ratio)*slots)
+    rows=[]
+    for item in sandboxes["items"]:
+        limit=quantity(item["spec"]["resources"]["limits"]["memory"])
+        rows.append(dict(limit_bytes=limit,request_bytes=math.ceil(limit/ratio),cpu_request_milli=math.ceil(cpu(item["spec"]["resources"]["limits"].get("cpu","1"))/cpu_ratio),running=item["status"]["phase"]=="Running",
+                         pod_uid=item["status"]["placement"]["fastletPodUID"]))
+    committed=sum(x["request_bytes"] for x in rows)
+    return dict(mode=policy["mode"],default_memory_bytes=default,memory_overcommit_ratio=ratio,max_sandboxes_per_pod=slots,
+                per_fastlet_memory_budget_bytes=budget,sandbox_limit_memory_bytes=max(x["limit_bytes"] for x in rows),
+                committed_bytes=committed,per_fastlet_cpu_budget_milli=cpu_budget,committed_cpu_milli=sum(x["cpu_request_milli"] for x in rows),
+                budget_sufficient=committed<=budget and sum(x["cpu_request_milli"] for x in rows)<=cpu_budget,
+                scheduled=all(x["running"] for x in rows) and len({x["pod_uid"] for x in rows})==1,
+                calculation="derived from live Pool policy and each live Sandbox resource limit",sandboxes=rows)
+
+
 def main(argv):
     command, *a = argv
-    if command == 'lifetime':
+    if command == 'm7-pool':
+        print(json.dumps(m7_pool(json.loads(Path(a[0]).read_text()),json.loads(Path(a[1]).read_text()))))
+    elif command == 'lifetime':
         print(lifetime_seconds(os.environ,a[0]))
     elif command == 'lifetime-readback':
         print(json.dumps(lifetime_readback(json.load(sys.stdin),int(a[0]))))

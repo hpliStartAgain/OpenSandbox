@@ -380,104 +380,188 @@ sup_burst_guests() {
 	SUP_BURST_IDS=("${SUP_LOAD_IDS[@]}"); SUP_LOAD_GUESTS="$saved"
 }
 
-sup_m7() {
-	local mode burst name since denials t0 leaf p_ok bad probe_json rep per process available expected tier_start reading released_start recovered i n gate allocations
+sup_m7_wait_gate() { # gate expected; inspect client files on every poll
+	local gate="$1" expected="$2" attempt i suffix raw
+	for attempt in $(seq 1 "$SUP_CLIENT_ATTEMPTS"); do
+		for i in "${!SUP_M7_NAMES[@]}"; do
+			for suffix in -ready ""; do
+				raw="$SUP_RAW/${SUP_M7_NAMES[$i]}$suffix.json"
+				if [[ ! -f "$raw" ]]; then bench_guest_fetch "${SUP_M7_IDS[$i]}" "$CB_GUEST_DIR/${SUP_M7_NAMES[$i]}$suffix.json" "$raw" || continue; fi
+				if [[ "$suffix" == "" || "$(jq -r '.status // "OK"' "$raw")" == INVALID ]]; then
+					jq '{measurement:"M7",status:"INVALID",reason:"client terminated before common gate release",participant:.participant,memory_preflight:.memory_preflight}' "$raw" > "$SUP_DIR/m7.json"
+					fail "M7 client terminal before common gate release"
+				fi
+			done
+		done
+		sup_gate_ready "$gate" "$expected" && return 0
+		((attempt>=SUP_CLIENT_ATTEMPTS)) || sleep 2
+	done
+	fail "M7 common gate readiness missing"
+}
+
+sup_m7_tier() {
+	local mode="$1" burst="$2" rep="$3" kind="${4:-distributed}" name since denials t0 leaf p_ok bad probe_json per process available expected tier_start reading released_start recovered i n gate allocations
 	local -a counts=() names=()
-	SUP_TOTAL_CONCURRENCY=0
-	for mode in all credential-bound; do
-		sup_spec m7; sup_pool "$mode" 500m; sup_pair; sup_burst_guests
-		for burst in $SUP_BURSTS; do
-			for rep in $(seq 1 "$SUP_BURST_REPEATS"); do
-				name="m7-$mode-$burst-$rep"; since="$(date -u +%FT%TZ)"; tier_start="$(bench_ns)"
-				per="$(kubectl -n "$RESOURCE_NS" get pod "$BENCH_POD" -o json | jq -r '.spec.containers[] | select(.name=="egress") | [.env[]? | select(.name=="OPENSANDBOX_EGRESS_FSB_TLS_CAPACITY") | .value][0] // "1024"')"
-				process="$(kubectl -n "$RESOURCE_NS" get pod "$BENCH_POD" -o json | jq -r '.spec.containers[] | select(.name=="egress") | [.env[]? | select(.name=="OPENSANDBOX_EGRESS_FSB_PROCESS_TLS_CAPACITY") | .value][0] // "32768"')"
-				counts=(); names=(); available=0
-				for i in "${!SUP_BURST_IDS[@]}"; do
-					n=$((burst/${#SUP_BURST_IDS[@]}+(i<burst%${#SUP_BURST_IDS[@]}?1:0))); ((n>0)) || continue
-					counts+=("$n"); names+=("$name-$i")
-					if ((n<per)); then available=$((available+n)); else available=$((available+per)); fi
-				done
-				if [[ "$mode" == credential-bound ]]; then ((process>=available)) || available="$process"; else available="$burst"; fi
-				allocations="$(printf '%s\n' "${counts[@]}" | jq -s .)"
-				# Complete every memory check before launching any burst workers.
-				for i in "${!names[@]}"; do
-					sup_start "${SUP_BURST_IDS[$i]}" "${names[$i]}-memory" bound "${counts[$i]}" keep-alive 1 0 memory-check
-					sup_fetch "${SUP_BURST_IDS[$i]}" "${names[$i]}-memory"
-					if [[ "$(jq -r .status "$SUP_RAW/${names[$i]}-memory.json")" != OK ]]; then
-						jq '{status:"INVALID",reason:"burst client memory insufficient; load not started",memory_preflight:.memory_preflight}' "$SUP_RAW/${names[$i]}-memory.json" > "$SUP_DIR/m7.json"
-						fail "M7 client memory preflight INVALID"
-					fi
-				done
-				expected="$burst"; (( expected<=available )) || expected="$available"
-				reading="$(sup_sample)"
-				jq -n --argjson g "$SUP_SEQ" --argjson per "$per" --argjson process "$process" --argjson avail "$available" \
-					--argjson admission "$([[ "$mode" == credential-bound ]] && echo true || echo false)" --argjson expected "$expected" --argjson rejected "$((burst-expected))" \
-					--argjson s "$reading" --argjson allocations "$allocations" --argjson timeout "$SUP_RESOURCE_RECOVERY_S" \
-					'{group:$g,allocations:$allocations,budget:{admission_enabled:$admission,per_subject:$per,process:$process,available:$avail,source:"live Pod env; absent process env uses product default 32768; idle pair"},
-					expected_success:[$expected,$expected],expected_rejections:[$rejected,$rejected],resource_samples:[$s+{phase:"baseline",t_s:0}],
-					resource_timeout_s:$timeout,resource_tolerances:{memory_current:33554432,anon:16777216,fd:4,conntrack:64}}' > "$SUP_RAW/m7-tier.json"
-				gate="$name-gate"
-				for i in "${!names[@]}"; do
-					sup_start "${SUP_BURST_IDS[$i]}" "${names[$i]}" bound "${counts[$i]}" keep-alive 1 0 burst \
-						--gate-url "$SUP_GATE_URL" --gate-key "$gate" --participant "guest-$i" \
-						--ready-file "$CB_GUEST_DIR/${names[$i]}-ready.json" --release-file "$CB_GUEST_DIR/${names[$i]}-go" --hold-s 120
-				done
-				bench_wait "$SUP_CLIENT_ATTEMPTS" sup_gate_ready "$gate" "${#names[@]}" || fail "M7 common gate readiness missing"
-				sup_gate release "$gate" > "$SUP_RAW/$name-release.json"
-				for i in "${!names[@]}"; do
-					bench_wait "$SUP_CLIENT_ATTEMPTS" bench_guest_fetch "${SUP_BURST_IDS[$i]}" "$CB_GUEST_DIR/${names[$i]}-ready.json" "$SUP_RAW/${names[$i]}-ready.json" || fail "M7 burst readiness missing"
-					sup_path_check m7 "$SUP_RAW/${names[$i]}-ready.json"
-					[[ "$(jq -r '.status // "OK"' "$SUP_RAW/${names[$i]}-ready.json")" != INVALID ]] || fail "M7 memory changed after preflight"
-				done
-				reading="$(sup_sample)"
-				bench_json_set "$SUP_RAW/m7-tier.json" '.resource_samples+=[$s+{phase:"held",t_s:($t/1000)}]' --argjson s "$reading" --argjson t "$(bench_elapsed_ms "$tier_start")"
-				cb_guest_once "$BENCH_U" m7-passthrough
-				leaf=mitm; [[ "$mode" != credential-bound ]] || leaf=origin
-				probe_json="$CB_RESULT"; [[ -n "$probe_json" ]] || probe_json='{}'
-				bad="$(jq --arg origin "$CB_ORIGIN_LEAF" --arg leaf "$leaf" 'if (.last.origin.cred != null and .last.origin.cred != "absent") or (.leaf_sha256 != null and ((.leaf_sha256==$origin) != ($leaf=="origin"))) then 1 else 0 end' <<< "$probe_json")"
-				printf '%s\n' "$probe_json" > "$SUP_RAW/$name-passthrough.json"
-				sup_path_check m7 "$SUP_RAW/$name-passthrough.json" "$bad"
-				p_ok=false; if [[ "$CB_RC" == 0 && "$bad" == 0 ]]; then p_ok=true; fi
-				bench_json_set "$SUP_RAW/m7-tier.json" '.passthrough_ok=$ok | .passthrough_contradictions=$bad' --argjson ok "$p_ok" --argjson bad "$bad"
-				sup_start "$BENCH_B" "$name-same-unbound" bound 1 new 1 0 load --bound-percent 0 --max-requests 1
-				sup_fetch "$BENCH_B" "$name-same-unbound"
-				p_ok="$(python3 - "$SUP_SELF_DIR" "$SUP_RAW/$name-same-unbound.json" <<'PROBE'
+	name="m7-$mode-$kind-$burst-$rep"; since="$(date -u +%FT%TZ)"; tier_start="$(bench_ns)"
+	per="$(kubectl -n "$RESOURCE_NS" get pod "$BENCH_POD" -o json | jq -r '.spec.containers[] | select(.name=="egress") | [.env[]? | select(.name=="OPENSANDBOX_EGRESS_FSB_TLS_CAPACITY") | .value][0] // "1024"')"
+	process="$(kubectl -n "$RESOURCE_NS" get pod "$BENCH_POD" -o json | jq -r '.spec.containers[] | select(.name=="egress") | [.env[]? | select(.name=="OPENSANDBOX_EGRESS_FSB_PROCESS_TLS_CAPACITY") | .value][0] // "32768"')"
+	counts=(); names=(); available=0
+	for i in "${!SUP_BURST_IDS[@]}"; do
+		n=$((burst/${#SUP_BURST_IDS[@]}+(i<burst%${#SUP_BURST_IDS[@]}?1:0))); ((n>0)) || continue
+		counts+=("$n"); names+=("$name-$i")
+		if ((n<per)); then available=$((available+n)); else available=$((available+per)); fi
+	done
+	if [[ "$mode" == credential-bound ]]; then ((process>=available)) || available="$process"; else available="$burst"; fi
+	allocations="$(printf '%s\n' "${counts[@]}" | jq -s .)"
+	# Complete every memory check before launching any burst workers.
+	for i in "${!names[@]}"; do
+		sup_start "${SUP_BURST_IDS[$i]}" "${names[$i]}-memory" bound "${counts[$i]}" keep-alive 1 0 memory-check
+		sup_fetch "${SUP_BURST_IDS[$i]}" "${names[$i]}-memory"
+		if [[ "$(jq -r .status "$SUP_RAW/${names[$i]}-memory.json")" != OK ]]; then
+			jq '{status:"INVALID",reason:"burst client memory insufficient; load not started",memory_preflight:.memory_preflight}' "$SUP_RAW/${names[$i]}-memory.json" > "$SUP_DIR/m7.json"
+			fail "M7 client memory preflight INVALID"
+		fi
+	done
+	expected="$burst"; (( expected<=available )) || expected="$available"
+	reading="$(sup_sample)"
+	jq -n --argjson g "$SUP_SEQ" --argjson per "$per" --argjson process "$process" --argjson avail "$available" \
+		--argjson admission "$([[ "$mode" == credential-bound ]] && echo true || echo false)" --argjson expected "$expected" --argjson rejected "$((burst-expected))" \
+		--argjson s "$reading" --arg kind "$kind" --argjson allocations "$allocations" --argjson timeout "$SUP_RESOURCE_RECOVERY_S" \
+		'{group:$g,kind:$kind,allocations:$allocations,members:[$allocations | to_entries[] | {participant:("guest-"+(.key|tostring)),allocation:.value}],budget:{admission_enabled:$admission,per_subject:$per,process:$process,available:$avail,source:"live Pod env; absent process env uses product default 32768; idle pair"},
+		expected_success:[$expected,$expected],expected_rejections:[$rejected,$rejected],resource_samples:[$s+{phase:"baseline",t_s:0}],
+		resource_timeout_s:$timeout,resource_tolerances:{memory_current:33554432,anon:16777216,fd:4,conntrack:64}}' > "$SUP_RAW/m7-tier.json"
+	gate="$name-gate"
+	SUP_M7_IDS=("${SUP_BURST_IDS[@]}"); SUP_M7_NAMES=("${names[@]}")
+	for i in "${!names[@]}"; do
+		sup_start "${SUP_BURST_IDS[$i]}" "${names[$i]}" bound "${counts[$i]}" keep-alive 1 0 burst \
+			--gate-url "$SUP_GATE_URL" --gate-key "$gate" --participant "guest-$i" \
+			--ready-file "$CB_GUEST_DIR/${names[$i]}-ready.json" --release-file "$CB_GUEST_DIR/${names[$i]}-go" --hold-s 600 --timeout 120
+	done
+	sup_m7_wait_gate "$gate" "${#names[@]}"
+	sup_gate release "$gate" > "$SUP_RAW/$name-release.json"
+	for i in "${!names[@]}"; do
+		bench_wait "$SUP_CLIENT_ATTEMPTS" bench_guest_fetch "${SUP_BURST_IDS[$i]}" "$CB_GUEST_DIR/${names[$i]}-ready.json" "$SUP_RAW/${names[$i]}-ready.json" || fail "M7 burst readiness missing"
+		sup_path_check m7 "$SUP_RAW/${names[$i]}-ready.json"
+		[[ "$(jq -r '.status // "OK"' "$SUP_RAW/${names[$i]}-ready.json")" != INVALID ]] || fail "M7 memory changed after preflight"
+	done
+	reading="$(sup_sample)"
+	bench_json_set "$SUP_RAW/m7-tier.json" '.resource_samples+=[$s+{phase:"held",t_s:($t/1000)}]' --argjson s "$reading" --argjson t "$(bench_elapsed_ms "$tier_start")"
+	cb_guest_once "$BENCH_U" m7-passthrough
+	leaf=mitm; [[ "$mode" != credential-bound ]] || leaf=origin
+	probe_json="$CB_RESULT"; [[ -n "$probe_json" ]] || probe_json='{}'
+	bad="$(jq --arg origin "$CB_ORIGIN_LEAF" --arg leaf "$leaf" 'if (.last.origin.cred != null and .last.origin.cred != "absent") or (.leaf_sha256 != null and ((.leaf_sha256==$origin) != ($leaf=="origin"))) then 1 else 0 end' <<< "$probe_json")"
+	printf '%s\n' "$probe_json" > "$SUP_RAW/$name-passthrough.json"
+	sup_path_check m7 "$SUP_RAW/$name-passthrough.json" "$bad"
+	p_ok=false; if [[ "$CB_RC" == 0 && "$bad" == 0 ]]; then p_ok=true; fi
+	bench_json_set "$SUP_RAW/m7-tier.json" '.passthrough_ok=$ok | .passthrough_contradictions=$bad' --argjson ok "$p_ok" --argjson bad "$bad"
+	sup_start "$BENCH_B" "$name-same-unbound" bound 1 new 1 0 load --bound-percent 0 --max-requests 1 --participant "probe-unbound-$SUP_SEQ"
+	sup_fetch "$BENCH_B" "$name-same-unbound"
+	p_ok="$(python3 - "$SUP_SELF_DIR" "$SUP_RAW/$name-same-unbound.json" <<'PROBE'
 import importlib.util,json,sys
 from pathlib import Path
 sp=importlib.util.spec_from_file_location('report',Path(sys.argv[1])/'supplemental-report.py');r=importlib.util.module_from_spec(sp);sp.loader.exec_module(r)
 print('true' if r.run_status(json.load(open(sys.argv[2])))=='OK' else 'false')
 PROBE
 )"
-				bench_json_set "$SUP_RAW/m7-tier.json" '.same_subject_passthrough_ok=$ok' --argjson ok "$p_ok"
-				bench_json_set "$SUP_RAW/m7-spec.json" '.same_subject_passthrough_runs=((.same_subject_passthrough_runs // [])+$r)' --slurpfile r "$SUP_RAW/$name-same-unbound.json"
-				reading="$(sup_sample)"
-				bench_json_set "$SUP_RAW/m7-tier.json" '.resource_samples+=[$s+{phase:"held",t_s:($t/1000)}]' --argjson s "$reading" --argjson t "$(bench_elapsed_ms "$tier_start")"
-				for i in "${!names[@]}"; do osb_api command run "${SUP_BURST_IDS[$i]}" -- touch "$CB_GUEST_DIR/${names[$i]}-go" >/dev/null; done
-				released_start="$(bench_ns)"; SUP_TOTAL_CONCURRENCY="$burst"
-				for i in "${!names[@]}"; do
-					sup_fetch "${SUP_BURST_IDS[$i]}" "${names[$i]}"
-					sup_append_run m7 "$SUP_RAW/${names[$i]}.json" bound "${counts[$i]}" keep-alive 0 "$rep" 500m
-				done
-				denials="$(kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress --since-time="$since" | python3 "$SUP_SELF_DIR/supplemental-tools.py" budget-denials)"
-				t0="$(bench_ns)"; cb_until "M7 recovered bound injection" 60 "$BENCH_B" m7-recovered "$SUP_CODE"
-				bench_json_set "$SUP_RAW/m7-tier.json" '.recovered=true | .injection_recovery_ms=$t | .server_budget_denials=$n' --argjson t "$(bench_elapsed_ms "$t0")" --argjson n "$denials"
-				recovered=false
-				while true; do
-					reading="$(sup_sample)"
-					bench_json_set "$SUP_RAW/m7-tier.json" '.resource_samples+=[$s+{phase:"released",t_s:($t/1000),release_elapsed_s:($r/1000)}]' \
-						--argjson s "$reading" --argjson t "$(bench_elapsed_ms "$tier_start")" --argjson r "$(bench_elapsed_ms "$released_start")"
-					if sup_m7_resources_ready; then recovered=true; else recovered=false; fi
-					(( $(bench_elapsed_ms "$released_start") < SUP_RESOURCE_RECOVERY_S*1000 )) || break
-					sleep "$SUP_RESOURCE_INTERVAL_S"
-				done
-				bench_json_set "$SUP_RAW/m7-spec.json" '.tiers=((.tiers // [])+$t)' --slurpfile t "$SUP_RAW/m7-tier.json"
-				SUP_SEQ=$((SUP_SEQ+1)); sup_report m7
-				# Observe the full bounded recovery sequence before replacing a Pool.
-				if [[ "$recovered" != true ]]; then sup_pool "$mode" 500m; sup_pair; sup_burst_guests; fi
+	bench_json_set "$SUP_RAW/m7-tier.json" '.same_subject_passthrough_ok=$ok' --argjson ok "$p_ok"
+	bench_json_set "$SUP_RAW/m7-spec.json" '.same_subject_passthrough_runs=((.same_subject_passthrough_runs // [])+$r)' --slurpfile r "$SUP_RAW/$name-same-unbound.json"
+	if [[ "$kind" == single-subject-overflow ]]; then
+		sup_start "$BENCH_B" "$name-new-bound" bound 1 new 1 0 load --bound-percent 100 --max-requests 1 --participant "probe-bound-$SUP_SEQ"
+		sup_fetch "$BENCH_B" "$name-new-bound"
+		bench_json_set "$SUP_RAW/m7-spec.json" '.overflow_probes={target_participant:"guest-0",unbound:$u[0],new_bound:$b[0]}' \
+			--slurpfile u "$SUP_RAW/$name-same-unbound.json" --slurpfile b "$SUP_RAW/$name-new-bound.json"
+	fi
+
+	reading="$(sup_sample)"
+	bench_json_set "$SUP_RAW/m7-tier.json" '.resource_samples+=[$s+{phase:"held",t_s:($t/1000)}]' --argjson s "$reading" --argjson t "$(bench_elapsed_ms "$tier_start")"
+	for i in "${!names[@]}"; do osb_api command run "${SUP_BURST_IDS[$i]}" -- touch "$CB_GUEST_DIR/${names[$i]}-go" >/dev/null; done
+	released_start="$(bench_ns)"; SUP_TOTAL_CONCURRENCY="$burst"
+	for i in "${!names[@]}"; do
+		sup_fetch "${SUP_BURST_IDS[$i]}" "${names[$i]}"
+		sup_append_run m7 "$SUP_RAW/${names[$i]}.json" bound "${counts[$i]}" keep-alive 0 "$rep" 500m
+	done
+	denials="$(kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress --since-time="$since" | python3 "$SUP_SELF_DIR/supplemental-tools.py" budget-denials)"
+	t0="$(bench_ns)"; cb_until "M7 recovered bound injection" 60 "$BENCH_B" m7-recovered "$SUP_CODE"
+	bench_json_set "$SUP_RAW/m7-tier.json" '.recovered=true | .injection_recovery_ms=$t | .server_budget_denials=$n' --argjson t "$(bench_elapsed_ms "$t0")" --argjson n "$denials"
+	recovered=false
+	while true; do
+		reading="$(sup_sample)"
+		bench_json_set "$SUP_RAW/m7-tier.json" '.resource_samples+=[$s+{phase:"released",t_s:($t/1000),release_elapsed_s:($r/1000)}]' \
+			--argjson s "$reading" --argjson t "$(bench_elapsed_ms "$tier_start")" --argjson r "$(bench_elapsed_ms "$released_start")"
+		if sup_m7_resources_ready; then recovered=true; else recovered=false; fi
+		(( $(bench_elapsed_ms "$released_start") < SUP_RESOURCE_RECOVERY_S*1000 )) || break
+		sleep "$SUP_RESOURCE_INTERVAL_S"
+	done
+	bench_json_set "$SUP_RAW/m7-spec.json" '.tiers=((.tiers // [])+$t)' --slurpfile t "$SUP_RAW/m7-tier.json"
+	SUP_SEQ=$((SUP_SEQ+1)); SUP_M7_RECOVERED="$recovered"; sup_report m7
+}
+
+sup_m7_overflow_pair() { # original small template, then large bound template
+	local small="$1" large="$CB_TEMPLATE_ID" u b id
+	CB_TEMPLATE_ID="$small"; cb_create_sandbox overflow-u "$BENCH_POLICY"; u="$CB_LAST_ID"
+	cb_placement "$u" || fail "M7 overflow U placement missing"
+	BENCH_POD="$CB_POD_NAME"; BENCH_POD_UID="$CB_POD_UID"
+	CB_TEMPLATE_ID="$large"; cb_create_colocated overflow-b "$BENCH_POLICY" "$BENCH_POD_UID"; b="$CB_LAST_ID"
+	bench_bind "$b" "$SUP_CRED" overflow-bind
+	cb_until "M7 overflow bound guest injected" 60 "$b" overflow-ready "$SUP_CODE"
+	bench_until_reachable "$u" overflow-unbound origin
+	BENCH_U="$u"; BENCH_B="$b"; SUP_SAMPLE_ID="$(bench_egress_identity "$BENCH_POD")"
+	rm -f "$SUP_RAW/resource-last.json"
+	for id in "$u" "$b"; do osb_api file upload "$id" "$SUP_SELF_DIR/supplemental-client.py" "$CB_GUEST_DIR/supplemental.py" >/dev/null; done
+}
+
+sup_m7_overflow() {
+	local original_template="$CB_TEMPLATE_ID" original_cap="$BENCH_FSB_TLS_CAPACITY" created cap=2048 memory total proof
+	[[ "$SUP_SMOKE" != true ]] || cap="${SUP_OVERFLOW_SMOKE_CAPACITY:-8}"
+	created="$(osb_api template create --image "$SBX_IMAGE" --publish "s3://$RUSTFS_BUCKET/publish" --format native \
+		--resource cpu=1 --resource memory=2Gi --resource disk=2Gi --warmup-seconds 15 --metadata origin=osep0023-m7-overflow -o json)"
+	TEMPLATE_ID="$(jq -r .template_id <<< "$created")"; CB_TEMPLATE_ID="$TEMPLATE_ID"
+	wait_succeeded "M7 2 GiB template Succeeded" 300 template_succeeded template_failed
+	BENCH_FSB_TLS_CAPACITY="$cap"
+	sup_spec m7; sup_pool credential-bound 500m; sup_m7_overflow_pair "$original_template"
+	SUP_BURST_IDS=("$BENCH_B")
+	memory="$(osb_api command run "$BENCH_B" -- python3 -c 'import json; from pathlib import Path; print(json.dumps({"v":1,"mem_total_bytes":int(next(x.split()[1] for x in Path("/proc/meminfo").read_text().splitlines() if x.startswith("MemTotal:")))*1024}))' | grep '^{' | tail -1)"
+	total="$(jq -r .mem_total_bytes <<< "$memory")"
+	jq -n --argjson mem "$total" '{mem_total_bytes:$mem}' > "$SUP_RAW/m7-large-guest.json"
+	kubectl -n "$RESOURCE_NS" get sandboxpool "$POOL_NAME" -o json > "$SUP_RAW/m7-overflow-pool.json"
+	kubectl -n "$RESOURCE_NS" get sandbox "$BENCH_U" "$BENCH_B" -o json > "$SUP_RAW/m7-overflow-sandboxes.json"
+	python3 "$SUP_SELF_DIR/supplemental-tools.py" m7-pool "$SUP_RAW/m7-overflow-pool.json" "$SUP_RAW/m7-overflow-sandboxes.json" > "$SUP_RAW/m7-pool-budget.json"
+	sup_start "$BENCH_B" m7-full-boundary-memory bound 2049 keep-alive 1 0 memory-check
+	sup_fetch "$BENCH_B" m7-full-boundary-memory
+	proof="$(jq -n --argjson mem "$total" --slurpfile pool "$SUP_RAW/m7-pool-budget.json" --slurpfile pre "$SUP_RAW/m7-full-boundary-memory.json" \
+		'{mem_total_bytes:$mem,pool:$pool[0],full_boundary_preflight:$pre[0].memory_preflight}')"
+	printf '%s\n' "$proof" > "$SUP_DIR/guest-feasibility.json"
+	if [[ "$(jq -r '.full_boundary_preflight.status=="OK" and .pool.budget_sufficient and .pool.scheduled and .mem_total_bytes>=1932735283' <<< "$proof")" != true ]]; then
+		jq -n --argjson proof "$proof" '{measurement:"M7",status:"INVALID",reason:"2 GiB guest or scheduling preflight failed",large_guest:$proof}' > "$SUP_DIR/m7.json"
+		fail "M7 overflow guest preflight INVALID"
+	fi
+	bench_json_set "$SUP_RAW/m7-spec.json" '.single_subject_overflow=true | .large_guest=$p' --argjson p "$proof"
+	sup_m7_tier credential-bound "$((cap+1))" 1 single-subject-overflow
+	sup_report m7; mv "$SUP_DIR/m7.json" "$SUP_DIR/m7-overflow.json"
+	cp "$SUP_RAW/m7-spec.json" "$SUP_RAW/m7-overflow-spec.json"
+	CB_TEMPLATE_ID="$original_template"; TEMPLATE_ID="$original_template"; BENCH_FSB_TLS_CAPACITY="$original_cap"
+}
+
+sup_m7() {
+	local mode burst rep
+	SUP_TOTAL_CONCURRENCY=0
+	for mode in all credential-bound; do
+		sup_spec m7
+		bench_json_set "$SUP_RAW/m7-spec.json" '.require_single_subject_overflow=true'
+		sup_pool "$mode" 500m; sup_pair; sup_burst_guests
+		for burst in $SUP_BURSTS; do
+			for rep in $(seq 1 "$SUP_BURST_REPEATS"); do
+				sup_m7_tier "$mode" "$burst" "$rep" distributed
+				if [[ "$SUP_M7_RECOVERED" != true ]]; then sup_pool "$mode" 500m; sup_pair; sup_burst_guests; fi
 			done
 		done
-		sup_report m7; mv "$SUP_DIR/m7.json" "$SUP_DIR/m7-$mode.json"
 		cp "$SUP_RAW/m7-spec.json" "$SUP_RAW/m7-$mode-spec.json"
+	done
+	sup_m7_overflow
+	for mode in all credential-bound; do
+		bench_json_set "$SUP_RAW/m7-$mode-spec.json" '.overflow_spec=$o[0]' --slurpfile o "$SUP_RAW/m7-overflow-spec.json"
+		cp "$SUP_RAW/m7-$mode-spec.json" "$SUP_RAW/m7-spec.json"
+		sup_report m7; mv "$SUP_DIR/m7.json" "$SUP_DIR/m7-$mode.json"
 	done
 }
 
@@ -567,6 +651,7 @@ sup_cleanup() {
 	[[ -z "${SUP_SUBJECT_PID:-}" ]] || { kill "$SUP_SUBJECT_PID" 2>/dev/null || true; wait "$SUP_SUBJECT_PID" 2>/dev/null || true; }
 	cb_cleanup
 	EGRESS_INTERCEPTION_MODE="$SUP_ORIGINAL_MODE"; WARM_IMAGES="$SUP_ORIGINAL_WARM"
+	[[ -z "${SUP_BASE_TEMPLATE:-}" ]] || { TEMPLATE_ID="$SUP_BASE_TEMPLATE"; CB_TEMPLATE_ID="$SUP_BASE_TEMPLATE"; }
 	bench_pool_restore
 }
 
@@ -594,6 +679,7 @@ supplemental_bench() {
 	python3 "$SUP_SELF_DIR/supplemental-tools.py" validate || die "invalid supplemental parameters"
 	bench_validate_knobs
 	load_mitm_ca_fingerprint; bench_load_template_id
+	SUP_BASE_TEMPLATE="$TEMPLATE_ID"
 	CB_NET="$(kind_network)"; [[ -n "$CB_NET" ]] || die "kind network missing"
 	SUP_DIR="${SUP_REPORT_DIR:-$WORK/bench/supplemental-$(date -u +%Y%m%dT%H%M%SZ)}"; SUP_RAW="$SUP_DIR/raw"
 	[[ ! -e "$SUP_DIR" ]] || die "supplemental output exists; choose a fresh SUP_REPORT_DIR"

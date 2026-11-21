@@ -108,7 +108,7 @@ def histogram_summary(hist):
 def run_row(raw):
     fields = ("attempted", "success", "failed", "wall_s", "cpu_s", "concurrency", "connection",
               "body_bytes", "bound_percent", "repeat", "mode", "cpu_limit", "path", "errors",
-              "contradictions", "verified", "leaf", "cred", "connections", "released_alive", "group", "total_concurrency", "latency_resolution_ms", "minute_windows", "max_requests", "start_at_s", "end_at_s", "scheduled_start_s", "start_lag_s", "memory_preflight")
+              "contradictions", "verified", "leaf", "cred", "connections", "released_alive", "group", "total_concurrency", "latency_resolution_ms", "minute_windows", "max_requests", "start_at_s", "end_at_s", "scheduled_start_s", "start_lag_s", "memory_preflight", "participant")
     row = {k: raw[k] for k in fields if k in raw}
     row["latency_ms"] = histogram_summary(raw["request_histogram_ms"]) if raw.get("request_histogram_ms") else quantiles(raw.get("request_ms", []))
     row["handshake_ms"] = quantiles(raw.get("handshake_ms", []))
@@ -380,16 +380,49 @@ def build_time(spec):
             "slope_unit": "bytes/second for memory, descriptors/second for FD"}
 
 
+def m7_members(members, tier):
+    budget=tier.get("budget") or {}; allocations=tier.get("allocations")
+    if allocations is None:
+        allocations=[x.get("attempted",0) for x in members]
+    allocations=[n if type(n) is int and n>0 else 0 for n in allocations]
+    declared=tier.get("members") or [dict(participant="guest-"+str(i),allocation=n) for i,n in enumerate(allocations)]
+    strict=tier.get("allocations") is not None
+    expected={x.get("participant"):x.get("allocation") for x in declared}
+    identities=[x.get("participant") for x in members]
+    identity_ok=(not strict or (len(expected)==len(declared)==len(members) and [x.get("allocation") for x in declared]==allocations and None not in identities and
+                 len(set(identities))==len(members) and set(identities)==set(expected)))
+    admission=budget.get("admission_enabled") is True
+    numeric=all(type(budget.get(k)) is int and budget[k]>0 for k in ("per_subject","process"))
+    caps=[min(n,budget["per_subject"]) if admission and numeric else n for n in allocations]
+    process_shared=bool(admission and numeric and budget["process"]<sum(caps))
+    rows=[]
+    for i,member in enumerate(members):
+        n=expected.get(member.get("participant")) if strict else allocations[i]
+        fields=("attempted","success","failed","verified","released_alive")
+        good=identity_ok and numeric and type(n) is int and n>0 and all(type(member.get(k)) is int and member[k]>=0 for k in fields)
+        cap=min(n,budget["per_subject"]) if good and admission else n
+        errors=member.get("errors")
+        good=good and isinstance(errors,dict) and all(type(v) is int and v>=0 for v in errors.values())
+        if good:
+            good=(member["attempted"]==n==member["success"]+member["failed"] and member["verified"]==member["released_alive"]==member["success"] and
+                  member["success"]<=cap and sum(errors.values())==member["failed"] and (process_shared or member["success"]==cap))
+        rows.append(dict(participant=member.get("participant"),allocation=n,success=member.get("success"),subject_upper_bound=cap,
+                         process_shared=process_shared,status="OK" if good else "PARTIAL"))
+    return rows
+
+
 def build_m7(spec):
     source_runs, tiers = spec.get("runs") or [], spec.get("tiers") or []
-    runs=[]
+    runs=[]; member_results={}
     for group in dict.fromkeys(x.get("group",i) for i,x in enumerate(source_runs)):
         members=[x for i,x in enumerate(source_runs) if x.get("group",i)==group]
+        tier=next((t for t in tiers if t.get("group")==group),{})
+        member_results[group]=m7_members(members,tier)
         if len(members)==1:
             runs.append(members[0]);continue
         merged=dict(members[0],group=group)
         for field in ("attempted","success","failed","verified","released_alive","contradictions","connections","cpu_s","concurrency"):
-            merged[field]=sum(x.get(field) or 0 for x in members)
+            merged[field]=sum(x.get(field) if isinstance(x.get(field),(int,float)) else 0 for x in members)
         complete=all(isinstance(x.get("errors"),dict) and all(type(v) is int and v>=0 for v in x["errors"].values()) for x in members)
         merged["errors"]=dict(sum((Counter(x["errors"]) for x in members),Counter())) if complete else None
         merged["wall_s"]=max(x.get("wall_s",0) for x in members)
@@ -408,9 +441,9 @@ def build_m7(spec):
         status = run_status(raw)
         expected, rejects = tier.get("expected_success"), tier.get("expected_rejections")
         recovery = resource_recovery(tier)
-        success, failed = raw.get("success") or 0, raw.get("failed") or 0
+        success, failed = (raw.get(k) if type(raw.get(k)) is int else 0 for k in ("success","failed"))
         budget=tier.get("budget") or {}
-        attempted=raw.get("attempted") or 0
+        attempted=raw.get("attempted") if type(raw.get("attempted")) is int else 0
         numeric_budget=all(type(budget.get(k)) is int and budget[k]>0 for k in ("per_subject","process","available"))
         allocations=tier.get("allocations")
         subject_available=sum(min(budget['per_subject'],n) for n in allocations) if numeric_budget and allocations else budget.get('per_subject',0)
@@ -418,10 +451,11 @@ def build_m7(spec):
         expected_count=min(attempted,available)
         budget_matches=(numeric_budget and budget.get('available')==available and
                         expected==[expected_count,expected_count] and rejects==[attempted-expected_count,attempted-expected_count])
-        good = (errors_complete and expected and rejects and success>0 and expected[0]<=success<=expected[1] and
+        member_checks=member_results[raw.get("group",i)]
+        good = (all(x["status"]=="OK" for x in member_checks) and errors_complete and expected and rejects and success>0 and expected[0]<=success<=expected[1] and
                 rejects[0]<=failed<=rejects[1] and raw.get("attempted")==success+failed and
                 raw.get("verified")==success and raw.get("released_alive")==success and
-                not refusal["unattributed"] and refusal["budget"]==failed and
+                not refusal["unattributed"] and refusal["budget"]==failed and sum(errors.values())==failed and
                 tier.get("passthrough_ok") is True and tier.get("same_subject_passthrough_ok") is True and
                 tier.get("recovered") is True and budget_matches)
         members=[x for j,x in enumerate(source_runs) if x.get("group",j)==raw.get("group",i)]
@@ -431,7 +465,10 @@ def build_m7(spec):
             synchronized=(len(members)==len(tier["allocations"]) and all(isinstance(t,(int,float)) for t in starts) and
                           len(set(starts))==1 and all(0<=x.get("start_lag_s",-1)<=1 for x in members))
             memory_ok=True
-            for member,count in zip(members,tier["allocations"]):
+            declared=tier.get("members") or [dict(participant="guest-"+str(j),allocation=n) for j,n in enumerate(tier["allocations"])]
+            assigned={x["participant"]:x["allocation"] for x in declared}
+            for member in members:
+                count=assigned.get(member.get("participant"),0)
                 check=member.get("memory_preflight") or {}
                 required=count*384*1024+64*1024*1024
                 memory_ok=memory_ok and (check.get("status")=="OK" and check.get("concurrency")==count and
@@ -445,7 +482,7 @@ def build_m7(spec):
             status = base.worst([status,"PARTIAL"])
         status = base.worst([status,recovery["status"] if tier else "PARTIAL"])
         statuses.append(status)
-        rows.append(dict(group=raw.get("group",i),status=status,synchronized_start=synchronized,allocations=tier.get("allocations"),client_memory_preflights=[x.get("memory_preflight") for x in members],budget=tier.get("budget"),
+        rows.append(dict(group=raw.get("group",i),status=status,member_checks=member_checks,synchronized_start=synchronized,allocations=tier.get("allocations"),client_memory_preflights=[x.get("memory_preflight") for x in members],budget=tier.get("budget"),
             expected_success=expected,expected_rejections=rejects,rejections=refusal,
             passthrough_ok=tier.get("passthrough_ok"),same_subject_passthrough_ok=tier.get("same_subject_passthrough_ok"),
             injection_recovery_ms=tier.get("injection_recovery_ms"),resource_recovery=recovery))
@@ -453,10 +490,38 @@ def build_m7(spec):
         statuses.append("INVALID")
     same_subject = spec.get("same_subject_passthrough_runs",[])
     statuses.extend(run_status(r) for r in same_subject)
-    return dict(status=base.worst(statuses),runs=[run_row(r) for r in source_runs],tiers=rows,
+    out=dict(status=base.worst(statuses),runs=[run_row(r) for r in source_runs],tiers=rows,
                 same_subject_passthrough_runs=[run_row(r) for r in same_subject],rejections=total_refusal,
                 passthrough_ok=all(t.get("passthrough_ok") is True for t in tiers) if tiers else None,
                 recovered=all(t.get("recovered") is True for t in tiers) if tiers else False)
+    if spec.get("single_subject_overflow"):
+        proof=spec.get("large_guest") or {}; budget_proof=proof.get("pool") or {}; full=proof.get("full_boundary_preflight") or {}
+        probes=spec.get("overflow_probes") or {}; unbound=probes.get("unbound") or {}; denied=probes.get("new_bound") or {}
+        tier=tiers[0] if len(tiers)==1 else {}; budget=tier.get("budget") or {}; cap=budget.get("per_subject",0)
+        participants={x.get("participant") for x in source_runs}
+        guest_ok=(proof.get("mem_total_bytes",0)>=int(1.8*1024**3) and budget_proof.get("scheduled") is True and
+            budget_proof.get("sandbox_limit_memory_bytes")==2*1024**3 and budget_proof.get("budget_sufficient") is True and
+            full.get("status")=="OK" and full.get("concurrency")==2049 and full.get("required_bytes")==2049*384*1024+64*1024*1024 and
+            full.get("available_bytes",0)>=full.get("required_bytes",1))
+        boundary_ok=(len(source_runs)==1 and tier.get("allocations")==[cap+1] and cap>0 and
+                     source_runs[0].get("mode")=="credential-bound" and (spec.get("smoke") is True or cap==2048))
+        probe_ids={unbound.get("participant"),denied.get("participant")}
+        probe_ok=(None not in probe_ids and len(probe_ids)==2 and not participants.intersection(probe_ids) and
+            probes.get("target_participant") in participants and unbound.get("attempted")==unbound.get("success")==unbound.get("verified")==1 and
+            unbound.get("failed")==0 and not unbound.get("contradictions") and denied.get("attempted")==denied.get("failed")==1 and
+            denied.get("success")==denied.get("verified",0)==0 and not denied.get("contradictions") and isinstance(denied.get("errors"),dict) and all(type(v) is int and v>=0 for v in denied["errors"].values()) and sum(denied["errors"].values())==1 and
+            burst_rejections(denied["errors"],max(0,(tier.get("server_budget_denials") or 0)-sum(x.get("failed",0) for x in source_runs)))["budget"]==1)
+        coverage="OK" if guest_ok and boundary_ok and probe_ok and out["status"]=="OK" else "PARTIAL"
+        out["status"]=base.worst([out["status"],coverage]);out["single_subject_overflow"]={"status":coverage,"large_guest":proof,"probes":{
+            "target_participant":probes.get("target_participant"),"unbound":run_row(unbound),"new_bound":run_row(denied)},
+            "capacity":cap,"burst":cap+1,"full_boundary":cap==2048}
+    if spec.get("require_single_subject_overflow"):
+        child=spec.get("overflow_spec") or {}
+        overflow=build_m7(child) if child.get("single_subject_overflow") is True and not child.get("require_single_subject_overflow") else {"status":"MISSING"}
+        out["overflow_coverage"]=overflow
+        out["status"]=base.worst([out["status"],overflow["status"] if overflow["status"]!="MISSING" else "PARTIAL"])
+    return out
+
 
 
 def build_m9(spec):

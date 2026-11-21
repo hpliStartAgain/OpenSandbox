@@ -89,7 +89,8 @@ class DistributedReports(unittest.TestCase):
         s=burst();a=s['runs'][0]
         a.update(attempted=2,success=1,verified=1,failed=1,released_alive=1,errors={'handshake/tls_closed':1},
                  scheduled_start_s=100,start_lag_s=.01,memory_preflight=c.memory_preflight(2,300*1024*1024))
-        s['runs']=[a,dict(a)];s['tiers'][0].update(allocations=[2,2],budget=dict(admission_enabled=True,per_subject=1,process=8,available=2))
+        a['participant']='guest-0'
+        s['runs']=[a,dict(a,participant='guest-1')];s['tiers'][0].update(allocations=[2,2],budget=dict(admission_enabled=True,per_subject=1,process=8,available=2))
         out=r.build_m7(s);self.assertEqual(out['status'],'OK');self.assertTrue(out['tiers'][0]['synchronized_start'])
         s['runs'][1]['scheduled_start_s']=101
         self.assertEqual(r.build_m7(s)['status'],'PARTIAL')

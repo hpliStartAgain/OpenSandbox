@@ -303,7 +303,8 @@ SUP_GATE_URL=unused; SUP_CRED=unused; SUP_CODE=unused; CB_ORIGIN_LEAF=origin; SU
 sup_pool() { BENCH_LEG="$1"; }
 sup_pair() { BENCH_B=b; BENCH_U=u; BENCH_POD=p; }
 sup_burst_guests() { SUP_BURST_IDS=(b b2); }
-sup_gate() { echo '{}'; }
+sup_gate() { echo '{"ready":2}'; }
+bench_guest_fetch() { return 1; }
 sup_start() { :; }
 bench_wait() { if [[ "$2" == bench_guest_fetch ]]; then printf '{"contradictions":0}' > "$5"; fi; }
 bench_ns() { echo 1; }
@@ -316,8 +317,12 @@ cb_guest_once() {
  CB_RC=0; leaf=mitm; [[ "$BENCH_LEG" != credential-bound ]] || leaf=origin
  CB_RESULT="$(printf '{"ok":true,"leaf_sha256":"%s","last":{"status":200,"origin":{"cred":"absent"}}}' "$leaf")"
 }
-sup_fetch() { printf '{"status":"OK","memory_preflight":{"status":"OK","concurrency":1,"required_bytes":67502080,"available_bytes":314572800},"scheduled_start_s":100,"start_lag_s":0,"success":1,"attempted":1,"failed":0,"contradictions":0,"released_alive":1,"verified":1,"errors":{},"request_ms":[1]}' > "$SUP_RAW/$2.json"; }
-sup_m7
+sup_fetch() { local part=guest-0; [[ "$1" != b2 ]] || part=guest-1; printf '{"participant":"%s","status":"OK","memory_preflight":{"status":"OK","concurrency":1,"required_bytes":67502080,"available_bytes":314572800},"scheduled_start_s":100,"start_lag_s":0,"success":1,"attempted":1,"failed":0,"contradictions":0,"released_alive":1,"verified":1,"errors":{},"request_ms":[1]}' "$part" > "$SUP_RAW/$2.json"; }
+for mode in all credential-bound; do
+ sup_spec m7; sup_pool "$mode" 500m; sup_pair; sup_burst_guests
+ for rep in 1 2 3; do sup_m7_tier "$mode" 2 "$rep"; done
+ sup_report m7; mv "$SUP_DIR/m7.json" "$SUP_DIR/m7-$mode.json"
+done
 cat "$SUP_DIR/m7-credential-bound.json"
 '''
         result = self.sourced(body, OCI_STACK='0')
