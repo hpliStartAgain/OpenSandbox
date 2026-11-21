@@ -141,7 +141,7 @@ async def execute(args):
     if args.mode in ('burst','memory-check'):
         preflight=memory_preflight(args.concurrency,memory_available())
         if preflight['status']!='OK' or args.mode=='memory-check':
-            result=dict(status=preflight['status'],memory_preflight=preflight,attempted=0,success=0,failed=0,contradictions=0)
+            result=dict(v=1,status=preflight['status'],memory_preflight=preflight,attempted=0,success=0,failed=0,contradictions=0)
             save(args.out,result)
             if args.ready_file:save(args.ready_file,result)
             return result

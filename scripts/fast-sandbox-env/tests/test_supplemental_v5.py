@@ -64,15 +64,21 @@ class Validity(unittest.TestCase):
             args=c.parse_args(['burst','--host','fixture','--ip','127.0.0.1','--cafile','missing','--origin-leaf','x','--expect-leaf','origin','--expect-cred','absent','--out',d+'/out.json','--concurrency','2000'])
             with patch.object(c,'memory_available',return_value=300*1024*1024),patch.object(c.Session,'connect') as connect,patch.object(c,'gate_request') as gate:
                 result=asyncio.run(c.execute(args))
+            self.assertEqual(result['v'],1)
             self.assertEqual(result['status'],'INVALID');self.assertEqual(result['attempted'],0)
             connect.assert_not_called();gate.assert_not_called()
+
+    def test_successful_memory_check_has_fetch_protocol_version(self):
+        with tempfile.TemporaryDirectory() as d:
+            args=c.parse_args(['memory-check','--host','fixture','--ip','127.0.0.1','--cafile','missing','--origin-leaf','x','--expect-leaf','origin','--expect-cred','absent','--out',d+'/out.json','--concurrency','2'])
+            with patch.object(c,'memory_available',return_value=300*1024*1024):
+                result=asyncio.run(c.execute(args))
+            self.assertEqual(result['v'],1);self.assertEqual(result['status'],'OK')
 
     def test_split_memory_capacity(self):
         self.assertEqual(c.memory_preflight(342,300*1024*1024)['status'],'OK')
         self.assertEqual(c.memory_preflight(2000,300*1024*1024)['status'],'INVALID')
 
-
-if __name__=='__main__':unittest.main()
 
 from test_credential_bound import ShellCase
 from test_supplemental_v2 import burst
@@ -111,3 +117,6 @@ cat "$WORK/launches"
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn('"INVALID"',result.stdout)
         self.assertEqual(result.stdout.strip().splitlines()[-1],'memory-check')
+
+
+if __name__=='__main__':unittest.main()
