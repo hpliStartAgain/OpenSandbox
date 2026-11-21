@@ -152,7 +152,7 @@ def m7_pool(pool, sandboxes):
     rows=[]
     for item in sandboxes["items"]:
         limit=quantity(item["spec"]["resources"]["limits"]["memory"])
-        rows.append(dict(limit_bytes=limit,request_bytes=math.ceil(limit/ratio),cpu_request_milli=math.ceil(cpu(item["spec"]["resources"]["limits"].get("cpu","1"))/cpu_ratio),running=item["status"]["phase"]=="Running",
+        rows.append(dict(limit_bytes=limit,request_bytes=math.ceil(limit/ratio),cpu_request_milli=math.ceil(cpu(item["spec"]["resources"]["limits"].get("cpu","1"))/cpu_ratio),running=item.get("status",{}).get("runtime",{}).get("state")=="Ready" and any(c.get("type")=="Ready" and c.get("status")=="True" for c in item.get("status",{}).get("conditions",[])),
                          pod_uid=item["status"]["placement"]["fastletPodUID"]))
     committed=sum(x["request_bytes"] for x in rows)
     return dict(mode=policy["mode"],default_memory_bytes=default,memory_overcommit_ratio=ratio,max_sandboxes_per_pod=slots,

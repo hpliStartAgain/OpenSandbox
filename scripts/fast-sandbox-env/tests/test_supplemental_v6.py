@@ -98,7 +98,7 @@ class Overflow(unittest.TestCase):
     def test_live_pool_derived_budget(self):
         tools=module('supplemental-tools')
         pool=dict(spec=dict(sandboxResources=dict(mode='ResourceAware',memory='512Mi',overcommitRatio=dict(memory='2')),maxSandboxesPerPod=8))
-        items=[dict(spec=dict(resources=dict(limits=dict(memory='2Gi'))),status=dict(phase='Running',placement=dict(fastletPodUID='same'))) for _ in range(2)]
+        items=[dict(spec=dict(resources=dict(limits=dict(memory='2Gi'))),status=dict(runtime=dict(state='Ready'),conditions=[dict(type='Ready',status='True')],placement=dict(fastletPodUID='same'))) for _ in range(2)]
         p=tools.m7_pool(pool,dict(items=items));self.assertTrue(p['budget_sufficient']);self.assertTrue(p['scheduled'])
         self.assertEqual(p['per_fastlet_memory_budget_bytes'],2*1024**3)
         items.append(copy.deepcopy(items[0]));self.assertFalse(tools.m7_pool(pool,dict(items=items))['budget_sufficient'])
@@ -146,10 +146,12 @@ class MixedShape(unittest.TestCase):
     def test_large_bound_small_probe_fit_live_default_pool(self):
         tools=module('supplemental-tools')
         pool=dict(spec=dict(sandboxResources=dict(mode='ResourceAware',cpu='1',memory='512Mi',overcommitRatio=dict(cpu='2',memory='2')),maxSandboxesPerPod=5))
-        items=[dict(spec=dict(resources=dict(limits=dict(cpu='1',memory=m))),status=dict(phase='Running',placement=dict(fastletPodUID='same'))) for m in ('512Mi','2Gi')]
+        items=[dict(spec=dict(resources=dict(limits=dict(cpu='1',memory=m))),status=dict(runtime=dict(state='Ready'),conditions=[dict(type='Ready',status='True')],placement=dict(fastletPodUID='same'))) for m in ('512Mi','2Gi')]
         out=tools.m7_pool(pool,dict(items=items));self.assertTrue(out['budget_sufficient'])
         self.assertEqual(out['sandbox_limit_memory_bytes'],2*1024**3)
         self.assertEqual(out['committed_bytes'],out['per_fastlet_memory_budget_bytes'])
+        items[1]['status']['conditions'][0]['status']='False'
+        self.assertFalse(tools.m7_pool(pool,dict(items=items))['scheduled'])
 
 
 if __name__=='__main__':unittest.main()
