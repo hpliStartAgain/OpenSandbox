@@ -16,17 +16,17 @@ c=module('supplemental-client');r=module('supplemental-report');tools=module('su
 
 
 def filled(mode='credential-bound'):
-    s=overflow();s.update(gradual_fill=True,mode=mode)
+    s=overflow();s.update(gradual_fill=True,mode=mode,logging_deployment=dict(PYTHONUNBUFFERED='1',live_egress_containers=2,readback=True,scope='m7_single_subject'))
     a=s['runs'][0];a.update(mode=mode,attempted=2,success=2,failed=0,errors={},held=2,
         memory_preflight=c.memory_preflight(2,2*1024**3),boundary_verified=2,boundary_origin_connections=2,fill_status='FULL',fill_reason='capacity_reached',
         fill=dict(batch_size=1,batch_interval_s=.1,max_retries=2,attempt_limit=6,
                   batches=[dict(attempted=1,verified=1,failed=0,held=1,errors={}),dict(attempted=1,verified=1,failed=0,held=2,errors={})]))
     s['tiers'][0].update(server_held=dict(source='origin_live_connections',established=2),
-        probe_denials_before=0,probe_denials_after=1,probe_server_budget_denials=1,probe_sent=True,server_budget_denials=1)
+        probe_event_window=dict(start_s=1,end_s=2,wait_limit_s=120,matched_denials=1,before_release=True),probe_denials_before=0,probe_denials_after=1,probe_server_budget_denials=1,probe_sent=True,server_budget_denials=1)
     s['tiers'][0]['budget']['admission_enabled']=mode=='credential-bound'
     if mode=='all':
         s['overflow_probes']['new_bound']=dict(participant='probe-bound',attempted=1,success=1,verified=1,failed=0,contradictions=0,errors={})
-        s['tiers'][0]['probe_server_budget_denials']=0;s['tiers'][0]['probe_denials_after']=0
+        s['tiers'][0]['probe_server_budget_denials']=0;s['tiers'][0]['probe_denials_after']=0;s['tiers'][0]['probe_event_window']['matched_denials']=0
     return s
 
 
@@ -61,6 +61,21 @@ class Report(unittest.TestCase):
             s=filled();s['runs'][0][field]=value;self.assertNotEqual(r.build_m7(s)['status'],'OK',field)
         s=filled();s['tiers'][0]['server_held']['established']=1
         self.assertNotEqual(r.build_m7(s)['status'],'OK')
+
+    def test_time_window_and_live_logging_proof_required(self):
+        for key,value in [('matched_denials',0),('before_release',False),('end_s',0),('end_s',122),('wait_limit_s',121)]:
+            s=filled();s['tiers'][0]['probe_event_window'][key]=value
+            self.assertNotEqual(r.build_m7(s)['status'],'OK',key)
+        s=filled();s['logging_deployment']['readback']=False
+        self.assertNotEqual(r.build_m7(s)['status'],'OK')
+
+    def test_denial_timestamp_must_be_in_probe_window(self):
+        line='credential proxy: tls decision deny reason=registry_exhausted'
+        text='\n'.join(['2026-11-23T04:00:00Z '+line,'2026-11-23T04:00:01.123456789Z '+line,'2026-11-23T04:00:04Z '+line,line])
+        import datetime
+        start=datetime.datetime.fromisoformat('2026-11-23T04:00:01+00:00').timestamp()
+        self.assertEqual(tools.budget_denials(text,start,start+1),1)
+        self.assertEqual(tools.budget_denials(text),4)
 
     def test_retry_accounting_and_guest_preflight(self):
         s=filled();a=s['runs'][0];a.update(attempted=3,failed=1,errors={'recv/io_error':1})
@@ -117,10 +132,35 @@ test "$(cat "$WORK/reads")" = 3
 printf '0' > "$WORK/reads"
 sup_m7_denial_count() { local n; n=$(cat "$WORK/reads"); echo "$((n+1))" > "$WORK/reads"; echo 0; }
 test "$(sup_m7_probe_denials 0 credential-bound)" = 0
-test "$(cat "$WORK/reads")" = 30
+test "$(cat "$WORK/reads")" = 120
 echo BOUNDED
 """,OCI_STACK='0')
         self.assertIn('BOUNDED',out.stdout);self.assertNotIn('REPLAYED',out.stdout)
+
+    def test_logging_environment_scoped_and_live_readback(self):
+        import yaml
+        for flag in ('false','true'):
+            out=self.sourced(r'''
+TEMPLATE_ID=tpl-1
+source "$SCRIPT_DIR/supplemental-bench.sh"
+SUP_RAW="$WORK"; SUP_IDLE_S=1
+sup_scan() { :; }; wait_for() { :; }; sleep() { :; }
+bench_pool_apply() { cat "$1"; }
+kubectl() {
+ case "$*" in
+ *jsonpath*) echo fixture-pod ;;
+ *printenv*) echo 1 ;;
+ *) printf '{"items":[{"spec":{"containers":[{"name":"egress","env":[{"name":"OPENSANDBOX_EGRESS_FSB_INTERCEPTION_MODE","value":"all"}],"resources":{"limits":{"cpu":"2"}}}]}}]}' ;;
+ esac
+}
+sup_pool all 2
+if [[ "$SUP_M7_LOG_UNBUFFERED" == true ]]; then
+ jq -e '.readback and .live_egress_containers==1 and .PYTHONUNBUFFERED=="1"' "$SUP_RAW/m7-log-deployment.json" >/dev/null
+else test ! -e "$SUP_RAW/m7-log-deployment.json"; fi
+''',OCI_STACK='0',WARM_IMAGES='0',SUP_M7_LOG_UNBUFFERED=flag)
+            containers=yaml.safe_load(out.stdout)['spec']['fastletTemplate']['spec']['containers']
+            env=next(c for c in containers if c['name']=='egress')['env']
+            self.assertEqual([e for e in env if e['name']=='PYTHONUNBUFFERED'],[dict(name='PYTHONUNBUFFERED',value='1')] if flag=='true' else [])
 
     def test_incomplete_fill_never_launches_probes(self):
         for held,server in ((1,1),(2,1)):

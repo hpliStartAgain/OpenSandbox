@@ -61,8 +61,9 @@ sup_pool() { # mode cpu-limit; each block gets a new Pool and live env readback
 	sup_scan
 	EGRESS_INTERCEPTION_MODE="$mode"; BENCH_LEG="$mode"
 	bench_render_pool
-	awk -v cpu="$cpu" '
+	awk -v cpu="$cpu" -v unbuffered="${SUP_M7_LOG_UNBUFFERED:-false}" '
 		/^      - name: / { e=($0=="      - name: egress"); l=0 }
+		e && unbuffered=="true" && /^        env:$/ { print; print "        - name: PYTHONUNBUFFERED\n          value: \"1\""; next }
 		e && /^          limits:$/ { l=1 }
 		e && /^          requests:$/ { l=0 }
 		e && l && /^            cpu:/ { print "            cpu: " cpu; next }
@@ -75,6 +76,15 @@ sup_pool() { # mode cpu-limit; each block gets a new Pool and live env readback
 		| jq -e --arg m "$mode" --arg cpu "$cpu" 'all(.items[]; (.spec.containers[] | select(.name=="egress")) as $e |
 			([$e.env[]? | select(.name=="OPENSANDBOX_EGRESS_FSB_INTERCEPTION_MODE") | .value] == [$m]) and $e.resources.limits.cpu==$cpu)' >/dev/null \
 		|| fail "supplemental: live mode/CPU mismatch"
+	if [[ "${SUP_M7_LOG_UNBUFFERED:-false}" == true ]]; then
+		local pod count=0
+		for pod in $(kubectl -n "$RESOURCE_NS" get pods -l "app=sandbox-fastlet,fast-sandbox.io/pool=$POOL_NAME" -o jsonpath='{.items[*].metadata.name}'); do
+			[[ "$(kubectl -n "$RESOURCE_NS" exec "$pod" -c egress -- printenv PYTHONUNBUFFERED)" == 1 ]] || fail "M7 live PYTHONUNBUFFERED mismatch"
+			count=$((count+1))
+		done
+		((count>0)) || fail "M7 logging readback has no egress container"
+		jq -n --argjson n "$count" '{PYTHONUNBUFFERED:"1",live_egress_containers:$n,readback:true,scope:"m7_single_subject"}' > "$SUP_RAW/m7-log-deployment.json"
+	fi
 	wait_for "supplemental: template cached on every warm Fastlet" 300 sup_warm_ready
 	sleep "$SUP_IDLE_S"
 }
@@ -526,23 +536,26 @@ sup_m7_fill_ready() { # inspect ready and premature terminal results
 	return 1
 }
 
-sup_m7_denial_count() {
-	kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress | python3 "$SUP_SELF_DIR/supplemental-tools.py" budget-denials
+sup_m7_denial_count() { # optional host-time window, same target Pod
+	kubectl --request-timeout="${SUP_M7_LOG_READ_TIMEOUT:-120}s" -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress --timestamps | python3 "$SUP_SELF_DIR/supplemental-tools.py" budget-denials "$@"
 }
 
-sup_m7_probe_denials() { # baseline; wait for this single probe's asynchronous log
-	local before="$1" after i
-	for i in $(seq 1 30); do
-		after="$(sup_m7_denial_count)"
+sup_m7_probe_denials() { # baseline mode; held sessions remain open for at most 120 s
+	local before="$1" after="$1" i budget=120 deadline remaining
+	if [[ -n "${3:-}" ]]; then budget="$(python3 -c 'import sys,time; print(max(0,int(120-time.time()+float(sys.argv[1]))))' "$3")"; fi
+	deadline=$((SECONDS+budget))
+	for i in $(seq 1 120); do
+		remaining=$((deadline-SECONDS)); ((remaining>0)) || break
+		after="$(SUP_M7_LOG_READ_TIMEOUT="$remaining" sup_m7_denial_count)"
 		if ((after>before)); then printf '%s\n' "$after"; return; fi
 		[[ "$2" == credential-bound ]] || break
-		((i==30)) || sleep 1
+		((i==120 || SECONDS>=deadline)) || sleep 1
 	done
 	printf '%s\n' "$after"
 }
 
 sup_m7_fill_tier() { # mode capacity; single subject only
-	local mode="$1" cap="$2" name="m7-fill-$1-$SUP_SEQ" reading start released_start proof before after full=false recovered=false t0
+	local mode="$1" cap="$2" name="m7-fill-$1-$SUP_SEQ" reading start released_start proof before after probe_start probe_end matched full=false recovered=false t0
 	start="$(bench_ns)"; reading="$(sup_sample)"
 	bench_json_set "$SUP_RAW/m7-spec.json" '.gradual_fill=true | .mode=$mode' --arg mode "$mode"
 	jq -n --argjson cap "$cap" --arg mode "$mode" --argjson s "$reading" --argjson timeout "$SUP_RESOURCE_RECOVERY_S" \
@@ -562,11 +575,15 @@ sup_m7_fill_tier() { # mode capacity; single subject only
 		sup_start "$BENCH_B" "$name-unbound" bound 1 new 1 0 load --bound-percent 0 --max-requests 1 --participant probe-unbound
 		sup_fetch "$BENCH_B" "$name-unbound"
 		before="$(sup_m7_denial_count)"
+		probe_start="$(python3 -c 'import time; print(time.time())')"
 		sup_start "$BENCH_B" "$name-new-bound" bound 1 new 1 0 load --bound-percent 100 --max-requests 1 --participant probe-bound
 		sup_fetch "$BENCH_B" "$name-new-bound"
-		after="$(sup_m7_probe_denials "$before" "$mode")"
-		bench_json_set "$SUP_RAW/m7-tier.json" '.probe_sent=true | .probe_server_budget_denials=$n | .probe_denials_before=$before | .probe_denials_after=$after' \
-			--argjson n "$((after-before))" --argjson before "$before" --argjson after "$after"
+		after="$(sup_m7_probe_denials "$before" "$mode" "$probe_start")"
+		probe_end="$(python3 -c 'import sys,time; print(min(time.time(),float(sys.argv[1])+120))' "$probe_start")"
+		matched="$(sup_m7_denial_count "$probe_start" "$probe_end")"
+		bench_json_set "$SUP_RAW/m7-tier.json" '.probe_sent=true | .probe_server_budget_denials=$n | .probe_denials_before=$before | .probe_denials_after=$after | .probe_event_window={start_s:$start,end_s:$end,wait_limit_s:120,matched_denials:$matched,before_release:true}' \
+			--argjson n "$((after-before))" --argjson before "$before" --argjson after "$after" \
+			--argjson start "$probe_start" --argjson end "$probe_end" --argjson matched "$matched"
 		bench_json_set "$SUP_RAW/m7-spec.json" '.overflow_probes={target_participant:"guest-0",unbound:$u[0],new_bound:$b[0]}' \
 			--slurpfile u "$SUP_RAW/$name-unbound.json" --slurpfile b "$SUP_RAW/$name-new-bound.json"
 	fi
@@ -588,7 +605,7 @@ sup_m7_fill_tier() { # mode capacity; single subject only
 }
 
 sup_m7_overflow() {
-	local original_template="$CB_TEMPLATE_ID" original_cap="$BENCH_FSB_TLS_CAPACITY" mode="${1:-credential-bound}" created cap=2048 memory total proof
+	local SUP_M7_LOG_UNBUFFERED=true original_template="$CB_TEMPLATE_ID" original_cap="$BENCH_FSB_TLS_CAPACITY" mode="${1:-credential-bound}" created cap=2048 memory total proof
 	[[ "$SUP_SMOKE" != true ]] || cap="${SUP_OVERFLOW_SMOKE_CAPACITY:-8}"
 	created="$(osb_api template create --image "$SBX_IMAGE" --publish "s3://$RUSTFS_BUCKET/publish" --format native \
 		--resource cpu=1 --resource memory=2Gi --resource disk=2Gi --warmup-seconds 15 --metadata origin=osep0023-m7-overflow -o json)"
@@ -612,7 +629,7 @@ sup_m7_overflow() {
 		jq -n --argjson proof "$proof" '{measurement:"M7",status:"INVALID",reason:"2 GiB guest or scheduling preflight failed",large_guest:$proof}' > "$SUP_DIR/m7.json"
 		fail "M7 overflow guest preflight INVALID"
 	fi
-	bench_json_set "$SUP_RAW/m7-spec.json" '.single_subject_overflow=true | .large_guest=$p' --argjson p "$proof"
+	bench_json_set "$SUP_RAW/m7-spec.json" '.single_subject_overflow=true | .large_guest=$p | .logging_deployment=$log[0]' --argjson p "$proof" --slurpfile log "$SUP_RAW/m7-log-deployment.json"
 	sup_m7_fill_tier "$mode" "$cap"
 	sup_report m7; mv "$SUP_DIR/m7.json" "$SUP_DIR/m7-overflow.json"
 	cp "$SUP_RAW/m7-spec.json" "$SUP_RAW/m7-overflow-spec.json"

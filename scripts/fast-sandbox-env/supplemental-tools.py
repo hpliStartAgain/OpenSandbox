@@ -62,10 +62,20 @@ def create_inputs(spec_file):
     return values
 
 
-def budget_denials(text):
+def budget_denials(text, start=None, end=None):
     # launch.go consumes tls-admission-v1 into telemetry, while it forwards
     # the closed tls-decision deny line to the egress container log.
-    return len(re.findall(r'credential proxy: tls decision deny reason=registry_exhausted(?=["\s]|$)', text))
+    pattern=r'credential proxy: tls decision deny reason=registry_exhausted(?=["\s]|$)'
+    if start is None:return len(re.findall(pattern,text))
+    count=0
+    for line in text.splitlines():
+        if not re.search(pattern,line):continue
+        try:
+            token=re.sub(r'(\.\d{6})\d+',r'\1',line.split()[0]).replace('Z','+00:00')
+            stamp=datetime.datetime.fromisoformat(token).timestamp()
+        except (ValueError,IndexError):continue
+        if float(start)<=stamp<=float(end):count+=1
+    return count
 
 
 def m5_cases(env):
@@ -190,7 +200,7 @@ def main(argv):
     elif command == 'validate':
         validate(os.environ)
     elif command == 'budget-denials':
-        print(budget_denials(sys.stdin.read()))
+        print(budget_denials(sys.stdin.read(),*a))
     elif command == 'certificate':
         make_origin_certificate(*a)
     elif command == 'classify':

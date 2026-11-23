@@ -448,7 +448,12 @@ def build_m7_fill(spec):
         pre.get('required_bytes')==2049*384*1024+64*1024*1024 and pre.get('available_bytes',0)>=pre.get('required_bytes',1))
     denial=tier.get('probe_server_budget_denials',0)
     before=tier.get('probe_denials_before');after=tier.get('probe_denials_after')
-    delta_ok=numeric(before) and numeric(after) and after-before==denial
+    window=tier.get('probe_event_window') or {};logging=spec.get('logging_deployment') or {}
+    window_ok=(all(type(window.get(k)) in (int,float) and math.isfinite(window[k]) for k in ('start_s','end_s')) and
+        0<=window['end_s']-window['start_s']<=120 and window.get('wait_limit_s')==120 and window.get('before_release') is True and window.get('matched_denials')==denial)
+    logging_ok=(logging.get('PYTHONUNBUFFERED')=='1' and logging.get('readback') is True and
+        type(logging.get('live_egress_containers')) is int and logging['live_egress_containers']>0 and logging.get('scope')=='m7_single_subject')
+    delta_ok=numeric(before) and numeric(after) and after-before==denial and window_ok
     be=bound.get('errors') or {}
     rejected=(bound.get('attempted')==bound.get('failed')==1 and bound.get('success')==bound.get('verified',0)==0 and
         not bound.get('contradictions') and isinstance(be,dict) and all(numeric(v) for v in be.values()) and sum(be.values())==1 and
@@ -457,7 +462,7 @@ def build_m7_fill(spec):
     probe_ok=(delta_ok and tier.get('probe_sent') is True and None not in ids and len(set(ids))==3 and probes.get('target_participant')==ids[0] and
         successful(unbound) and (rejected if mode=='credential-bound' else successful(bound) and denial==0))
     recovery=resource_recovery(tier)
-    ok=(mode in ('all','credential-bound') and full and guest_ok and probe_ok and tier.get('recovered') is True and recovery['status']=='OK')
+    ok=(mode in ('all','credential-bound') and full and guest_ok and probe_ok and logging_ok and tier.get('recovered') is True and recovery['status']=='OK')
     invalid=any(x.get('contradictions',0) or x.get('status')=='INVALID' for x in (raw,unbound,bound))
     status='INVALID' if invalid or recovery['status']=='INVALID' else 'OK' if ok else 'PARTIAL'
     reason=raw.get('fill_reason') if raw.get('fill_reason') in ('capacity_reached','retry_limit_reached','non_retryable_failure') else 'fill_evidence_incomplete'
@@ -466,7 +471,7 @@ def build_m7_fill(spec):
         fill={k:fill.get(k) for k in ('batch_size','batch_interval_s','max_retries','attempt_limit')},
         batches=[{k:b.get(k) for k in ('attempted','verified','failed','held','errors')} for b in batches],
         server_held={k:server.get(k) for k in ('source','established')},probe_sent=tier.get('probe_sent',False),
-        probe_server_budget_denials=denial,probe_denials_before=before,probe_denials_after=after,large_guest=proof,probes=dict(target_participant=probes.get('target_participant'),unbound=run_row(unbound),new_bound=run_row(bound)))
+        probe_server_budget_denials=denial,probe_denials_before=before,probe_denials_after=after,probe_event_window={k:window.get(k) for k in ('start_s','end_s','wait_limit_s','matched_denials','before_release')},logging_deployment={k:logging.get(k) for k in ('PYTHONUNBUFFERED','live_egress_containers','readback','scope')},large_guest=proof,probes=dict(target_participant=probes.get('target_participant'),unbound=run_row(unbound),new_bound=run_row(bound)))
     return dict(status=status,mode=mode,runs=[run_row(x) for x in runs],single_subject_overflow=summary,
         tiers=[dict(status=status,budget=tier.get('budget'),resource_recovery=recovery,injection_recovery_ms=tier.get('injection_recovery_ms'))],
         recovered=tier.get('recovered') is True,rejections=burst_rejections(be,denial))
