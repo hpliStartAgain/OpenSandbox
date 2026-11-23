@@ -447,12 +447,14 @@ def build_m7_fill(spec):
         pool.get('sandbox_limit_memory_bytes')==2*1024**3 and pre.get('status')=='OK' and pre.get('concurrency')==2049 and
         pre.get('required_bytes')==2049*384*1024+64*1024*1024 and pre.get('available_bytes',0)>=pre.get('required_bytes',1))
     denial=tier.get('probe_server_budget_denials',0)
+    before=tier.get('probe_denials_before');after=tier.get('probe_denials_after')
+    delta_ok=numeric(before) and numeric(after) and after-before==denial
     be=bound.get('errors') or {}
     rejected=(bound.get('attempted')==bound.get('failed')==1 and bound.get('success')==bound.get('verified',0)==0 and
         not bound.get('contradictions') and isinstance(be,dict) and all(numeric(v) for v in be.values()) and sum(be.values())==1 and
         denial==1 and burst_rejections(be,denial)['budget']==1)
     ids=[raw.get('participant'),unbound.get('participant'),bound.get('participant')]
-    probe_ok=(tier.get('probe_sent') is True and None not in ids and len(set(ids))==3 and probes.get('target_participant')==ids[0] and
+    probe_ok=(delta_ok and tier.get('probe_sent') is True and None not in ids and len(set(ids))==3 and probes.get('target_participant')==ids[0] and
         successful(unbound) and (rejected if mode=='credential-bound' else successful(bound) and denial==0))
     recovery=resource_recovery(tier)
     ok=(mode in ('all','credential-bound') and full and guest_ok and probe_ok and tier.get('recovered') is True and recovery['status']=='OK')
@@ -464,7 +466,7 @@ def build_m7_fill(spec):
         fill={k:fill.get(k) for k in ('batch_size','batch_interval_s','max_retries','attempt_limit')},
         batches=[{k:b.get(k) for k in ('attempted','verified','failed','held','errors')} for b in batches],
         server_held={k:server.get(k) for k in ('source','established')},probe_sent=tier.get('probe_sent',False),
-        probe_server_budget_denials=denial,large_guest=proof,probes=dict(target_participant=probes.get('target_participant'),unbound=run_row(unbound),new_bound=run_row(bound)))
+        probe_server_budget_denials=denial,probe_denials_before=before,probe_denials_after=after,large_guest=proof,probes=dict(target_participant=probes.get('target_participant'),unbound=run_row(unbound),new_bound=run_row(bound)))
     return dict(status=status,mode=mode,runs=[run_row(x) for x in runs],single_subject_overflow=summary,
         tiers=[dict(status=status,budget=tier.get('budget'),resource_recovery=recovery,injection_recovery_ms=tier.get('injection_recovery_ms'))],
         recovered=tier.get('recovered') is True,rejections=burst_rejections(be,denial))

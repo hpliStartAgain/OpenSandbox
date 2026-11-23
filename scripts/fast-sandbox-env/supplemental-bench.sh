@@ -526,9 +526,24 @@ sup_m7_fill_ready() { # inspect ready and premature terminal results
 	return 1
 }
 
+sup_m7_denial_count() {
+	kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress | python3 "$SUP_SELF_DIR/supplemental-tools.py" budget-denials
+}
+
+sup_m7_probe_denials() { # baseline; wait for this single probe's asynchronous log
+	local before="$1" after i
+	for i in $(seq 1 30); do
+		after="$(sup_m7_denial_count)"
+		if ((after>before)); then printf '%s\n' "$after"; return; fi
+		[[ "$2" == credential-bound ]] || break
+		((i==30)) || sleep 1
+	done
+	printf '%s\n' "$after"
+}
+
 sup_m7_fill_tier() { # mode capacity; single subject only
-	local mode="$1" cap="$2" name="m7-fill-$1-$SUP_SEQ" reading start released_start proof since before after full=false recovered=false t0
-	start="$(bench_ns)"; since="$(date -u +%FT%TZ)"; reading="$(sup_sample)"
+	local mode="$1" cap="$2" name="m7-fill-$1-$SUP_SEQ" reading start released_start proof before after full=false recovered=false t0
+	start="$(bench_ns)"; reading="$(sup_sample)"
 	bench_json_set "$SUP_RAW/m7-spec.json" '.gradual_fill=true | .mode=$mode' --arg mode "$mode"
 	jq -n --argjson cap "$cap" --arg mode "$mode" --argjson s "$reading" --argjson timeout "$SUP_RESOURCE_RECOVERY_S" \
 		'{budget:{per_subject:$cap,admission_enabled:($mode=="credential-bound")},resource_samples:[$s+{phase:"baseline",t_s:0}],
@@ -546,11 +561,12 @@ sup_m7_fill_tier() { # mode capacity; single subject only
 	if [[ "$full" == true ]]; then
 		sup_start "$BENCH_B" "$name-unbound" bound 1 new 1 0 load --bound-percent 0 --max-requests 1 --participant probe-unbound
 		sup_fetch "$BENCH_B" "$name-unbound"
-		before="$(kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress --since-time="$since" | python3 "$SUP_SELF_DIR/supplemental-tools.py" budget-denials)"
+		before="$(sup_m7_denial_count)"
 		sup_start "$BENCH_B" "$name-new-bound" bound 1 new 1 0 load --bound-percent 100 --max-requests 1 --participant probe-bound
 		sup_fetch "$BENCH_B" "$name-new-bound"
-		after="$(kubectl -n "$RESOURCE_NS" logs "$BENCH_POD" -c egress --since-time="$since" | python3 "$SUP_SELF_DIR/supplemental-tools.py" budget-denials)"
-		bench_json_set "$SUP_RAW/m7-tier.json" '.probe_sent=true | .probe_server_budget_denials=$n' --argjson n "$((after-before))"
+		after="$(sup_m7_probe_denials "$before" "$mode")"
+		bench_json_set "$SUP_RAW/m7-tier.json" '.probe_sent=true | .probe_server_budget_denials=$n | .probe_denials_before=$before | .probe_denials_after=$after' \
+			--argjson n "$((after-before))" --argjson before "$before" --argjson after "$after"
 		bench_json_set "$SUP_RAW/m7-spec.json" '.overflow_probes={target_participant:"guest-0",unbound:$u[0],new_bound:$b[0]}' \
 			--slurpfile u "$SUP_RAW/$name-unbound.json" --slurpfile b "$SUP_RAW/$name-new-bound.json"
 	fi

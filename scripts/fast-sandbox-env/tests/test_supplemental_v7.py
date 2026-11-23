@@ -22,11 +22,11 @@ def filled(mode='credential-bound'):
         fill=dict(batch_size=1,batch_interval_s=.1,max_retries=2,attempt_limit=6,
                   batches=[dict(attempted=1,verified=1,failed=0,held=1,errors={}),dict(attempted=1,verified=1,failed=0,held=2,errors={})]))
     s['tiers'][0].update(server_held=dict(source='origin_live_connections',established=2),
-        probe_server_budget_denials=1,probe_sent=True,server_budget_denials=1)
+        probe_denials_before=0,probe_denials_after=1,probe_server_budget_denials=1,probe_sent=True,server_budget_denials=1)
     s['tiers'][0]['budget']['admission_enabled']=mode=='credential-bound'
     if mode=='all':
         s['overflow_probes']['new_bound']=dict(participant='probe-bound',attempted=1,success=1,verified=1,failed=0,contradictions=0,errors={})
-        s['tiers'][0]['probe_server_budget_denials']=0
+        s['tiers'][0]['probe_server_budget_denials']=0;s['tiers'][0]['probe_denials_after']=0
     return s
 
 
@@ -103,6 +103,25 @@ class FillClient(unittest.TestCase):
 
 
 class FillOrchestration(ShellCase):
+    def test_asynchronous_denial_log_wait_is_bounded(self):
+        out=self.sourced(r"""
+source "$SCRIPT_DIR/supplemental-bench.sh"
+printf '0' > "$WORK/reads"
+sup_m7_denial_count() {
+ local n; n=$(cat "$WORK/reads"); n=$((n+1)); echo "$n" > "$WORK/reads"
+ if ((n>=3)); then echo 1; else echo 0; fi
+}
+sleep() { :; }; sup_start() { echo REPLAYED; }
+test "$(sup_m7_probe_denials 0 credential-bound)" = 1
+test "$(cat "$WORK/reads")" = 3
+printf '0' > "$WORK/reads"
+sup_m7_denial_count() { local n; n=$(cat "$WORK/reads"); echo "$((n+1))" > "$WORK/reads"; echo 0; }
+test "$(sup_m7_probe_denials 0 credential-bound)" = 0
+test "$(cat "$WORK/reads")" = 30
+echo BOUNDED
+""",OCI_STACK='0')
+        self.assertIn('BOUNDED',out.stdout);self.assertNotIn('REPLAYED',out.stdout)
+
     def test_incomplete_fill_never_launches_probes(self):
         for held,server in ((1,1),(2,1)):
             out=self.sourced(r'''
