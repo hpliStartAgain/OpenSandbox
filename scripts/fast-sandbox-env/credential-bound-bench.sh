@@ -627,6 +627,8 @@ credential_bound_bench() {
 	rm -rf "$BENCH_DIR"
 	mkdir -p "$BENCH_RAW" "$GEN_DIR"
 	BENCH_BIND_MS=()
+	# Shared with the sourced credential-bound verify and bench cleanup.
+	# shellcheck disable=SC2034
 	CB_SANDBOXES=()
 	BENCH_PREV_EXIT_TRAP="$(trap -p EXIT)"
 	trap 'bench_cleanup' EXIT
