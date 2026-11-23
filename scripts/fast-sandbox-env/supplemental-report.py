@@ -430,12 +430,22 @@ def build_m7_fill(spec):
     batch_ok=bool(batches) and config and all(isinstance(b,dict) and all(numeric(b.get(k)) for k in ('attempted','verified','failed','held')) and
         0<b['attempted']<=fill['batch_size'] and b['attempted']==b['verified']+b['failed'] and b['held']<=cap and
         isinstance(b.get('errors'),dict) and all(numeric(v) for v in b['errors'].values()) and sum(b['errors'].values())==b['failed'] for b in batches)
-    count_ok=(counters and config and batch_ok and raw['attempted']<=fill['attempt_limit'] and
-        raw['attempted']==raw['success']+raw['failed'] and raw['success']==raw['verified']==raw['held']==raw['boundary_verified']==raw['released_alive']==cap and
+    removed=fill.get('recheck_removed',0);recheck_errors=fill.get('recheck_errors',{})
+    retryable={'handshake/timeout','handshake/reset','handshake/tls_closed','handshake/tls_error',
+        'handshake/io_error','handshake/refused','recv/timeout','recv/reset','recv/eof','recv/io_error'}
+    recheck_ok=(numeric(removed) and isinstance(recheck_errors,dict) and set(recheck_errors)<=retryable and
+        all(numeric(v) for v in recheck_errors.values()) and sum(recheck_errors.values())==removed and
+        batch_ok and all(numeric(b.get('recheck_removed',0)) and isinstance(b.get('recheck_errors',{}),dict) and
+            all(numeric(v) for v in b.get('recheck_errors',{}).values()) and
+            sum(b.get('recheck_errors',{}).values())==b.get('recheck_removed',0) for b in batches) and
+        sum(b.get('recheck_removed',0) for b in batches)==removed and
+        dict(sum((Counter(b.get('recheck_errors',{})) for b in batches),Counter()))==recheck_errors)
+    count_ok=(counters and config and batch_ok and recheck_ok and raw['attempted']<=fill['attempt_limit'] and
+        raw['attempted']==raw['success']+raw['failed'] and raw['success']==raw['verified'] and raw['verified']-removed==raw['held']==raw['boundary_verified']==raw['released_alive']==cap and
         isinstance(errors,dict) and all(numeric(v) for v in errors.values()) and sum(errors.values())==raw['failed'] and
         all(sum(b[k] for b in batches)==raw[k] for k in ('attempted','verified','failed')) and
         dict(sum((Counter(b['errors']) for b in batches),Counter()))==errors and
-        all(b['held']==sum(x['verified'] for x in batches[:i+1]) for i,b in enumerate(batches)))
+        all(b['held']==sum(x['verified']-x.get('recheck_removed',0) for x in batches[:i+1]) for i,b in enumerate(batches)))
     server=tier.get('server_held') or {}
     client_pre=raw.get('memory_preflight') or {}
     client_memory_ok=(client_pre.get('status')=='OK' and client_pre.get('concurrency')==cap and
@@ -468,8 +478,8 @@ def build_m7_fill(spec):
     reason=raw.get('fill_reason') if raw.get('fill_reason') in ('capacity_reached','retry_limit_reached','non_retryable_failure') else 'fill_evidence_incomplete'
     summary=dict(status=status,mode=mode,expected='budget_rejection' if mode=='credential-bound' else 'no_per_subject_budget',
         capacity=cap,full_boundary=cap==2048,held=raw.get('held'),boundary_verified=raw.get('boundary_verified'),boundary_origin_connections=raw.get('boundary_origin_connections'),fill_reason=reason,
-        fill={k:fill.get(k) for k in ('batch_size','batch_interval_s','max_retries','attempt_limit')},
-        batches=[{k:b.get(k) for k in ('attempted','verified','failed','held','errors')} for b in batches],
+        fill=dict({k:fill.get(k) for k in ('batch_size','batch_interval_s','max_retries','attempt_limit')},recheck_removed=removed,recheck_errors=recheck_errors),
+        batches=[{k:b.get(k) for k in ('attempted','verified','failed','held','errors','recheck_removed','recheck_errors')} for b in batches],
         server_held={k:server.get(k) for k in ('source','established')},probe_sent=tier.get('probe_sent',False),
         probe_server_budget_denials=denial,probe_denials_before=before,probe_denials_after=after,probe_event_window={k:window.get(k) for k in ('start_s','end_s','wait_limit_s','matched_denials','before_release')},logging_deployment={k:logging.get(k) for k in ('PYTHONUNBUFFERED','live_egress_containers','readback','scope')},large_guest=proof,probes=dict(target_participant=probes.get('target_participant'),unbound=run_row(unbound),new_bound=run_row(bound)))
     return dict(status=status,mode=mode,runs=[run_row(x) for x in runs],single_subject_overflow=summary,

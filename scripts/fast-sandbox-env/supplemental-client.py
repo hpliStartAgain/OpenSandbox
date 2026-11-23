@@ -251,7 +251,7 @@ async def execute(args):
     if args.mode == 'fill':
         limit=args.concurrency*(1+args.fill_max_retries)
         fill=dict(batch_size=args.fill_batch_size,batch_interval_s=args.fill_interval_s,
-                  max_retries=args.fill_max_retries,attempt_limit=limit,batches=[])
+                  max_retries=args.fill_max_retries,attempt_limit=limit,batches=[],recheck_removed=0,recheck_errors={})
         result['fill']=fill
         retryable={'handshake/timeout','handshake/reset','handshake/tls_closed','handshake/tls_error',
                    'handshake/io_error','handshake/refused','recv/timeout','recv/reset','recv/eof','recv/io_error'}
@@ -266,8 +266,11 @@ async def execute(args):
                     good,_=await asyncio.wait_for(session.request(),args.timeout)
                     result['contradictions']+=int(not good)
                     if good:alive.append(session);return
-                except (OSError,ValueError,asyncio.TimeoutError,asyncio.IncompleteReadError):
-                    pass
+                    key='recv/validation_failed'
+                except (OSError,ValueError,asyncio.TimeoutError,asyncio.IncompleteReadError) as exc:
+                    key=error_kind(exc,'recv')
+                fill['recheck_removed']+=1
+                fill['recheck_errors'][key]=fill['recheck_errors'].get(key,0)+1
                 await session.close()
             for offset in range(0,len(held),args.fill_batch_size):
                 await asyncio.gather(*(verify(s) for s in held[offset:offset+args.fill_batch_size]))
@@ -276,12 +279,16 @@ async def execute(args):
         while result['attempted']<limit:
             n=min(args.fill_batch_size,args.concurrency-len(held),limit-result['attempted'])
             before={k:result[k] for k in ('attempted','verified','failed')};errors=dict(result['errors'])
+            removed=fill['recheck_removed'];recheck_errors=dict(fill['recheck_errors'])
             await asyncio.gather(*(add_one() for _ in range(n)))
+            full=len(held)==args.concurrency and await verify_held()==args.concurrency
             fill['batches'].append(dict({k:result[k]-before[k] for k in before},held=len(held),
-                errors={k:v-errors.get(k,0) for k,v in result['errors'].items() if v>errors.get(k,0)}))
-            if result['contradictions'] or set(result['errors'])-retryable:
+                errors={k:v-errors.get(k,0) for k,v in result['errors'].items() if v>errors.get(k,0)},
+                recheck_removed=fill['recheck_removed']-removed,
+                recheck_errors={k:v-recheck_errors.get(k,0) for k,v in fill['recheck_errors'].items() if v>recheck_errors.get(k,0)}))
+            if result['contradictions'] or (set(result['errors'])|set(fill['recheck_errors']))-retryable:
                 result['fill_reason']='non_retryable_failure';break
-            if len(held)==args.concurrency and await verify_held()==args.concurrency:
+            if full:
                 result['fill_reason']='capacity_reached';break
             # Persist partial progress without declaring readiness for probes.
             save(str(args.out)+'.progress',dict(result,held=len(held)))

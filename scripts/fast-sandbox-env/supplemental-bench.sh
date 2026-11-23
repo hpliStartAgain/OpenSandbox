@@ -569,7 +569,7 @@ sup_m7_fill_tier() { # mode capacity; single subject only
 	reading="$(sup_sample)"
 	bench_json_set "$SUP_RAW/m7-tier.json" '.server_held=$proof | .resource_samples+=[$s+{phase:"held",t_s:($t/1000)}]' \
 		--argjson proof "$proof" --argjson s "$reading" --argjson t "$(bench_elapsed_ms "$start")"
-	if jq -e --argjson cap "$cap" '.fill_status=="FULL" and .held==$cap and .boundary_verified==$cap' "$SUP_RAW/$name-ready.json" >/dev/null && \
+	if jq -e --argjson cap "$cap" '.fill_status=="FULL" and .held==$cap and .boundary_verified==$cap and .boundary_origin_connections==$cap' "$SUP_RAW/$name-ready.json" >/dev/null && \
 		[[ "$(jq -r --argjson cap "$cap" '.source=="origin_live_connections" and .established==$cap' <<< "$proof")" == true ]]; then full=true; fi
 	if [[ "$full" == true ]]; then
 		sup_start "$BENCH_B" "$name-unbound" bound 1 new 1 0 load --bound-percent 0 --max-requests 1 --participant probe-unbound

@@ -106,6 +106,52 @@ class FillClient(unittest.TestCase):
                 out=asyncio.run(c.execute(args));ready=json.loads(Path(d+'/ready.json').read_text())
         return out,ready,state
 
+    def refill_after_recheck_drop(self, repeat=False):
+        state={'next':0}
+        class Session:
+            def __init__(self,*_):
+                state['next']+=1;self.number=state['next'];self.writer=None;self.calls=0
+                self.leaf='mitm';self.origin_connection='origin-'+str(self.number)
+            async def connect(self):self.writer=object();return 1
+            async def request(self):
+                self.calls+=1
+                if self.calls==2 and (repeat or self.number==1):raise ConnectionResetError()
+                return True,'expected'
+            async def close(self):self.writer=None
+        with tempfile.TemporaryDirectory() as d:
+            args=c.parse_args(['fill','--host','fixture','--ip','127.0.0.1','--cafile','unused','--origin-leaf','x',
+                '--expect-leaf','mitm','--expect-cred','fake','--out',d+'/out.json','--ready-file',d+'/ready.json',
+                '--participant','guest-0','--concurrency','2','--fill-batch-size','1','--fill-interval-s','0','--fill-max-retries','2','--hold-s','.001'])
+            with patch.object(c,'Session',Session),patch.object(c.ssl,'create_default_context'),patch.object(c,'memory_available',return_value=2*1024**3):
+                return asyncio.run(c.execute(args))
+
+    def test_recheck_drop_refill_uses_current_survivors(self):
+        out=self.refill_after_recheck_drop()
+        self.assertEqual(out['success'],3)
+        self.assertEqual(out['held'],out['boundary_verified']);self.assertEqual(out['released_alive'],2)
+        spec=filled();out['mode']='credential-bound';spec['runs']=[out]
+        report=r.build_m7(spec)
+        self.assertEqual(report['status'],'OK')
+        self.assertEqual(out['fill']['recheck_removed'],1)
+        self.assertEqual(out['fill']['recheck_errors'],{'recv/reset':1})
+        self.assertEqual(report['single_subject_overflow']['fill']['recheck_removed'],1)
+        for mutate in (
+            lambda a:a['fill'].update(recheck_removed=0),
+            lambda a:a['fill'].update(recheck_errors={}),
+            lambda a:a['fill']['batches'][-1].update(held=1),
+            lambda a:a.update(released_alive=1),
+            lambda a:a.update(boundary_origin_connections=1),
+        ):
+            bad=copy.deepcopy(spec);mutate(bad['runs'][0])
+            self.assertNotEqual(r.build_m7(bad)['status'],'OK')
+
+    def test_repeated_recheck_drops_exhaust_attempts(self):
+        out=self.refill_after_recheck_drop(repeat=True)
+        self.assertEqual(out['attempted'],6);self.assertEqual(out['fill_status'],'PARTIAL')
+        self.assertGreater(out['fill']['recheck_removed'],0)
+        spec=filled();spec['runs']=[out]
+        self.assertNotEqual(r.build_m7(spec)['status'],'OK')
+
     def test_gradual_success(self):
         out,ready,state=self.execute();self.assertEqual(ready['held'],4);self.assertEqual(ready['boundary_verified'],4)
         self.assertEqual(out['released_alive'],4);self.assertEqual(state['peak'],1)
@@ -176,7 +222,7 @@ bench_ns() { echo 1; }; bench_elapsed_ms() { echo 1000; }
 sup_sample() { echo '{}'; }; cb_until() { :; }
 osb_api() { touch "$WORK/released"; }
 sup_start() { echo "$2" >> "$WORK/starts"; }
-bench_wait() { echo '{"fill_status":"FULL","held":2,"boundary_verified":2}' > "$SUP_RAW/$3-ready.json"; }
+bench_wait() { echo '{"fill_status":"FULL","held":2,"boundary_verified":2,"boundary_origin_connections":2}' > "$SUP_RAW/$3-ready.json"; }
 sup_gate() { echo '{"source":"origin_live_connections","established":2}'; }
 sup_fetch() { echo '{"attempted":2,"success":2,"failed":0,"verified":2}' > "$SUP_RAW/$2.json"; }
 sup_m7_resources_ready() { return 0; }
@@ -193,7 +239,7 @@ jq -e --argjson n "$DENIALS" '.probe_sent and .probe_server_budget_denials==$n a
             self.assertIn('true',out.stdout)
 
     def test_incomplete_fill_never_launches_probes(self):
-        for held,server in ((1,1),(2,1)):
+        for held,server,distinct in ((1,1,1),(2,1,2),(2,2,1),(2,2,None)):
             out=self.sourced(r'''
 source "$SCRIPT_DIR/supplemental-bench.sh"
 SUP_DIR="$WORK/report"; SUP_RAW="$SUP_DIR/raw"; mkdir -p "$SUP_RAW"
@@ -206,15 +252,15 @@ bench_ns() { echo 1; }; bench_elapsed_ms() { echo 1000; }
 sup_sample() { echo '{}'; }; cb_until() { :; }; osb_api() { :; }
 sup_start() { echo "$2" >> "$WORK/starts"; }
 bench_wait() {
- jq -n --argjson held "$HELD" '{fill_status:"FULL",held:$held,boundary_verified:$held,held_endpoints:[["192.0.2.1",12345]]}' > "$SUP_RAW/$3-ready.json"
+ jq -n --argjson held "$HELD" --argjson distinct "$DISTINCT" '{fill_status:"FULL",held:$held,boundary_verified:$held,boundary_origin_connections:$distinct}' > "$SUP_RAW/$3-ready.json"
 }
-sup_gate() { echo '{"source":"origin_live_connections","established":1}'; }
+sup_gate() { jq -n --argjson n "$SERVER" '{source:"origin_live_connections",established:$n}'; }
 sup_fetch() { echo '{"attempted":2,"success":1,"failed":1,"verified":1}' > "$SUP_RAW/$2.json"; }
 sup_m7_resources_ready() { return 0; }
 sup_m7_fill_tier credential-bound 2
 test "$(wc -l < "$WORK/starts" | tr -d ' ')" = 1
 jq -e '.probe_sent==false' "$SUP_RAW/m7-tier.json"
-''',OCI_STACK='0',HELD=str(held))
+''',OCI_STACK='0',HELD=str(held),SERVER=str(server),DISTINCT=json.dumps(distinct))
             self.assertIn('true',out.stdout)
 
 
