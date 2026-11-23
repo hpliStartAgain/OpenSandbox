@@ -62,6 +62,7 @@ class Session:
         self.args, self.context = args, context
         self.reader = self.writer = None
         self.leaf = 'none'
+        self.origin_connection = None
 
     async def connect(self):
         start = time.monotonic()
@@ -73,8 +74,9 @@ class Session:
         return (time.monotonic()-start)*1000
 
     async def request(self):
-        self.writer.write(('GET /cbv?bytes=%d HTTP/1.1\r\nHost: %s\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
-                          % (self.args.body_bytes, self.args.host)).encode('ascii'))
+        held_header='X-Bench-Held-Key: '+self.args.held_key+'\r\n' if self.args.held_key else ''
+        self.writer.write(('GET /cbv?bytes=%d HTTP/1.1\r\nHost: %s\r\nContent-Length: 0\r\nConnection: keep-alive\r\n%s\r\n'
+                          % (self.args.body_bytes, self.args.host,held_header)).encode('ascii'))
         await self.writer.drain()
         header = await self.reader.readuntil(b'\r\n\r\n')
         lines = header.decode('iso-8859-1').split('\r\n')
@@ -85,6 +87,7 @@ class Session:
             raise ValueError('invalid response length')
         body = await self.reader.readexactly(length)
         parsed = json.loads(body)
+        self.origin_connection = parsed.get('conn')
         cred = parsed.get('cred')
         cred_class = 'absent' if cred == 'absent' else 'expected' if cred == self.args.expect_cred else 'other'
         expected_headers = [] if self.args.expect_cred == 'absent' else ['x-api-key']
@@ -285,8 +288,8 @@ async def execute(args):
             await asyncio.sleep(args.fill_interval_s)
         result.update(held=len(held),boundary_verified=len(held) if len(held)==args.concurrency else 0,
                       fill_status='FULL' if len(held)==args.concurrency else 'PARTIAL')
+        result['boundary_origin_connections']=len({s.origin_connection for s in held if isinstance(s.origin_connection,str) and s.origin_connection})
         result.setdefault('fill_reason','retry_limit_reached')
-        result['held_endpoints']=[list(s.writer.get_extra_info('sockname')[:2]) for s in held]
     if args.mode in ('burst','fill'):
         if args.ready_file:
             save(args.ready_file, dict(result, held=len(held)))
@@ -325,6 +328,7 @@ def parse_args(argv=None):
     p.add_argument('--fill-batch-size',type=int,default=32)
     p.add_argument('--fill-interval-s',type=float,default=.25)
     p.add_argument('--fill-max-retries',type=int,default=3)
+    p.add_argument('--held-key',default='')
     for key in ['host', 'ip', 'cafile', 'origin-leaf', 'expect-leaf', 'expect-cred', 'out']:
         p.add_argument('--'+key, required=True)
     p.add_argument('--gate-url',default='')
@@ -350,6 +354,8 @@ def parse_args(argv=None):
         p.error('invalid load bounds')
     if not 1<=a.fill_batch_size<=2048 or not math.isfinite(a.fill_interval_s) or a.fill_interval_s<0 or not 0<=a.fill_max_retries<=10:
         p.error('invalid fill bounds')
+    if a.held_key and (a.mode!='fill' or len(a.held_key)>128 or any(not(c.isascii() and (c.isalnum() or c=='-')) for c in a.held_key)):
+        p.error('invalid held key')
     return a
 
 

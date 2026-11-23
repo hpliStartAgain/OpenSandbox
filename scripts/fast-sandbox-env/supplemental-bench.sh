@@ -533,16 +533,16 @@ sup_m7_fill_tier() { # mode capacity; single subject only
 	jq -n --argjson cap "$cap" --arg mode "$mode" --argjson s "$reading" --argjson timeout "$SUP_RESOURCE_RECOVERY_S" \
 		'{budget:{per_subject:$cap,admission_enabled:($mode=="credential-bound")},resource_samples:[$s+{phase:"baseline",t_s:0}],
 		resource_timeout_s:$timeout,resource_tolerances:{memory_current:33554432,anon:16777216,fd:4,conntrack:64},probe_sent:false}' > "$SUP_RAW/m7-tier.json"
-	sup_start "$BENCH_B" "$name" bound "$cap" keep-alive 1 0 fill --participant guest-0 \
+	sup_start "$BENCH_B" "$name" bound "$cap" keep-alive 1 0 fill --participant guest-0 --held-key "$name" \
 		--fill-batch-size "$SUP_FILL_BATCH_SIZE" --fill-interval-s "$SUP_FILL_INTERVAL_S" --fill-max-retries "$SUP_FILL_MAX_RETRIES" \
 		--ready-file "$CB_GUEST_DIR/$name-ready.json" --release-file "$CB_GUEST_DIR/$name-go" --hold-s 600 --timeout 120
 	bench_wait "$SUP_CLIENT_ATTEMPTS" sup_m7_fill_ready "$name" || fail "M7 fill readiness missing"
-	proof="$(kubectl -n "$RESOURCE_NS" exec "$BENCH_POD" -c egress -- cat /proc/net/tcp | python3 "$SUP_SELF_DIR/supplemental-tools.py" server-held "$SUP_RAW/$name-ready.json")"
+	proof="$(sup_gate held "$name")"
 	reading="$(sup_sample)"
 	bench_json_set "$SUP_RAW/m7-tier.json" '.server_held=$proof | .resource_samples+=[$s+{phase:"held",t_s:($t/1000)}]' \
 		--argjson proof "$proof" --argjson s "$reading" --argjson t "$(bench_elapsed_ms "$start")"
 	if jq -e --argjson cap "$cap" '.fill_status=="FULL" and .held==$cap and .boundary_verified==$cap' "$SUP_RAW/$name-ready.json" >/dev/null && \
-		[[ "$(jq -r --argjson cap "$cap" '.established==$cap and .matched_endpoints==$cap' <<< "$proof")" == true ]]; then full=true; fi
+		[[ "$(jq -r --argjson cap "$cap" '.source=="origin_live_connections" and .established==$cap' <<< "$proof")" == true ]]; then full=true; fi
 	if [[ "$full" == true ]]; then
 		sup_start "$BENCH_B" "$name-unbound" bound 1 new 1 0 load --bound-percent 0 --max-requests 1 --participant probe-unbound
 		sup_fetch "$BENCH_B" "$name-unbound"

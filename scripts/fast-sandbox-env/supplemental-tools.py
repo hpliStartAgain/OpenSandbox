@@ -68,21 +68,6 @@ def budget_denials(text):
     return len(re.findall(r'credential proxy: tls decision deny reason=registry_exhausted(?=["\s]|$)', text))
 
 
-def server_held(text,ready):
-    """Count server-owned established peers matching the held guest sockets."""
-    import socket
-    endpoints={(ip,int(port)) for ip,port in ready.get('held_endpoints',[])}
-    peers=set()
-    for line in text.splitlines():
-        fields=line.split()
-        if len(fields)<4 or fields[3]!='01':continue
-        ip,port=fields[2].split(':')
-        if len(ip)!=8:continue
-        peer=(socket.inet_ntoa(bytes.fromhex(ip)[::-1]),int(port,16))
-        if peer in endpoints:peers.add(peer)
-    return dict(source='egress_tcp_peer_match',established=len(peers),matched_endpoints=len(endpoints))
-
-
 def m5_cases(env):
     return [(int(mix),int(body)) for mix in (5,100) for body in env['SUP_BODY_BYTES'].split()
             if mix==5 or body=='0']
@@ -206,8 +191,6 @@ def main(argv):
         validate(os.environ)
     elif command == 'budget-denials':
         print(budget_denials(sys.stdin.read()))
-    elif command == 'server-held':
-        print(json.dumps(server_held(sys.stdin.read(),json.loads(Path(a[0]).read_text()))))
     elif command == 'certificate':
         make_origin_certificate(*a)
     elif command == 'classify':

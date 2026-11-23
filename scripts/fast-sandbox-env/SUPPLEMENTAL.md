@@ -40,7 +40,7 @@ M7 将分摊档位均分到 `SUP_BURST_GUESTS` 个同置 bound guest，默认 6 
 
 单 subject 档默认 capacity=2048，构建 2 GiB bound guest，配一个原规格 unbound guest。读回 guest MemTotal、live Pool 资源策略和 Sandbox 限额/同 Pod Ready 状态，计算 CPU 与内存承诺，并执行完整 2049 条连接的内存预检。`SUP_SMOKE=true` 时可通过 `SUP_OVERFLOW_SMOKE_CAPACITY=64` 缩小边界；guest 仍为 2 GiB，完整 2049 预检仍保留。只有实测 2 GiB guest 不可调度时，才准备低容量替代并保存不可行证据。
 
-填充使用 `SUP_FILL_BATCH_SIZE=32`、`SUP_FILL_INTERVAL_S=0.25`（秒）、`SUP_FILL_MAX_RETRIES=3`。每批完成 TLS 握手、响应凭据及证书路径验证后才计入 held；批间等待指定间隔。可重试的握手或响应错误按闭集原因计数，最多尝试 `capacity × (1 + max_retries)` 次；资源耗尽、校验错误或路径矛盾停止补足。报告保留每批 attempted、verified、failed、累计 held 和 errors。达到容量后，按批在原 Session 上再次请求，确认全部连接仍可注入；再从 egress 网络命名空间读取 ESTABLISHED TCP peer，精确匹配这些 Session 的 guest 本地 socket tuple，输出匿名连接计数。两项均达到 capacity 才发送探针。未填满或服务端计数不足时为 PARTIAL，跳过边界探针，释放已持有连接并检查恢复。
+填充使用 `SUP_FILL_BATCH_SIZE=32`、`SUP_FILL_INTERVAL_S=0.25`（秒）、`SUP_FILL_MAX_RETRIES=3`。每批完成 TLS 握手、响应凭据及证书路径验证后才计入 held；批间等待指定间隔。可重试的握手或响应错误按闭集原因计数，最多尝试 `capacity × (1 + max_retries)` 次；资源耗尽、校验错误或路径矛盾停止补足。报告保留每批 attempted、verified、failed、累计 held 和 errors。达到容量后，按批在原 Session 上再次请求，确认全部连接仍可注入；填充请求带有本轮专用的 `X-Bench-Held-Key`，origin 按接受的 TCP 连接登记，连接关闭时注销。控制端经独立协调端口读取该键的当前活动连接数，输出 `source=origin_live_connections` 和匿名计数。原 Session 再次验证返回的服务端连接 ID 去重数、已验证 held 和 origin 活动连接计数均达到 capacity，才发送探针。未填满或origin 活动连接计数不足时为 PARTIAL，跳过边界探针，释放已持有连接并检查恢复。
 
 `SUP_MEASUREMENTS=m7-overflow` 只运行上述单 subject 档，两种模式分别重建 Pool，输出 `m7-overflow-all.json` 和 `m7-overflow-credential-bound.json`，可与 M8 同次选择。credential-bound 的 `expected=budget_rejection`：同 subject unbound 探针成功，new-bound 探针失败，并且在该单探针窗口新增一条服务端 `registry_exhausted`，才构成预算拒绝证据。all 的 `expected=no_per_subject_budget`：同 subject unbound 和 new-bound 探针均成功。两个探针使用独立 participant，不计入填充负载。释放时用原 Session 分批请求，确认全部既有连接存活；随后确认新 bound 连接恢复注入，观察完整资源恢复窗口。
 

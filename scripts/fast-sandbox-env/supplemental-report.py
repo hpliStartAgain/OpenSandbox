@@ -441,8 +441,8 @@ def build_m7_fill(spec):
     client_memory_ok=(client_pre.get('status')=='OK' and client_pre.get('concurrency')==cap and
         client_pre.get('required_bytes')==cap*384*1024+64*1024*1024 and client_pre.get('available_bytes',0)>=client_pre.get('required_bytes',1))
     full=(raw.get('mode')==mode and (tier.get('budget') or {}).get('admission_enabled')==(mode=='credential-bound') and
-        raw.get('fill_status')=='FULL' and count_ok and cap>0 and (spec.get('smoke') is True or cap==2048) and
-        client_memory_ok and server.get('source')=='egress_tcp_peer_match' and server.get('established')==server.get('matched_endpoints')==cap)
+        raw.get('fill_status')=='FULL' and raw.get('boundary_origin_connections')==cap and count_ok and cap>0 and (spec.get('smoke') is True or cap==2048) and
+        client_memory_ok and server.get('source')=='origin_live_connections' and server.get('established')==cap)
     guest_ok=(proof.get('mem_total_bytes',0)>=int(1.8*1024**3) and pool.get('scheduled') is True and pool.get('budget_sufficient') is True and
         pool.get('sandbox_limit_memory_bytes')==2*1024**3 and pre.get('status')=='OK' and pre.get('concurrency')==2049 and
         pre.get('required_bytes')==2049*384*1024+64*1024*1024 and pre.get('available_bytes',0)>=pre.get('required_bytes',1))
@@ -460,10 +460,10 @@ def build_m7_fill(spec):
     status='INVALID' if invalid or recovery['status']=='INVALID' else 'OK' if ok else 'PARTIAL'
     reason=raw.get('fill_reason') if raw.get('fill_reason') in ('capacity_reached','retry_limit_reached','non_retryable_failure') else 'fill_evidence_incomplete'
     summary=dict(status=status,mode=mode,expected='budget_rejection' if mode=='credential-bound' else 'no_per_subject_budget',
-        capacity=cap,full_boundary=cap==2048,held=raw.get('held'),boundary_verified=raw.get('boundary_verified'),fill_reason=reason,
+        capacity=cap,full_boundary=cap==2048,held=raw.get('held'),boundary_verified=raw.get('boundary_verified'),boundary_origin_connections=raw.get('boundary_origin_connections'),fill_reason=reason,
         fill={k:fill.get(k) for k in ('batch_size','batch_interval_s','max_retries','attempt_limit')},
         batches=[{k:b.get(k) for k in ('attempted','verified','failed','held','errors')} for b in batches],
-        server_held={k:server.get(k) for k in ('source','established','matched_endpoints')},probe_sent=tier.get('probe_sent',False),
+        server_held={k:server.get(k) for k in ('source','established')},probe_sent=tier.get('probe_sent',False),
         probe_server_budget_denials=denial,large_guest=proof,probes=dict(target_participant=probes.get('target_participant'),unbound=run_row(unbound),new_bound=run_row(bound)))
     return dict(status=status,mode=mode,runs=[run_row(x) for x in runs],single_subject_overflow=summary,
         tiers=[dict(status=status,budget=tier.get('budget'),resource_recovery=recovery,injection_recovery_ms=tier.get('injection_recovery_ms'))],

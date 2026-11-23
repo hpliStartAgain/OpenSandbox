@@ -18,10 +18,10 @@ c=module('supplemental-client');r=module('supplemental-report');tools=module('su
 def filled(mode='credential-bound'):
     s=overflow();s.update(gradual_fill=True,mode=mode)
     a=s['runs'][0];a.update(mode=mode,attempted=2,success=2,failed=0,errors={},held=2,
-        memory_preflight=c.memory_preflight(2,2*1024**3),boundary_verified=2,fill_status='FULL',fill_reason='capacity_reached',
+        memory_preflight=c.memory_preflight(2,2*1024**3),boundary_verified=2,boundary_origin_connections=2,fill_status='FULL',fill_reason='capacity_reached',
         fill=dict(batch_size=1,batch_interval_s=.1,max_retries=2,attempt_limit=6,
                   batches=[dict(attempted=1,verified=1,failed=0,held=1,errors={}),dict(attempted=1,verified=1,failed=0,held=2,errors={})]))
-    s['tiers'][0].update(server_held=dict(source='egress_tcp_peer_match',established=2,matched_endpoints=2),
+    s['tiers'][0].update(server_held=dict(source='origin_live_connections',established=2),
         probe_server_budget_denials=1,probe_sent=True,server_budget_denials=1)
     s['tiers'][0]['budget']['admission_enabled']=mode=='credential-bound'
     if mode=='all':
@@ -33,10 +33,10 @@ def filled(mode='credential-bound'):
 class Report(unittest.TestCase):
     def test_production_capacity_2048(self):
         s=filled();s['smoke']=False;a=s['runs'][0];t=s['tiers'][0]
-        for k in ('attempted','success','verified','released_alive','held','boundary_verified'):a[k]=2048
+        for k in ('attempted','success','verified','released_alive','held','boundary_verified','boundary_origin_connections'):a[k]=2048
         a['memory_preflight']=c.memory_preflight(2048,2*1024**3)
         a['fill'].update(batch_size=32,attempt_limit=6144,batches=[dict(attempted=32,verified=32,failed=0,held=n,errors={}) for n in range(32,2049,32)])
-        t['budget']['per_subject']=2048;t['server_held'].update(established=2048,matched_endpoints=2048)
+        t['budget']['per_subject']=2048;t['server_held'].update(established=2048)
         self.assertEqual(r.build_m7(s)['status'],'OK')
     def test_full_and_two_mode_expectations(self):
         for mode in ('all','credential-bound'):
@@ -80,7 +80,7 @@ class FillClient(unittest.TestCase):
                 state['calls']+=1;state['active']+=1;state['peak']=max(state['peak'],state['active'])
                 await asyncio.sleep(0);state['active']-=1
                 if state['calls']<=failures:raise ConnectionResetError()
-                self.writer=Writer();self.leaf='mitm';return 1
+                self.writer=Writer();self.leaf='mitm';self.origin_connection='origin-'+str(state['calls']);return 1
             async def request(self):return True,'expected'
             async def close(self):self.writer=None
         with tempfile.TemporaryDirectory() as d:
@@ -100,10 +100,6 @@ class FillClient(unittest.TestCase):
         out,ready,state=self.execute(100);self.assertEqual(ready['fill_status'],'PARTIAL')
         self.assertEqual(out['attempted'],8);self.assertEqual(state['calls'],8)
 
-    def test_server_tuple_counter(self):
-        ready={'held_endpoints':[['192.0.2.1',12345],['192.0.2.1',12346]]}
-        table=' 0: 0100007F:1F90 010200C0:3039 01\n 1: 0100007F:1F90 010200C0:303A 06\n'
-        out=tools.server_held(table,ready);self.assertEqual(out['established'],1)
 
 
 class FillOrchestration(ShellCase):
@@ -123,7 +119,7 @@ sup_start() { echo "$2" >> "$WORK/starts"; }
 bench_wait() {
  jq -n --argjson held "$HELD" '{fill_status:"FULL",held:$held,boundary_verified:$held,held_endpoints:[["192.0.2.1",12345]]}' > "$SUP_RAW/$3-ready.json"
 }
-kubectl() { echo '0: 0100007F:1F90 010200C0:3039 01'; }
+sup_gate() { echo '{"source":"origin_live_connections","established":1}'; }
 sup_fetch() { echo '{"attempted":2,"success":1,"failed":1,"verified":1}' > "$SUP_RAW/$2.json"; }
 sup_m7_resources_ready() { return 0; }
 sup_m7_fill_tier credential-bound 2
@@ -137,7 +133,35 @@ class FillTLS(fixtures.OriginFixture):
     def test_real_tls_fill_verifies_and_releases_all(self):
         out=fixtures.SupplementalClientTest.probe(self,'fill',concurrency=4,fill_batch_size=2,fill_interval_s=.01,fill_max_retries=1,hold_s=.01)
         self.assertEqual(out['fill_status'],'FULL');self.assertEqual(out['boundary_verified'],4)
-        self.assertEqual(out['released_alive'],4);self.assertEqual(len({tuple(x) for x in out['held_endpoints']}),4)
+        self.assertEqual(out['released_alive'],4);self.assertEqual(len(out['fill']['batches']),2)
+
+
+class OriginCounter(unittest.TestCase):
+    def test_live_counter_counts_distinct_open_connections_and_cleans(self):
+        import http.client,threading,time
+        origin=module('supplemental-origin')
+        server=origin.OriginServer(('127.0.0.1',0),origin.Handler);server.daemon_threads=True
+        gate=origin.build_gate_server(0,'127.0.0.1')
+        for srv in (server,gate):threading.Thread(target=srv.serve_forever,daemon=True).start()
+        clients=[]
+        def count():
+            c=http.client.HTTPConnection(*gate.server_address,timeout=2)
+            c.request('GET','/held/test-fill/host');q=json.loads(c.getresponse().read());c.close();return q
+        try:
+            for _ in range(2):
+                c=http.client.HTTPConnection(*server.server_address,timeout=2);clients.append(c)
+                for i in range(2):
+                    c.request('GET','/cbv',headers={'X-Bench-Held-Key':'test-fill'});c.getresponse().read()
+            self.assertEqual(count(),dict(source='origin_live_connections',established=2))
+            for c in clients:c.close()
+            for _ in range(100):
+                if count()['established']==0:break
+                time.sleep(.01)
+            self.assertEqual(count()['established'],0)
+            self.assertFalse(origin._HELD)
+        finally:
+            for c in clients:c.close()
+            for srv in (server,gate):srv.shutdown();srv.server_close()
 
 
 if __name__=='__main__':unittest.main()

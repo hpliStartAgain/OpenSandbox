@@ -48,6 +48,7 @@ CREDENTIAL_HEADERS = ("authorization", "proxy-authorization", "x-api-key")
 _COUNTER = itertools.count(1)
 _LOCK = threading.Lock()
 _RUN = uuid.uuid4().hex[:8]
+_HELD = {}
 
 
 def credential_code(value):
@@ -73,9 +74,24 @@ class Handler(BaseHTTPRequestHandler):
         with _LOCK:
             self.conn_id = "%s-%d" % (_RUN, next(_COUNTER))
         self.requests_served = 0
+        self.held_key = None
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            with _LOCK:
+                if self.held_key is not None:
+                    _HELD.get(self.held_key,set()).discard(self.conn_id)
+                    if not _HELD.get(self.held_key):_HELD.pop(self.held_key,None)
 
     def _reply(self):
         self.requests_served += 1
+        key=self.headers.get('X-Bench-Held-Key','')
+        if key and len(key)<=128 and all(c.isalnum() or c=='-' for c in key):
+            with _LOCK:
+                if self.held_key is None:
+                    self.held_key=key;_HELD.setdefault(key,set()).add(self.conn_id)
         length = int(self.headers.get("Content-Length") or 0)
         if length:
             self.rfile.read(min(length, 65536))
@@ -140,6 +156,11 @@ class GateHandler(BaseHTTPRequestHandler):
         if len(parts)!=3:
             self.send_error(400); return
         operation,key,participant=parts
+        if operation=='held':
+            with _LOCK:result=dict(source='origin_live_connections',established=len(_HELD.get(key,set())))
+            body=json.dumps(result).encode()
+            self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+            return
         with self.server.condition:
             gate=self.server.gates.setdefault(key,dict(ready=set(),start_at=None,marks={}))
             if operation=='wait':
