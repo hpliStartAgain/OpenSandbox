@@ -138,7 +138,7 @@ def memory_preflight(concurrency, available):
 
 
 async def execute(args):
-    if args.mode in ('burst','memory-check'):
+    if args.mode in ('burst','fill','memory-check'):
         preflight=memory_preflight(args.concurrency,memory_available())
         if preflight['status']!='OK' or args.mode=='memory-check':
             result=dict(v=1,participant=args.participant,status=preflight['status'],memory_preflight=preflight,attempted=0,success=0,failed=0,contradictions=0)
@@ -235,7 +235,7 @@ async def execute(args):
             for current in list(sessions.values())+[session]:
                 if current not in held:
                     await current.close()
-    tasks = [asyncio.create_task(worker(i)) for i in range(args.concurrency)]
+    tasks = [] if args.mode == 'fill' else [asyncio.create_task(worker(i)) for i in range(args.concurrency)]
     if args.gate_url:
         release = await gate_request(args,'wait')
         await asyncio.sleep(max(0,release['start_at_s']-release['server_now_s']))
@@ -245,13 +245,55 @@ async def execute(args):
     start, cpu = time.monotonic(), time.process_time()
     gate.set()
     await asyncio.gather(*tasks)
-    if args.mode == 'burst':
+    if args.mode == 'fill':
+        limit=args.concurrency*(1+args.fill_max_retries)
+        fill=dict(batch_size=args.fill_batch_size,batch_interval_s=args.fill_interval_s,
+                  max_retries=args.fill_max_retries,attempt_limit=limit,batches=[])
+        result['fill']=fill
+        retryable={'handshake/timeout','handshake/reset','handshake/tls_closed','handshake/tls_error',
+                   'handshake/io_error','handshake/refused','recv/timeout','recv/reset','recv/eof','recv/io_error'}
+        async def add_one():
+            session=Session(args,ctx)
+            if await once(session):held.append(session)
+            else:await session.close()
+        async def verify_held():
+            alive=[]
+            async def verify(session):
+                try:
+                    good,_=await asyncio.wait_for(session.request(),args.timeout)
+                    result['contradictions']+=int(not good)
+                    if good:alive.append(session);return
+                except (OSError,ValueError,asyncio.TimeoutError,asyncio.IncompleteReadError):
+                    pass
+                await session.close()
+            for offset in range(0,len(held),args.fill_batch_size):
+                await asyncio.gather(*(verify(s) for s in held[offset:offset+args.fill_batch_size]))
+            held[:]=alive
+            return len(alive)
+        while result['attempted']<limit:
+            n=min(args.fill_batch_size,args.concurrency-len(held),limit-result['attempted'])
+            before={k:result[k] for k in ('attempted','verified','failed')};errors=dict(result['errors'])
+            await asyncio.gather(*(add_one() for _ in range(n)))
+            fill['batches'].append(dict({k:result[k]-before[k] for k in before},held=len(held),
+                errors={k:v-errors.get(k,0) for k,v in result['errors'].items() if v>errors.get(k,0)}))
+            if result['contradictions'] or set(result['errors'])-retryable:
+                result['fill_reason']='non_retryable_failure';break
+            if len(held)==args.concurrency and await verify_held()==args.concurrency:
+                result['fill_reason']='capacity_reached';break
+            # Persist partial progress without declaring readiness for probes.
+            save(str(args.out)+'.progress',dict(result,held=len(held)))
+            await asyncio.sleep(args.fill_interval_s)
+        result.update(held=len(held),boundary_verified=len(held) if len(held)==args.concurrency else 0,
+                      fill_status='FULL' if len(held)==args.concurrency else 'PARTIAL')
+        result.setdefault('fill_reason','retry_limit_reached')
+        result['held_endpoints']=[list(s.writer.get_extra_info('sockname')[:2]) for s in held]
+    if args.mode in ('burst','fill'):
         if args.ready_file:
             save(args.ready_file, dict(result, held=len(held)))
         deadline = time.monotonic()+args.hold_s
         while time.monotonic() < deadline and args.release_file and not Path(args.release_file).exists():
             await asyncio.sleep(.05)
-        for session in held:
+        async def release(session):
             try:
                 good, _ = await asyncio.wait_for(session.request(), args.timeout)
                 result['released_alive'] += int(good)
@@ -260,6 +302,11 @@ async def execute(args):
                 pass
             finally:
                 await session.close()
+        if args.mode=='fill':
+            for offset in range(0,len(held),args.fill_batch_size):
+                await asyncio.gather(*(release(s) for s in held[offset:offset+args.fill_batch_size]))
+        else:
+            for session in held:await release(session)
     result['wall_s'] = time.monotonic()-start
     result['cpu_s'] = time.process_time()-cpu
     if args.gate_url:
@@ -274,7 +321,10 @@ async def execute(args):
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument('mode', choices=['load', 'burst', 'memory-check'])
+    p.add_argument('mode', choices=['load', 'burst', 'fill', 'memory-check'])
+    p.add_argument('--fill-batch-size',type=int,default=32)
+    p.add_argument('--fill-interval-s',type=float,default=.25)
+    p.add_argument('--fill-max-retries',type=int,default=3)
     for key in ['host', 'ip', 'cafile', 'origin-leaf', 'expect-leaf', 'expect-cred', 'out']:
         p.add_argument('--'+key, required=True)
     p.add_argument('--gate-url',default='')
@@ -298,6 +348,8 @@ def parse_args(argv=None):
     a = p.parse_args(argv)
     if not 1 <= a.concurrency <= 5000 or a.duration <= 0 or a.timeout <= 0 or a.rate < 0 or a.churn_every < 0 or a.max_requests < 0:
         p.error('invalid load bounds')
+    if not 1<=a.fill_batch_size<=2048 or not math.isfinite(a.fill_interval_s) or a.fill_interval_s<0 or not 0<=a.fill_max_retries<=10:
+        p.error('invalid fill bounds')
     return a
 
 

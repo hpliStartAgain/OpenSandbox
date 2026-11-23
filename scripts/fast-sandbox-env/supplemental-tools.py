@@ -68,6 +68,21 @@ def budget_denials(text):
     return len(re.findall(r'credential proxy: tls decision deny reason=registry_exhausted(?=["\s]|$)', text))
 
 
+def server_held(text,ready):
+    """Count server-owned established peers matching the held guest sockets."""
+    import socket
+    endpoints={(ip,int(port)) for ip,port in ready.get('held_endpoints',[])}
+    peers=set()
+    for line in text.splitlines():
+        fields=line.split()
+        if len(fields)<4 or fields[3]!='01':continue
+        ip,port=fields[2].split(':')
+        if len(ip)!=8:continue
+        peer=(socket.inet_ntoa(bytes.fromhex(ip)[::-1]),int(port,16))
+        if peer in endpoints:peers.add(peer)
+    return dict(source='egress_tcp_peer_match',established=len(peers),matched_endpoints=len(endpoints))
+
+
 def m5_cases(env):
     return [(int(mix),int(body)) for mix in (5,100) for body in env['SUP_BODY_BYTES'].split()
             if mix==5 or body=='0']
@@ -115,6 +130,11 @@ def validate(env):
         if not cap.isdigit() or not 1<=int(cap)<=2048:raise ValueError('overflow smoke capacity')
     if not 2 <= int(env.get('SUP_BURST_GUESTS','6')) <= 6:
         raise ValueError('burst guests')
+    import math
+    if not 1<=int(env.get('SUP_FILL_BATCH_SIZE','32'))<=2048 or not 0<=int(env.get('SUP_FILL_MAX_RETRIES','3'))<=10:
+        raise ValueError('fill bounds')
+    interval=float(env.get('SUP_FILL_INTERVAL_S','.25'))
+    if not math.isfinite(interval) or interval<0:raise ValueError('fill interval')
     if not 1 <= int(env['SUP_LOAD_GUESTS']) <= 6:
         raise ValueError('load guests')
     if 'm8' in env['SUP_MEASUREMENTS'].split() and env['SUP_SMOKE']=='false' and any(float(env[k])<=0 for k in ('SUP_SOAK_RATE_ALL','SUP_SOAK_RATE_CB')):
@@ -131,7 +151,7 @@ def validate(env):
         raise ValueError('body bytes')
     if any(x not in ('500m', '2') for x in env['SUP_CPU_LIMITS'].split()):
         raise ValueError('CPU limit')
-    if any(x not in r.BUILDERS for x in env['SUP_MEASUREMENTS'].split()):
+    if any(x not in (*r.BUILDERS,'m7-overflow') for x in env['SUP_MEASUREMENTS'].split()):
         raise ValueError('measurement')
     if not env['SUP_SOAK_ANALYSIS_S'].isdigit() or int(env['SUP_SOAK_ANALYSIS_S']) >= int(env['SUP_SOAK_S']):
         raise ValueError('analysis window')
@@ -186,6 +206,8 @@ def main(argv):
         validate(os.environ)
     elif command == 'budget-denials':
         print(budget_denials(sys.stdin.read()))
+    elif command == 'server-held':
+        print(json.dumps(server_held(sys.stdin.read(),json.loads(Path(a[0]).read_text()))))
     elif command == 'certificate':
         make_origin_certificate(*a)
     elif command == 'classify':

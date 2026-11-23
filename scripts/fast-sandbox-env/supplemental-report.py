@@ -411,7 +411,67 @@ def m7_members(members, tier):
     return rows
 
 
+def build_m7_fill(spec):
+    runs=spec.get('runs') or [];tiers=spec.get('tiers') or []
+    raw=runs[0] if len(runs)==1 else {};tier=tiers[0] if len(tiers)==1 else {}
+    mode=spec.get('mode');cap=(tier.get('budget') or {}).get('per_subject',0)
+    fill=raw.get('fill') or {};batches=fill.get('batches') or []
+    errors=raw.get('errors') or {};proof=spec.get('large_guest') or {}
+    pool=proof.get('pool') or {};pre=proof.get('full_boundary_preflight') or {}
+    probes=spec.get('overflow_probes') or {};unbound=probes.get('unbound') or {};bound=probes.get('new_bound') or {}
+    def successful(p):
+        return p.get('attempted')==p.get('success')==p.get('verified')==1 and p.get('failed')==0 and not p.get('contradictions') and not p.get('errors')
+    numeric=lambda x:type(x) is int and x>=0
+    counters=all(numeric(raw.get(k)) for k in ('attempted','success','failed','verified','released_alive','held','boundary_verified'))
+    config=(type(fill.get('batch_size')) is int and 1<=fill['batch_size']<=2048 and
+        isinstance(fill.get('batch_interval_s'),(int,float)) and math.isfinite(fill['batch_interval_s']) and fill['batch_interval_s']>=0 and
+        type(fill.get('max_retries')) is int and 0<=fill['max_retries']<=10 and
+        fill.get('attempt_limit')==cap*(1+fill['max_retries']))
+    batch_ok=bool(batches) and config and all(isinstance(b,dict) and all(numeric(b.get(k)) for k in ('attempted','verified','failed','held')) and
+        0<b['attempted']<=fill['batch_size'] and b['attempted']==b['verified']+b['failed'] and b['held']<=cap and
+        isinstance(b.get('errors'),dict) and all(numeric(v) for v in b['errors'].values()) and sum(b['errors'].values())==b['failed'] for b in batches)
+    count_ok=(counters and config and batch_ok and raw['attempted']<=fill['attempt_limit'] and
+        raw['attempted']==raw['success']+raw['failed'] and raw['success']==raw['verified']==raw['held']==raw['boundary_verified']==raw['released_alive']==cap and
+        isinstance(errors,dict) and all(numeric(v) for v in errors.values()) and sum(errors.values())==raw['failed'] and
+        all(sum(b[k] for b in batches)==raw[k] for k in ('attempted','verified','failed')) and
+        dict(sum((Counter(b['errors']) for b in batches),Counter()))==errors and
+        all(b['held']==sum(x['verified'] for x in batches[:i+1]) for i,b in enumerate(batches)))
+    server=tier.get('server_held') or {}
+    client_pre=raw.get('memory_preflight') or {}
+    client_memory_ok=(client_pre.get('status')=='OK' and client_pre.get('concurrency')==cap and
+        client_pre.get('required_bytes')==cap*384*1024+64*1024*1024 and client_pre.get('available_bytes',0)>=client_pre.get('required_bytes',1))
+    full=(raw.get('mode')==mode and (tier.get('budget') or {}).get('admission_enabled')==(mode=='credential-bound') and
+        raw.get('fill_status')=='FULL' and count_ok and cap>0 and (spec.get('smoke') is True or cap==2048) and
+        client_memory_ok and server.get('source')=='egress_tcp_peer_match' and server.get('established')==server.get('matched_endpoints')==cap)
+    guest_ok=(proof.get('mem_total_bytes',0)>=int(1.8*1024**3) and pool.get('scheduled') is True and pool.get('budget_sufficient') is True and
+        pool.get('sandbox_limit_memory_bytes')==2*1024**3 and pre.get('status')=='OK' and pre.get('concurrency')==2049 and
+        pre.get('required_bytes')==2049*384*1024+64*1024*1024 and pre.get('available_bytes',0)>=pre.get('required_bytes',1))
+    denial=tier.get('probe_server_budget_denials',0)
+    be=bound.get('errors') or {}
+    rejected=(bound.get('attempted')==bound.get('failed')==1 and bound.get('success')==bound.get('verified',0)==0 and
+        not bound.get('contradictions') and isinstance(be,dict) and all(numeric(v) for v in be.values()) and sum(be.values())==1 and
+        denial==1 and burst_rejections(be,denial)['budget']==1)
+    ids=[raw.get('participant'),unbound.get('participant'),bound.get('participant')]
+    probe_ok=(tier.get('probe_sent') is True and None not in ids and len(set(ids))==3 and probes.get('target_participant')==ids[0] and
+        successful(unbound) and (rejected if mode=='credential-bound' else successful(bound) and denial==0))
+    recovery=resource_recovery(tier)
+    ok=(mode in ('all','credential-bound') and full and guest_ok and probe_ok and tier.get('recovered') is True and recovery['status']=='OK')
+    invalid=any(x.get('contradictions',0) or x.get('status')=='INVALID' for x in (raw,unbound,bound))
+    status='INVALID' if invalid or recovery['status']=='INVALID' else 'OK' if ok else 'PARTIAL'
+    reason=raw.get('fill_reason') if raw.get('fill_reason') in ('capacity_reached','retry_limit_reached','non_retryable_failure') else 'fill_evidence_incomplete'
+    summary=dict(status=status,mode=mode,expected='budget_rejection' if mode=='credential-bound' else 'no_per_subject_budget',
+        capacity=cap,full_boundary=cap==2048,held=raw.get('held'),boundary_verified=raw.get('boundary_verified'),fill_reason=reason,
+        fill={k:fill.get(k) for k in ('batch_size','batch_interval_s','max_retries','attempt_limit')},
+        batches=[{k:b.get(k) for k in ('attempted','verified','failed','held','errors')} for b in batches],
+        server_held={k:server.get(k) for k in ('source','established','matched_endpoints')},probe_sent=tier.get('probe_sent',False),
+        probe_server_budget_denials=denial,large_guest=proof,probes=dict(target_participant=probes.get('target_participant'),unbound=run_row(unbound),new_bound=run_row(bound)))
+    return dict(status=status,mode=mode,runs=[run_row(x) for x in runs],single_subject_overflow=summary,
+        tiers=[dict(status=status,budget=tier.get('budget'),resource_recovery=recovery,injection_recovery_ms=tier.get('injection_recovery_ms'))],
+        recovered=tier.get('recovered') is True,rejections=burst_rejections(be,denial))
+
+
 def build_m7(spec):
+    if spec.get('gradual_fill') is True:return build_m7_fill(spec)
     source_runs, tiers = spec.get("runs") or [], spec.get("tiers") or []
     runs=[]; member_results={}
     for group in dict.fromkeys(x.get("group",i) for i,x in enumerate(source_runs)):

@@ -38,9 +38,19 @@ M7 将分摊档位均分到 `SUP_BURST_GUESTS` 个同置 bound guest，默认 6 
 
 任何 burst worker 启动前，全部 guest 先完成内存预检：按每连接 384 KiB 加固定 64 MiB 与 live MemAvailable 比较；不足即写 INVALID，整档不启动负载。客户端在创建 TLS 上下文与任务前再次预检。共同起跑门的每轮等待同时检查 ready/终态文件，发现 INVALID 或释放前提前终止即写 M7 INVALID 并清理。报告保留逐 member 预检和核对结果。
 
-分摊档之后，独立执行 credential-bound 的单 subject 超预算档：per-subject=2048、B=2049，构建 2 GiB bound guest，配一个原规格 unbound guest；读回 guest MemTotal、live Pool 资源策略和 Sandbox 限额/同 Pod 运行状态，计算 CPU 与内存承诺预算，并对 2049 条连接做 384 KiB/连接加 64 MiB 的预检。只有实测 2 GiB guest 不可调度时，才按已授权裁决准备低容量替代，并保存不可行证据。默认入口保留 2048/2049。`SUP_SMOKE=true` 时可显式用 `SUP_OVERFLOW_SMOKE_CAPACITY=8` 缩小边界为 8/9；guest 仍为 2 GiB，并保存完整 2049 预检作为可行性证据。
+单 subject 档默认 capacity=2048，构建 2 GiB bound guest，配一个原规格 unbound guest。读回 guest MemTotal、live Pool 资源策略和 Sandbox 限额/同 Pod Ready 状态，计算 CPU 与内存承诺，并执行完整 2049 条连接的内存预检。`SUP_SMOKE=true` 时可通过 `SUP_OVERFLOW_SMOKE_CAPACITY=64` 缩小边界；guest 仍为 2 GiB，完整 2049 预检仍保留。只有实测 2 GiB guest 不可调度时，才准备低容量替代并保存不可行证据。
 
-超预算档持有现有连接，单独启动同 subject 的 unbound SNI 探针和新 bound 连接探针。两个探针使用独立 participant/结果对象，不进入负载组汇总；前者必须可通，后者须有匹配服务端 registry_exhausted 的预算拒绝。释放时用原 Session 验证全部既有连接存活，再确认 bound 注入恢复。M7 顶层保存 `overflow_coverage`，该独立档缺失或非 OK 时，分摊结果不能使顶层成为 OK。
+填充使用 `SUP_FILL_BATCH_SIZE=32`、`SUP_FILL_INTERVAL_S=0.25`（秒）、`SUP_FILL_MAX_RETRIES=3`。每批完成 TLS 握手、响应凭据及证书路径验证后才计入 held；批间等待指定间隔。可重试的握手或响应错误按闭集原因计数，最多尝试 `capacity × (1 + max_retries)` 次；资源耗尽、校验错误或路径矛盾停止补足。报告保留每批 attempted、verified、failed、累计 held 和 errors。达到容量后，按批在原 Session 上再次请求，确认全部连接仍可注入；再从 egress 网络命名空间读取 ESTABLISHED TCP peer，精确匹配这些 Session 的 guest 本地 socket tuple，输出匿名连接计数。两项均达到 capacity 才发送探针。未填满或服务端计数不足时为 PARTIAL，跳过边界探针，释放已持有连接并检查恢复。
+
+`SUP_MEASUREMENTS=m7-overflow` 只运行上述单 subject 档，两种模式分别重建 Pool，输出 `m7-overflow-all.json` 和 `m7-overflow-credential-bound.json`，可与 M8 同次选择。credential-bound 的 `expected=budget_rejection`：同 subject unbound 探针成功，new-bound 探针失败，并且在该单探针窗口新增一条服务端 `registry_exhausted`，才构成预算拒绝证据。all 的 `expected=no_per_subject_budget`：同 subject unbound 和 new-bound 探针均成功。两个探针使用独立 participant，不计入填充负载。释放时用原 Session 分批请求，确认全部既有连接存活；随后确认新 bound 连接恢复注入，观察完整资源恢复窗口。
+
+```bash
+SUP_MEASUREMENTS='m7-overflow m8' SUP_REPORT_DIR=/path/to/new-report-dir \
+SUP_SOAK_RATE_ALL=55 SUP_SOAK_RATE_CB=514 BENCH_FSB_TLS_CAPACITY=2048 \
+  ./scripts/fast-sandbox-env/integration-env.sh bench-supplemental
+```
+
+`SUP_MEASUREMENTS=m7` 继续运行多 guest 分摊档，随后补充 credential-bound 的单 subject 档。其 `overflow_coverage.mode=credential-bound` 表示 A4 预算证据的模式来源。独立单 subject 入口可用于下一阶段补测，无需重跑分摊档。
 
 拒绝分为 budget、handshake_timeout、response_timeout、connection_refused、client_failure 与 unattributed；budget 需要同一隔离窗口的服务端事件及可匹配关闭。分类表示可观察失败阶段，不推断超时根因。每档保留资源基线、持有期与释放后的 memory.current/anon、FD、conntrack、重启和 OOM 序列；容差和完整恢复等待沿用原配置，以最后样本判定恢复。
 
