@@ -162,6 +162,36 @@ else test ! -e "$SUP_RAW/m7-log-deployment.json"; fi
             env=next(c for c in containers if c['name']=='egress')['env']
             self.assertEqual([e for e in env if e['name']=='PYTHONUNBUFFERED'],[dict(name='PYTHONUNBUFFERED',value='1')] if flag=='true' else [])
 
+    def test_full_fill_records_probe_window_before_release(self):
+        for mode,count in [('all','0'),('credential-bound','1')]:
+            out=self.sourced(r'''
+source "$SCRIPT_DIR/supplemental-bench.sh"
+SUP_DIR="$WORK/report"; SUP_RAW="$SUP_DIR/raw"; mkdir -p "$SUP_RAW"
+> "$WORK/starts"; rm -f "$WORK/released"
+SUP_SEQ=0; SUP_RESOURCE_RECOVERY_S=1; SUP_RESOURCE_INTERVAL_S=1; SUP_CLIENT_ATTEMPTS=1
+SUP_FILL_BATCH_SIZE=1; SUP_FILL_INTERVAL_S=0; SUP_FILL_MAX_RETRIES=1
+BENCH_B=b; BENCH_POD=p; RESOURCE_NS=x; CB_GUEST_DIR=/guest; SUP_CODE=fixture; BENCH_LEG="$MODE"
+printf '{"runs":[]}' > "$SUP_RAW/m7-spec.json"
+bench_ns() { echo 1; }; bench_elapsed_ms() { echo 1000; }
+sup_sample() { echo '{}'; }; cb_until() { :; }
+osb_api() { touch "$WORK/released"; }
+sup_start() { echo "$2" >> "$WORK/starts"; }
+bench_wait() { echo '{"fill_status":"FULL","held":2,"boundary_verified":2}' > "$SUP_RAW/$3-ready.json"; }
+sup_gate() { echo '{"source":"origin_live_connections","established":2}'; }
+sup_fetch() { echo '{"attempted":2,"success":2,"failed":0,"verified":2}' > "$SUP_RAW/$2.json"; }
+sup_m7_resources_ready() { return 0; }
+sup_m7_denial_count() {
+ test ! -e "$WORK/released" || return 1
+ if (($#)); then test "$2" != ""; echo "$DENIALS"; else echo 0; fi
+}
+sup_m7_probe_denials() { test ! -e "$WORK/released" || return 1; echo "$DENIALS"; }
+sup_m7_fill_tier "$MODE" 2
+test -e "$WORK/released"
+test "$(wc -l < "$WORK/starts" | tr -d ' ')" = 3
+jq -e --argjson n "$DENIALS" '.probe_sent and .probe_server_budget_denials==$n and .probe_denials_after==$n and .probe_event_window.matched_denials==$n and .probe_event_window.before_release and (.probe_event_window.end_s-.probe_event_window.start_s<=120)' "$SUP_RAW/m7-tier.json"
+''',OCI_STACK='0',MODE=mode,DENIALS=count)
+            self.assertIn('true',out.stdout)
+
     def test_incomplete_fill_never_launches_probes(self):
         for held,server in ((1,1),(2,1)):
             out=self.sourced(r'''

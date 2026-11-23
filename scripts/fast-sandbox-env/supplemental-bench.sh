@@ -581,9 +581,9 @@ sup_m7_fill_tier() { # mode capacity; single subject only
 		after="$(sup_m7_probe_denials "$before" "$mode" "$probe_start")"
 		probe_end="$(python3 -c 'import sys,time; print(min(time.time(),float(sys.argv[1])+120))' "$probe_start")"
 		matched="$(sup_m7_denial_count "$probe_start" "$probe_end")"
-		bench_json_set "$SUP_RAW/m7-tier.json" '.probe_sent=true | .probe_server_budget_denials=$n | .probe_denials_before=$before | .probe_denials_after=$after | .probe_event_window={start_s:$start,end_s:$end,wait_limit_s:120,matched_denials:$matched,before_release:true}' \
+		bench_json_set "$SUP_RAW/m7-tier.json" '.probe_sent=true | .probe_server_budget_denials=$n | .probe_denials_before=$before | .probe_denials_after=$after | .probe_event_window={start_s:$start,end_s:$closed,wait_limit_s:120,matched_denials:$matched,before_release:true}' \
 			--argjson n "$((after-before))" --argjson before "$before" --argjson after "$after" \
-			--argjson start "$probe_start" --argjson end "$probe_end" --argjson matched "$matched"
+			--argjson start "$probe_start" --argjson closed "$probe_end" --argjson matched "$matched"
 		bench_json_set "$SUP_RAW/m7-spec.json" '.overflow_probes={target_participant:"guest-0",unbound:$u[0],new_bound:$b[0]}' \
 			--slurpfile u "$SUP_RAW/$name-unbound.json" --slurpfile b "$SUP_RAW/$name-new-bound.json"
 	fi
