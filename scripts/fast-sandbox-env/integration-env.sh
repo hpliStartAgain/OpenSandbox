@@ -5208,7 +5208,7 @@ down() {
 
 usage() {
 	cat <<'EOF'
-usage: integration-env.sh [--auto-clean] {up|verify-native|verify-overlaybd|verify-resourceaware|bench-credential-bound|down|status|pool|sdk-e2e|idle-e2e}
+usage: integration-env.sh [--auto-clean] {up|verify-native|verify-overlaybd|verify-resourceaware|bench-credential-bound|bench-supplemental|down|status|pool|sdk-e2e|idle-e2e}
 
   up       initialize the environment: fast-sandbox@pinned-commit images,
            two-node kind cluster (KVM), RustFS, control plane, firecracker
@@ -5278,6 +5278,7 @@ EOF
 for arg in "$@"; do
 	case "$arg" in
 		--auto-clean) AUTO_CLEAN=1 ;;
+		bench-supplemental) ACTION="$arg" ;;
 		up|down|status|pool|sdk-e2e|idle-e2e|verify-native|verify-overlaybd|verify-resourceaware|bench-credential-bound) ACTION="$arg" ;;
 		*) usage ;;
 	esac
@@ -5391,6 +5392,12 @@ case "$ACTION" in
 		verify_overlaybd
 		trap - ERR
 		stage_summary
+		;;
+	bench-supplemental)
+		require_live_stack
+		# shellcheck source=supplemental-bench.sh
+		source "$SCRIPT_DIR/supplemental-bench.sh"
+		supplemental_bench
 		;;
 	bench-credential-bound)
 		exec > >(tee -a "$WORK/run.log") 2>&1

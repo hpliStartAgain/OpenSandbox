@@ -182,13 +182,14 @@ cb_kill_sandbox() { # <id>
 # cb_create_sandbox <label> <policy-file> -> CB_LAST_ID (registered for cleanup)
 cb_create_sandbox() {
 	local label="$1" policy="$2" created id uid version
-	created="$(osb_api sandbox create --template "$CB_TEMPLATE_ID" --timeout 1h \
+	created="$(osb_api sandbox create --template "$CB_TEMPLATE_ID" --timeout "${CB_SANDBOX_TIMEOUT:-1h}" \
 		--metadata "origin=fast-sandbox-env-credential-bound-$label" \
 		--network-policy-file "$policy" --skip-health-check -o json 2>/dev/null)" \
 		|| fail "credential-bound: sandbox $label create failed"
 	id="$(printf '%s' "$created" | jq -r '.id // empty')"
 	[[ -n "$id" ]] || fail "credential-bound: sandbox $label create response carried no id"
 	CB_SANDBOXES+=("$id")
+	if [[ -n "${CB_CREATE_READBACK_HOOK:-}" ]]; then "$CB_CREATE_READBACK_HOOK" "$id"; fi
 	wait_for "credential-bound: sandbox $label ($id) Running" 300 cb_sandbox_state_is "$id" Running
 	uid="$(cb_sandbox_uid "$id")" || true
 	[[ -n "$uid" ]] || fail "credential-bound: sandbox $label CR carried no uid"
