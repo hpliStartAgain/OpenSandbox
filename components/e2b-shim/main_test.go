@@ -19,10 +19,16 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/alibaba/opensandbox/e2b-shim/internal/fakeenvd"
+	"github.com/alibaba/opensandbox/e2b-shim/internal/fakenative"
+	"github.com/alibaba/opensandbox/e2b-shim/pkg/adapter"
+	"github.com/alibaba/opensandbox/e2b-shim/pkg/native"
 )
 
 // Obviously fake secret values. Real credentials never appear in tests.
@@ -267,4 +273,46 @@ func waitForListening(t *testing.T, errOut *syncBuffer) string {
 	}
 	t.Fatalf("no listening line within 10s; stderr = %q", errOut.String())
 	return ""
+}
+
+func TestRunAdapterInitializesEnvd(t *testing.T) {
+	fake := fakeenvd.New(fakeenvd.Config{})
+	es := httptest.NewServer(fake)
+	defer es.Close()
+	env := serveEnv("127.0.0.1:0")
+	fn := fakenative.New(fakenative.Config{APIKey: env["E2B_SHIM_NATIVE_API_KEY"], BasePath: "/v1", DefaultTemplates: []fakenative.TemplateSpec{{ID: "native-base", Ready: true, InitialState: native.StateRunning}}})
+	fn.SetEndpoint("*", adapter.EnvdPort, native.Endpoint{URL: es.URL})
+	ns := httptest.NewServer(fn.Handler())
+	defer ns.Close()
+	env["E2B_SHIM_NATIVE_API_URL"] = ns.URL + "/v1"
+	env["E2B_SHIM_TEMPLATES"] = `[{"template_id":"base","native_template_id":"native-base","revision":"base.rev-1","expected_envd_version":"0.8.0"}]`
+	ctx, cancel := context.WithCancel(context.Background())
+	var out, errOut syncBuffer
+	codes := make(chan int, 1)
+	go func() { codes <- run(ctx, []string{"adapter"}, &out, &errOut, lookup(env)) }()
+	defer func() {
+		cancel()
+		select {
+		case code := <-codes:
+			if code != exitOK {
+				t.Errorf("adapter exit code %d", code)
+			}
+		case <-time.After(15 * time.Second):
+			t.Error("adapter shutdown timed out")
+		}
+	}()
+	addr := waitForListening(t, &errOut)
+	r, err := http.NewRequest("POST", "http://"+addr+"/compat/e2b/v2/sandboxes", strings.NewReader(`{"templateID":"base"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Header.Set("X-API-KEY", env["E2B_SHIM_ADAPTER_API_KEY"])
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated || fake.Stats().Init != 1 || fake.Stats().Metrics != 2 || fn.Stats().Delete != 0 {
+		t.Fatalf("real adapter wiring failed: status=%d envd=%+v native=%+v", resp.StatusCode, fake.Stats(), fn.Stats())
+	}
 }

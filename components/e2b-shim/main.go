@@ -31,6 +31,7 @@ import (
 
 	"github.com/alibaba/opensandbox/e2b-shim/pkg/adapter"
 	"github.com/alibaba/opensandbox/e2b-shim/pkg/config"
+	"github.com/alibaba/opensandbox/e2b-shim/pkg/envdinit"
 	"github.com/alibaba/opensandbox/e2b-shim/pkg/native"
 	"github.com/alibaba/opensandbox/e2b-shim/pkg/service"
 	"github.com/alibaba/opensandbox/internal/version"
@@ -143,7 +144,7 @@ func serve(ctx context.Context, role string, args []string, stdout, stderr io.Wr
 		adapterHandler, err := adapter.New(adapter.Options{
 			Config:      cfg,
 			Native:      nativeClient,
-			Initializer: adapter.UnconfiguredEnvdInitializer{},
+			Initializer: envdinit.New(nil),
 			Admission:   adapter.NewMemoryAdmissionController(),
 			Logger:      logger,
 		})
