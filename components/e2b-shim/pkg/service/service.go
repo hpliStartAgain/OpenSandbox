@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package service hosts the HTTP skeleton shared by the adapter and router.
-// It serves only the liveness check; no E2B route is registered and no
-// upstream request is made.
+// Package service hosts the HTTP listener and shared liveness check.
 package service
 
 import (
@@ -110,10 +108,24 @@ func leadingCleanProbePath(p string) (string, bool) {
 // Serve runs handler on ln until ctx is canceled, then shuts down within
 // shutdownTimeout. A shutdown triggered by ctx is not an error.
 func Serve(ctx context.Context, ln net.Listener, handler http.Handler, shutdownTimeout time.Duration) error {
+	return serve(ctx, ln, handler, shutdownTimeout, false)
+}
+
+// ServeRouter accepts HTTP/1.1 and unencrypted HTTP/2 behind operator TLS termination.
+func ServeRouter(ctx context.Context, ln net.Listener, handler http.Handler, shutdownTimeout time.Duration) error {
+	return serve(ctx, ln, handler, shutdownTimeout, true)
+}
+
+func serve(ctx context.Context, ln net.Listener, handler http.Handler, shutdownTimeout time.Duration, h2c bool) error {
 	srv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
+	}
+	if h2c {
+		srv.Protocols = new(http.Protocols)
+		srv.Protocols.SetHTTP1(true)
+		srv.Protocols.SetUnencryptedHTTP2(true)
 	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()

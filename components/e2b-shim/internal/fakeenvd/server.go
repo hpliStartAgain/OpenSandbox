@@ -26,7 +26,12 @@ import (
 	"sync"
 )
 
-type Config struct{ Version string }
+type Config struct {
+	Version string
+	// DataHandler receives authenticated non-management requests. It runs without
+	// the state mutex so tests can stream and observe request cancellation.
+	DataHandler http.Handler
+}
 
 // Faults are persistent until replaced with SetFaults. RestartBeforeProbe
 // simulates a single daemon restart on the next metrics request.
@@ -41,12 +46,13 @@ type Stats struct{ Init, Metrics, Health int }
 type Server struct{ *serverState }
 
 type serverState struct {
-	mu      sync.Mutex
-	version string
-	token   string
-	env     map[string]string
-	faults  Faults
-	stats   Stats
+	mu          sync.Mutex
+	version     string
+	dataHandler http.Handler
+	token       string
+	env         map[string]string
+	faults      Faults
+	stats       Stats
 }
 
 func New(cfg Config) *Server {
@@ -54,7 +60,7 @@ func New(cfg Config) *Server {
 	if version == "" {
 		version = "0.8.0"
 	}
-	return &Server{serverState: &serverState{version: version}}
+	return &Server{serverState: &serverState{version: version, dataHandler: cfg.DataHandler}}
 }
 
 func (s *Server) Handler() http.Handler { return s }
@@ -88,9 +94,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if r.Method == http.MethodGet && r.URL.Path == "/health" {
 		s.stats.Health++
+		s.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -102,12 +108,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if s.token != "" && subtle.ConstantTimeCompare([]byte(s.token), []byte(r.Header.Get("X-Access-Token"))) != 1 {
+		s.mu.Unlock()
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == "/metrics" {
+		s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, "{}")
+		return
+	}
+	handler := s.dataHandler
+	s.mu.Unlock()
+	if handler != nil {
+		handler.ServeHTTP(w, r)
 		return
 	}
 	http.NotFound(w, r)

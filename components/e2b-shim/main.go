@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command e2b-shim is the scaffold for the optional OSEP-0027 E2B
-// compatibility component. Both subcommands validate configuration and serve
-// a liveness check only; no E2B protocol or proxy behavior is implemented.
+// Command e2b-shim serves the optional OSEP-0027 lifecycle adapter or envd router.
 package main
 
 import (
@@ -33,6 +31,7 @@ import (
 	"github.com/alibaba/opensandbox/e2b-shim/pkg/config"
 	"github.com/alibaba/opensandbox/e2b-shim/pkg/envdinit"
 	"github.com/alibaba/opensandbox/e2b-shim/pkg/native"
+	"github.com/alibaba/opensandbox/e2b-shim/pkg/router"
 	"github.com/alibaba/opensandbox/e2b-shim/pkg/service"
 	"github.com/alibaba/opensandbox/internal/version"
 )
@@ -45,12 +44,12 @@ const (
 
 const usage = `Usage: e2b-shim <command> [flags]
 
-Scaffold for the optional OpenSandbox E2B compatibility component (OSEP-0027).
-No E2B operation is implemented; both commands serve only GET/HEAD /healthz.
+Optional OpenSandbox E2B compatibility component (OSEP-0027).
+Both commands also serve unauthenticated GET/HEAD /healthz.
 
 Commands:
-  adapter   run the lifecycle adapter skeleton
-  router    run the envd router skeleton
+  adapter   run the lifecycle adapter
+  router    run the thin envd router (HTTP/1.1 and h2c)
   version   print build information
   help      print this help
 
@@ -132,15 +131,15 @@ func serve(ctx context.Context, role string, args []string, stdout, stderr io.Wr
 
 	logger := slog.New(slog.NewTextHandler(stderr, nil))
 	handler := service.NewHandler()
+	nativeClient, err := native.NewClient(native.ClientConfig{
+		BaseURL: cfg.NativeAPIURL,
+		APIKey:  cfg.NativeAPIKey,
+	})
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "e2b-shim %s: invalid native client configuration:\n%v\n", role, err)
+		return exitError
+	}
 	if role == "adapter" {
-		nativeClient, err := native.NewClient(native.ClientConfig{
-			BaseURL: cfg.NativeAPIURL,
-			APIKey:  cfg.NativeAPIKey,
-		})
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "e2b-shim %s: invalid native client configuration:\n%v\n", role, err)
-			return exitError
-		}
 		adapterHandler, err := adapter.New(adapter.Options{
 			Config:      cfg,
 			Native:      nativeClient,
@@ -153,6 +152,13 @@ func serve(ctx context.Context, role string, args []string, stdout, stderr io.Wr
 			return exitError
 		}
 		handler = service.NewHandlerWithExtra(adapterHandler.Mount)
+	} else {
+		routerHandler, err := router.New(router.Options{Config: cfg, Native: nativeClient, Logger: logger})
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "e2b-shim %s: invalid router configuration:\n%v\n", role, err)
+			return exitError
+		}
+		handler = routerHandler
 	}
 
 	ln, err := net.Listen("tcp", cfg.Listen)
@@ -169,7 +175,11 @@ func serve(ctx context.Context, role string, args []string, stdout, stderr io.Wr
 	}
 	logger.Info("listening", "role", role, "addr", ln.Addr().String(), "health_path", config.HealthPath)
 
-	if err := service.Serve(ctx, ln, handler, service.ShutdownTimeout); err != nil {
+	serveHTTP := service.Serve
+	if role == "router" {
+		serveHTTP = service.ServeRouter
+	}
+	if err := serveHTTP(ctx, ln, handler, service.ShutdownTimeout); err != nil {
 		logger.Error("server stopped with error", "role", role, "error", err.Error())
 		return exitError
 	}

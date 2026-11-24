@@ -699,7 +699,7 @@ func normalizeCompatPrefix(p string) (string, error) {
 }
 
 func isValidSandboxID(id string) bool {
-	return id != "" && id != "." && id != ".." && !strings.ContainsAny(id, "/\\?#") && !hasWhitespaceOrControl(id)
+	return rules.ValidSandboxID(id)
 }
 
 func hasWhitespaceOrControl(s string) bool {

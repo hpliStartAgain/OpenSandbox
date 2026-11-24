@@ -108,3 +108,8 @@ func hasWhitespaceOrControl(s string) bool {
 		return unicode.IsSpace(r) || unicode.IsControl(r)
 	})
 }
+
+// ValidSandboxID applies the shared adapter/router sandbox selector rules.
+func ValidSandboxID(id string) bool {
+	return id != "" && id != "." && id != ".." && !strings.ContainsAny(id, "/\\?#") && !hasWhitespaceOrControl(id)
+}

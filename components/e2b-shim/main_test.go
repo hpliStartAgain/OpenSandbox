@@ -17,6 +17,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -314,5 +315,48 @@ func TestRunAdapterInitializesEnvd(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated || fake.Stats().Init != 1 || fake.Stats().Metrics != 2 || fn.Stats().Delete != 0 {
 		t.Fatalf("real adapter wiring failed: status=%d envd=%+v native=%+v", resp.StatusCode, fake.Stats(), fn.Stats())
+	}
+	var created struct {
+		SandboxID string `json:"sandboxID"`
+		Token     string `json:"envdAccessToken"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	// A separately constructed router has no adapter memory/admission records.
+	var routerOut, routerErr syncBuffer
+	routerCodes := make(chan int, 1)
+	go func() { routerCodes <- run(ctx, []string{"router"}, &routerOut, &routerErr, lookup(env)) }()
+	defer func() {
+		cancel()
+		select {
+		case code := <-routerCodes:
+			if code != exitOK {
+				t.Errorf("router exit %d", code)
+			}
+		case <-time.After(15 * time.Second):
+			t.Error("router shutdown timed out")
+		}
+	}()
+	routerAddr := waitForListening(t, &routerErr)
+	protocols := new(http.Protocols)
+	protocols.SetUnencryptedHTTP2(true)
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Protocols = protocols
+	defer transport.CloseIdleConnections()
+	routed, err := http.NewRequest("GET", "http://"+routerAddr+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routed.Header.Set("E2b-Sandbox-Id", created.SandboxID)
+	routed.Header.Set("E2b-Sandbox-Port", "49983")
+	routed.Header.Set("X-Access-Token", created.Token)
+	routedResp, err := (&http.Client{Transport: transport, Timeout: 5 * time.Second}).Do(routed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routedResp.Body.Close()
+	if routedResp.StatusCode != 200 || routedResp.ProtoMajor != 2 {
+		t.Fatalf("router wiring: status=%d protocol=%s", routedResp.StatusCode, routedResp.Proto)
 	}
 }

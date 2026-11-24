@@ -1,25 +1,25 @@
-# OpenSandbox E2B Shim (Scaffold)
+# OpenSandbox E2B Shim (Development)
 
-`components/e2b-shim` is the optional component proposed by [OSEP-0027](https://github.com/opensandbox-group/OpenSandbox/blob/main/oseps/0027-optional-e2b-compatibility.md). This README describes the current development scaffold only. It stays out of the docs site until the proof of concept works end to end.
+`components/e2b-shim` is the optional component proposed by [OSEP-0027](https://github.com/opensandbox-group/OpenSandbox/blob/main/oseps/0027-optional-e2b-compatibility.md). This README describes the current development implementation only. It stays out of the docs site until the proof of concept works end to end.
 
-> **Scaffold only.** Gate 0 of OSEP-0027 is pending. The binary loads and validates configuration, starts an HTTP server, and answers a liveness check; `pkg/rules` contains pure, network-independent helpers for token derivation, template resolution, metadata encoding, timeout evaluation, and create-option validation. It does not register any E2B HTTP route, implement any command or file operation, or call the native OpenSandbox API or envd. No E2B SDK, envd, or Fast Sandbox combination has been tested. Do not treat this module as a deployment recipe or a compatibility commitment.
+> **Local implementation only.** The lifecycle adapter supports the Gate 1a create/delete slice with private envd initialization; the thin router forwards authenticated envd traffic through native endpoints. Local tests use fake native and envd servers. No real E2B SDK, envd, or Fast Sandbox combination has been validated; this is not a deployment recipe or a compatibility commitment.
 
 Development commands and dependency guidelines: [DEVELOPMENT.md](DEVELOPMENT.md)
 
-## What the scaffold does
+## Service roles
 
-The binary has two service subcommands that share the same skeleton, plus `version` (build information) and `help`:
+The binary has two service subcommands that share configuration and liveness handling, plus `version` (build information) and `help`:
 
-| Subcommand | Planned role (not implemented) | Current behavior |
+| Subcommand | Role | Current behavior |
 |---|---|---|
-| `adapter` | Translate E2B lifecycle requests to the native lifecycle API | Validate configuration, serve `/healthz` |
-| `router` | Forward E2B command and file traffic to upstream envd | Validate configuration, serve `/healthz` |
+| `adapter` | Translate E2B lifecycle requests to the native lifecycle API | Gate 1a create/delete under `compat_prefix`, private envd initialization, `/healthz` |
+| `router` | Forward E2B command and file traffic to upstream envd | Token admission, native ownership/state/endpoint resolution, streaming passthrough, `/healthz`; HTTP/1.1 and h2c |
 
 HTTP behavior:
 
 - `GET /healthz` and `HEAD /healthz` return `200`. The check needs no API key and its body contains no configuration. It only reports that the process is running; it does not check the native backend, envd readiness, or E2B compatibility. There is no `/readyz`.
 - Other methods on `/healthz` return `405`.
-- Every other path returns `404`, including `/`, `/v2/sandboxes`, `/sandboxes`, and the same paths under the compatibility prefix. No E2B route is registered at the root or under the prefix.
+- The adapter registers lifecycle routes under `compat_prefix`. The router accepts envd paths at the root, using fixed-entrypoint headers or `<port>-<sandboxID>.<domain>`; conflicting selectors are rejected. Only port `49983` is admitted.
 
 All configuration errors are reported before the server starts listening. Errors name the field or category only; they never echo secret values, raw configuration, or URLs.
 
@@ -67,7 +67,7 @@ The file must contain a JSON object. The loader rejects unknown fields, trailing
 |---|---|---|---|
 | `listen` | No | `127.0.0.1:8080` | `host:port` with a decimal port `0`–`65535`. The host may contain letters, digits, and `.-_:[]`. An empty host listens on all interfaces. |
 | `compat_prefix` | No | `/compat/e2b` | Absolute path below `/`. One trailing `/` is removed. Disallows queries, fragments, `%`, `\`, whitespace, control characters, and empty, `.` or `..` segments. Must not be `/healthz` or start with `/healthz/`. |
-| `native_api_url` | Yes | — | Hierarchical `http` or `https` URL with a host. A base path such as `/v1` is allowed. An explicit port must be `1`–`65535`. No user info, query, or fragment. The scaffold does not connect to it. |
+| `native_api_url` | Yes | — | Hierarchical `http` or `https` URL with a host. A base path such as `/v1` is allowed. An explicit port must be `1`–`65535`. No user info, query, or fragment. Both service roles use it for native lifecycle and endpoint queries. |
 | `adapter_id` | Yes | — | Deployment identity for the future E2B `clientID`, persisted as a native sandbox metadata label value. Must match Fast Sandbox label-value syntax `^[A-Za-z0-9]([-_.A-Za-z0-9]*[A-Za-z0-9])?$` (1–63 ASCII characters; no whitespace, control characters, or `@`). |
 | `domain` | No | empty | Bare host name. Disallows `/`, `?`, `#`, `@`, `:`, whitespace, and control characters. |
 | `hmac_key_version` | Yes | — | HMAC key configuration label, persisted as a native sandbox metadata label value. Must match Fast Sandbox label-value syntax `^[A-Za-z0-9]([-_.A-Za-z0-9]*[A-Za-z0-9])?$` (1–63 ASCII characters; no whitespace, control characters, or `@`). |
@@ -131,9 +131,21 @@ Precedence, highest first: `--listen` flag, environment variable, configuration 
 - For file sources, one trailing `\n` or `\r\n` is removed. No other trimming is applied. Environment values are used as is.
 - Loaded secrets are redacted in every formatted, JSON, and log output of the configuration.
 
+## Router admission and forwarding
+
+Run `e2b-shim router` with the same native API, adapter identity, HMAC key/version, template revisions and domain configuration as the adapter. TLS termination belongs to the operator entrypoint; the router accepts HTTP/1.1 and unencrypted HTTP/2 (h2c). No additional dependency or configuration field is required.
+
+Every client request resolves one sandbox and port, verifies `X-Access-Token` before native calls, then checks native ownership, `Running`, non-expiration, and the native port `49983` endpoint. Token possession stands in for completed initialization because the adapter returns it only after private `/init` succeeds and deletes instances whose initialization fails. This relies on the OSEP's trusted native administrative scope and protected stable HMAC key; metadata alone is not authorization.
+
+Positive native state/endpoint results are cached for at most two seconds, capped by native expiration. Failures are not cached, and refresh errors fail closed. `router.Handler` implements `adapter.AdmissionController`; sharing that instance with an adapter lets `Close` invalidate its cache immediately. `Close` does not retain a denial tombstone: if subsequent native deletion fails while the instance remains `Running`, a later authenticated refresh can admit it. Separate processes converge after native deletion/state change within the cache TTL. Existing streams are not cut by invalidation; they continue until a peer disconnects or native/runtime teardown ends them, with no router-enforced lifetime bound.
+
+The router uses `httputil.ReverseProxy.Rewrite` with immediate flushing, without full-body buffering, protocol translation, redirects, or request replay. The native endpoint supplies the upstream host/base URL and routing headers; client native routing headers and hop-by-hop headers are removed before injection. SDK selectors and `X-Access-Token` remain available to envd. Native base-path/query scope is preserved while the incoming envd path/raw query is appended. Upstream response status, end-to-end headers, body and trailers pass through unchanged.
+
+Client access to `/init`, `/upgrade`, `/freeze`, `/unfreeze`, `/collapse`, `/fsfreeze`, and `/fsthaw` is rejected before native queries, including normalized aliases and subpaths. These management operations come from the [pinned envd route table](https://github.com/e2b-dev/runtime/blob/f32ee8a2a50052f32e3632ceb451111a98dd5104/packages/envd/internal/api/api.gen.go#L931-L948) and [upgrade registration](https://github.com/e2b-dev/runtime/blob/f32ee8a2a50052f32e3632ceb451111a98dd5104/packages/envd/main.go#L402). Other envd methods are forwarded without an RPC whitelist; that does not establish compatibility for untested methods. Router-generated errors use value-free JSON `{ "code": <status>, "message": "<status text>" }`; each request logs only status and duration.
+
 ## Limitations
 
-- No E2B API, command, or file operation is implemented. The pinned SDK candidate `e2b==2.62.1`, envd `0.8.0`, and Fast Sandbox backends are not tested.
+- The pinned SDK candidate `e2b==2.62.1`, real envd `0.8.0`, and Fast Sandbox backends remain untested.
 - `/healthz` is liveness only.
 - `timeout_max_seconds` is not checked against the native server.
 - Template mappings are not checked against native templates.

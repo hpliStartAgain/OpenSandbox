@@ -24,7 +24,7 @@ make golint         # golangci-lint (install-golint target included)
 
 ## Dependencies
 
-The scaffold uses only the standard library because it serves a single liveness route. When the E2B routes land, prefer maintained community packages over hand-rolled equivalents, and justify each new dependency in its PR:
+The component currently uses only the standard library. The router uses `httputil.ReverseProxy` and Go `http.Protocols` for HTTP/1.1 and h2c. For future work, prefer maintained community packages over hand-rolled equivalents, and justify each new dependency in its PR:
 
 - Routing: `net/http.ServeMux` while it is enough; otherwise a maintained router such as `chi`, or `gin`, which `execd` already uses.
 - Request validation for the pinned SDK models: `go-playground/validator` or an equivalent, not hand-written field checks.
