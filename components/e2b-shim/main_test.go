@@ -220,6 +220,19 @@ func TestRunServeStartsStopsAndServesHealthz(t *testing.T) {
 				t.Errorf("GET /v2/sandboxes: status = %d, want 404", notFound.StatusCode)
 			}
 
+			compatUnauth, err := client.Get("http://" + addr + "/compat/e2b/v2/sandboxes")
+			if err != nil {
+				t.Fatalf("GET /compat/e2b/v2/sandboxes: %v", err)
+			}
+			compatUnauth.Body.Close()
+			wantCompatStatus := http.StatusNotFound
+			if role == "adapter" {
+				wantCompatStatus = http.StatusUnauthorized
+			}
+			if compatUnauth.StatusCode != wantCompatStatus {
+				t.Errorf("GET /compat/e2b/v2/sandboxes: status = %d, want %d", compatUnauth.StatusCode, wantCompatStatus)
+			}
+
 			cancel()
 			select {
 			case code := <-codeCh:

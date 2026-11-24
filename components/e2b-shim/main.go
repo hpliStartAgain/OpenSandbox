@@ -29,7 +29,9 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/alibaba/opensandbox/e2b-shim/pkg/adapter"
 	"github.com/alibaba/opensandbox/e2b-shim/pkg/config"
+	"github.com/alibaba/opensandbox/e2b-shim/pkg/native"
 	"github.com/alibaba/opensandbox/e2b-shim/pkg/service"
 	"github.com/alibaba/opensandbox/internal/version"
 )
@@ -127,6 +129,31 @@ func serve(ctx context.Context, role string, args []string, stdout, stderr io.Wr
 		return exitError
 	}
 
+	logger := slog.New(slog.NewTextHandler(stderr, nil))
+	handler := service.NewHandler()
+	if role == "adapter" {
+		nativeClient, err := native.NewClient(native.ClientConfig{
+			BaseURL: cfg.NativeAPIURL,
+			APIKey:  cfg.NativeAPIKey,
+		})
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "e2b-shim %s: invalid native client configuration:\n%v\n", role, err)
+			return exitError
+		}
+		adapterHandler, err := adapter.New(adapter.Options{
+			Config:      cfg,
+			Native:      nativeClient,
+			Initializer: adapter.UnconfiguredEnvdInitializer{},
+			Admission:   adapter.NewMemoryAdmissionController(),
+			Logger:      logger,
+		})
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "e2b-shim %s: invalid adapter configuration:\n%v\n", role, err)
+			return exitError
+		}
+		handler = service.NewHandlerWithExtra(adapterHandler.Mount)
+	}
+
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		// Report the cause (for example "bind: address already in use")
@@ -139,10 +166,9 @@ func serve(ctx context.Context, role string, args []string, stdout, stderr io.Wr
 		_, _ = fmt.Fprintf(stderr, "e2b-shim %s: listen failed%s\n", role, cause)
 		return exitError
 	}
-	logger := slog.New(slog.NewTextHandler(stderr, nil))
 	logger.Info("listening", "role", role, "addr", ln.Addr().String(), "health_path", config.HealthPath)
 
-	if err := service.Serve(ctx, ln, service.NewHandler(), service.ShutdownTimeout); err != nil {
+	if err := service.Serve(ctx, ln, handler, service.ShutdownTimeout); err != nil {
 		logger.Error("server stopped with error", "role", role, "error", err.Error())
 		return exitError
 	}

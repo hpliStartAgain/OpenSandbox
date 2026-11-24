@@ -22,6 +22,8 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/alibaba/opensandbox/e2b-shim/pkg/config"
@@ -38,6 +40,12 @@ const (
 // return 200 (process liveness only, not backend or envd readiness); other
 // methods there get 405 and every other path 404.
 func NewHandler() http.Handler {
+	return NewHandlerWithExtra(nil)
+}
+
+// NewHandlerWithExtra returns a private mux serving /healthz plus any routes
+// registered by register (for example, the E2B adapter under compat_prefix).
+func NewHandlerWithExtra(register func(*http.ServeMux)) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+config.HealthPath, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -52,7 +60,51 @@ func NewHandler() http.Handler {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
-	return mux
+	if register != nil {
+		register(mux)
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if probePath, unclean := leadingCleanProbePath(r.URL.Path); unclean {
+			if probePath != "" {
+				probe := r.Clone(r.Context())
+				probe.Method = http.MethodGet
+				probe.URL = &url.URL{Path: probePath}
+				if h, pattern := mux.Handler(probe); pattern != "" {
+					h.ServeHTTP(w, r)
+					return
+				}
+			}
+			http.NotFound(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// leadingCleanProbePath reports whether p contains empty, "." or ".." segments
+// that net/http.ServeMux would redirect (301/307). When unclean, it returns a
+// probe path under the leading clean prefix so subtree handlers (such as the
+// compatibility adapter) can reject or classify the raw request without redirects.
+func leadingCleanProbePath(p string) (string, bool) {
+	if !strings.HasPrefix(p, "/") {
+		return "", true
+	}
+	if p == "/" {
+		return "", false
+	}
+	segs := strings.Split(p[1:], "/")
+	for i, seg := range segs {
+		if seg == "" && i == len(segs)-1 {
+			continue
+		}
+		if seg == "" || seg == "." || seg == ".." {
+			if i == 0 {
+				return "", true
+			}
+			return "/" + strings.Join(segs[:i], "/") + "/_", true
+		}
+	}
+	return "", false
 }
 
 // Serve runs handler on ln until ctx is canceled, then shuts down within
