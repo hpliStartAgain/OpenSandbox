@@ -27,6 +27,7 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -69,8 +70,9 @@ type Options struct {
 }
 
 // Handler serves E2B control-plane routes beneath the compatibility prefix.
+// It must be constructed with New; its zero value cannot serve requests.
 type Handler struct {
-	prefix, adapterID, domain, hmacKeyVersion, apiKey       string
+	prefix, adapterID, domain, hmacKeyVersion               string
 	apiKeyHash                                              [32]byte
 	catalog                                                 *rules.TemplateCatalog
 	tokenDeriver                                            *rules.TokenDeriver
@@ -100,12 +102,19 @@ type createSandboxResponse struct {
 	Domain          string `json:"domain,omitempty"`
 }
 
+var envdVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
+
 // New validates opts and builds a prefix-mounted E2B control-plane Handler.
 func New(opts Options) (*Handler, error) {
 	if opts.Config == nil || opts.Native == nil || opts.Initializer == nil || opts.Admission == nil {
 		return nil, errors.New("adapter: config, native, initializer, and admission are required")
 	}
 	cfg := opts.Config
+	for _, template := range cfg.Templates {
+		if v := template.ExpectedEnvdVersion; !envdVersionPattern.MatchString(v) || strings.HasPrefix(v, "0.0.") {
+			return nil, errors.New("adapter: expected_envd_version must be MAJOR.MINOR.PATCH and at least 0.1.0")
+		}
+	}
 	prefix, err := normalizeCompatPrefix(cfg.CompatPrefix)
 	if err != nil {
 		return nil, err
@@ -141,11 +150,10 @@ func New(opts Options) (*Handler, error) {
 	if clk == nil {
 		clk = time.Now
 	}
-	clonedKey := strings.Clone(rawAPIKey)
 	h := &Handler{
 		prefix: prefix, adapterID: cfg.AdapterID, domain: cfg.Domain, hmacKeyVersion: cfg.HMACKeyVersion,
-		apiKey: clonedKey, apiKeyHash: sha256.Sum256([]byte(clonedKey)),
-		catalog: catalog, tokenDeriver: deriver, native: opts.Native,
+		apiKeyHash: sha256.Sum256([]byte(rawAPIKey)),
+		catalog:    catalog, tokenDeriver: deriver, native: opts.Native,
 		initializer: opts.Initializer, admission: opts.Admission, logger: logger,
 		readinessTimeout:      positiveOr(opts.ReadinessTimeout, DefaultReadinessTimeout),
 		readinessPollInterval: positiveOr(opts.ReadinessPollInterval, DefaultReadinessPollInterval),
@@ -214,7 +222,13 @@ func (h *Handler) registerRoutes() {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h == nil || r == nil || r.URL == nil {
+	if h == nil || h.mux == nil || h.clock == nil || h.reqSeq == nil {
+		h.respondJSON(w, http.StatusInternalServerError, "", false, errorResponse{
+			Code: http.StatusInternalServerError, Message: "handler must be constructed with New", ErrorCode: "handler_not_initialized",
+		})
+		return
+	}
+	if r == nil || r.URL == nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -423,7 +437,7 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, start tim
 
 	ctx := r.Context()
 	sbx, err := h.native.GetSandbox(ctx, sandboxID)
-	if err != nil {
+	if err != nil || sbx == nil {
 		if native.IsNotFound(err) {
 			if closeErr := h.admission.Close(ctx, sandboxID); closeErr != nil {
 				h.respondError(w, start, reqID, opDelete, sandboxID, http.StatusServiceUnavailable,
@@ -503,6 +517,9 @@ func (h *Handler) waitForRunning(ctx context.Context, sandboxID string, initialS
 		if err != nil {
 			return err
 		}
+		if sbx == nil {
+			return errors.New("adapter: backend returned no sandbox")
+		}
 		switch sbx.Status.State {
 		case native.StateRunning:
 			return nil
@@ -516,8 +533,10 @@ func (h *Handler) waitForRunning(ctx context.Context, sandboxID string, initialS
 
 func (h *Handler) cleanupOnCreateFailure(sandboxID string) {
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), h.cleanupTimeout)
-	defer cancel()
 	_ = h.admission.Close(cleanupCtx, sandboxID)
+	cancel()
+	cleanupCtx, cancel = context.WithTimeout(context.Background(), h.cleanupTimeout)
+	defer cancel()
 	_ = h.native.DeleteSandbox(cleanupCtx, sandboxID)
 }
 
@@ -672,6 +691,9 @@ func normalizeCompatPrefix(p string) (string, error) {
 	}
 	if p == config.HealthPath || strings.HasPrefix(p, config.HealthPath+"/") {
 		return "", errors.New("adapter: compat_prefix must not overlap the health check path")
+	}
+	if first, _, _ := strings.Cut(p[1:], "/"); first == "v1" || first == "v2" || first == "sandboxes" {
+		return "", errors.New("adapter: compat_prefix must not use a reserved native namespace")
 	}
 	return p, nil
 }

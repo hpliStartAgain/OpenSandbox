@@ -118,6 +118,9 @@ func normalizePrefix(p string) (string, error) {
 	if p == HealthPath || strings.HasPrefix(p, HealthPath+"/") {
 		return "", errors.New(field + ": must not overlap the health check path")
 	}
+	if first, _, _ := strings.Cut(p[1:], "/"); first == "v1" || first == "v2" || first == "sandboxes" {
+		return "", errors.New(field + ": must not use a reserved native namespace")
+	}
 	return p, nil
 }
 

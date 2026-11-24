@@ -459,6 +459,17 @@ func TestLoadFailures(t *testing.T) {
 	}
 }
 
+func TestReservedCompatPrefixes(t *testing.T) {
+	for _, prefix := range []string{"/v1", "/v1/e2b", "/v2", "/v2/e2b", "/sandboxes", "/sandboxes/e2b", "/healthz", "/healthz/e2b", "/compat/e2b", "/V1/e2b", "/v10", "/compat/v2"} {
+		_, err := config.Load(config.Source{Path: writeConfig(t, strings.Replace(validFile, "/compat/e2b", prefix, 1)), LookupEnv: lookup(secretEnv())})
+		first := strings.Split(prefix, "/")[1]
+		wantErr := first == "v1" || first == "v2" || first == "sandboxes" || first == "healthz"
+		if (err != nil) != wantErr || (err != nil && (!strings.Contains(err.Error(), "compat_prefix:") || strings.Contains(err.Error(), prefix))) {
+			t.Fatalf("prefix %q: error = %v, wantErr=%v (value-free)", prefix, err, wantErr)
+		}
+	}
+}
+
 func fileOverrideEnv(name, path string) map[string]string {
 	env := hmacRefEnv()
 	switch name {

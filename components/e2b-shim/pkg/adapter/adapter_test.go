@@ -271,11 +271,102 @@ func assertAPIError(t *testing.T, resp *http.Response, raw []byte, wantStatus in
 	return out
 }
 
+type nilSandboxLifecycle struct {
+	native.Lifecycle
+	events   []string
+	onDelete func(context.Context) error
+}
+
+func (n *nilSandboxLifecycle) CreateTemplateSandbox(context.Context, native.CreateTemplateSandboxRequest) (*native.CreateSandboxResult, error) {
+	n.events = append(n.events, "create")
+	return &native.CreateSandboxResult{ID: "sbx-1", Status: native.SandboxStatus{State: native.StatePending}}, nil
+}
+func (n *nilSandboxLifecycle) GetSandbox(context.Context, string) (*native.Sandbox, error) {
+	n.events = append(n.events, "get")
+	return nil, nil
+}
+func (n *nilSandboxLifecycle) DeleteSandbox(ctx context.Context, _ string) error {
+	n.events = append(n.events, "delete")
+	return n.onDelete(ctx)
+}
+
+func TestNilSandboxAndIndependentCleanupContexts(t *testing.T) {
+	for _, scenario := range []string{"create", "delete", "create_slow_close"} {
+		t.Run(scenario, func(t *testing.T) {
+			base := newHarness(t, harnessOpts{})
+			n := &nilSandboxLifecycle{}
+			base.admission.onClose = func(ctx context.Context, _ string) error {
+				n.events = append(n.events, "close")
+				if scenario == "create_slow_close" {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return nil
+			}
+			n.onDelete = func(ctx context.Context) error {
+				deadline, ok := ctx.Deadline()
+				if ctx.Err() != nil || !ok || !deadline.After(time.Now()) {
+					t.Fatalf("delete must receive its own live timeout: err=%v deadline=%v", ctx.Err(), deadline)
+				}
+				return nil
+			}
+			h, err := adapter.New(adapter.Options{Config: base.cfg, Native: n, Initializer: base.init, Admission: base.admission,
+				ReadinessPollInterval: time.Millisecond, CleanupTimeout: 20 * time.Millisecond})
+			if err != nil {
+				t.Fatal(err)
+			}
+			method, path, code := http.MethodPost, "/compat/e2b/v2/sandboxes", "sandbox_readiness_failed"
+			wantEvents := []string{"create", "get", "close", "delete"}
+			if scenario == "delete" {
+				method, path, code = http.MethodDelete, "/compat/e2b/sandboxes/sbx-1", "backend_unavailable"
+				wantEvents = []string{"get"}
+			}
+			r := httptest.NewRequest(method, path, strings.NewReader(`{"templateID":"tpl-base"}`))
+			r.Header.Set("X-API-KEY", testAdapterAPIKey)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			assertAPIError(t, w.Result(), w.Body.Bytes(), http.StatusServiceUnavailable, code, true)
+			if !slices.Equal(n.events, wantEvents) || len(base.init.Calls()) != 0 {
+				t.Fatalf("events=%v, want %v; initializer must not run", n.events, wantEvents)
+			}
+		})
+	}
+}
+
+func TestZeroValueHandler(t *testing.T) {
+	var h adapter.Handler
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/compat/e2b/v2/sandboxes", nil))
+	out := assertAPIError(t, w.Result(), w.Body.Bytes(), http.StatusInternalServerError, "handler_not_initialized", false)
+	if out.Message == "" || w.Header().Get("Content-Type") != "application/json" {
+		t.Fatal("uninitialized handler must return a JSON error envelope")
+	}
+}
+
 func TestNewValidationAndPorts(t *testing.T) {
 	base := newHarness(t, harnessOpts{})
 	nc, err := native.NewClient(native.ClientConfig{BaseURL: base.cfg.NativeAPIURL, APIKey: base.cfg.NativeAPIKey})
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, prefix := range []string{"/v1", "/v1/e2b", "/v2", "/v2/e2b", "/sandboxes", "/sandboxes/e2b", "/healthz", "/healthz/e2b", "/compat/e2b", "/V1/e2b", "/v10", "/compat/v2"} {
+		cfg := *base.cfg
+		cfg.CompatPrefix = prefix
+		_, err := adapter.New(adapter.Options{Config: &cfg, Native: nc, Initializer: base.init, Admission: base.admission})
+		wantErr := slices.Contains([]string{"v1", "v2", "sandboxes", "healthz"}, strings.Split(prefix, "/")[1])
+		if (err != nil) != wantErr || (err != nil && strings.Contains(err.Error(), prefix)) {
+			t.Fatalf("prefix %q: error = %v, wantErr=%v (value-free)", prefix, err, wantErr)
+		}
+	}
+	for _, version := range []string{"latest", "0.0.9", "0.0.0", "v0.8.0", "0.8", "0.01.0", "0.1.0-rc.1", "0.1.0", "0.8.0", "1.0.0"} {
+		cfg := *base.cfg
+		cfg.Templates = slices.Clone(cfg.Templates)
+		cfg.Templates[0].ExpectedEnvdVersion = version
+		_, err := adapter.New(adapter.Options{Config: &cfg, Native: nc, Initializer: base.init, Admission: base.admission})
+		wantErr := !slices.Contains([]string{"0.1.0", "0.8.0", "1.0.0"}, version)
+		if (err != nil) != wantErr || (err != nil && strings.Contains(err.Error(), version)) {
+			t.Fatalf("version %q: error = %v, wantErr=%v (value-free)", version, err, wantErr)
+		}
 	}
 	for name, mutate := range map[string]func(*adapter.Options){
 		"nil_config":      func(o *adapter.Options) { o.Config = nil },
@@ -674,7 +765,7 @@ func TestDeleteTwoConditionMatrix(t *testing.T) {
 	t.Run("happy_delete_all_states_and_duplicate_delete_404", func(t *testing.T) {
 		for _, retain := range []bool{true, false} {
 			retainVal := retain
-			for _, state := range []native.State{native.StateRunning, native.StateFailed, native.StatePaused, native.StateStopping} {
+			for _, state := range []native.State{native.StatePending, native.StateRunning, native.StateFailed, native.StatePaused, native.StateStopping} {
 				h := newHarness(t, harnessOpts{retainTerminated: &retainVal})
 				id := createOneSandbox(t, h)
 				if state != native.StateRunning {
