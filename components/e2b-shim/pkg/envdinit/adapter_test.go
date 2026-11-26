@@ -76,7 +76,7 @@ func TestAdapterInitialization(t *testing.T) {
 			env := map[string]string{
 				"E2B_SHIM_NATIVE_API_URL": ns.URL + "/v1", "E2B_SHIM_ADAPTER_ID": "e6-test", "E2B_SHIM_HMAC_KEY_VERSION": "v1",
 				"E2B_SHIM_TIMEOUT_MAX_SECONDS": "3600", "E2B_SHIM_ADAPTER_API_KEY": "test-adapter-key", "E2B_SHIM_NATIVE_API_KEY": "test-native-key",
-				"E2B_SHIM_HMAC_KEY": "test-hmac-key", "E2B_SHIM_TEMPLATES": `[{"template_id":"base","native_template_id":"native-base","revision":"base.rev-1","expected_envd_version":"0.8.0"}]`,
+				"E2B_SHIM_HMAC_KEY": "test-hmac-key", "E2B_SHIM_TEMPLATES": `[{"template_id":"base","native_template_id":"native-base","revision":"base.rev-1","default_user":"user","expected_envd_version":"0.8.0"}]`,
 			}
 			cfg, err := config.Load(config.Source{LookupEnv: func(k string) (string, bool) { v, ok := env[k]; return v, ok }})
 			if err != nil {

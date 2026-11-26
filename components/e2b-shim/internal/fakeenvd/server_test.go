@@ -15,6 +15,7 @@
 package fakeenvd
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -80,6 +81,41 @@ func TestFaultsAndFormatting(t *testing.T) {
 	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
 		if strings.Contains(fmt.Sprintf(verb, s)+fmt.Sprintf(verb, *s), "test-secret") {
 			t.Fatal("formatted server leaked token")
+		}
+	}
+}
+
+func TestDeliveredDefaultsAndFaults(t *testing.T) {
+	s := New(Config{})
+	check := func(body string, user string, fallback bool) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest("POST", "/init", strings.NewReader(body)))
+		var got struct {
+			User     string
+			Fallback bool
+		}
+		if w.Code != 204 || json.Unmarshal([]byte(w.Header().Get("X-Envd-Defaults")), &got) != nil || got.User != user || got.Fallback != fallback {
+			t.Fatalf("defaults: %s", w.Header().Get("X-Envd-Defaults"))
+		}
+	}
+	check("{}", "root", true)
+	check(`{"defaultUser":"app"}`, "app", false)
+	check("{}", "app", false)
+	for _, tt := range []struct {
+		fault Faults
+		want  string
+	}{
+		{Faults{OmitDefaults: true}, ""},
+		{Faults{InvalidDefaults: true}, "{"},
+		{Faults{WrongDefaultUser: "wrong"}, `{"fallback":false,"user":"wrong"}`},
+		{Faults{ForceFallback: true}, `{"fallback":true,"user":"app"}`},
+	} {
+		s.SetFaults(tt.fault)
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest("POST", "/init", strings.NewReader("{}")))
+		if w.Header().Get("X-Envd-Defaults") != tt.want {
+			t.Fatalf("fault header=%q", w.Header().Get("X-Envd-Defaults"))
 		}
 	}
 }

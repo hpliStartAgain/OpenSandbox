@@ -286,7 +286,7 @@ func TestRunAdapterInitializesEnvd(t *testing.T) {
 	ns := httptest.NewServer(fn.Handler())
 	defer ns.Close()
 	env["E2B_SHIM_NATIVE_API_URL"] = ns.URL + "/v1"
-	env["E2B_SHIM_TEMPLATES"] = `[{"template_id":"base","native_template_id":"native-base","revision":"base.rev-1","expected_envd_version":"0.8.0"}]`
+	env["E2B_SHIM_TEMPLATES"] = `[{"template_id":"base","native_template_id":"native-base","revision":"base.rev-1","default_user":"user","expected_envd_version":"0.8.0"}]`
 	ctx, cancel := context.WithCancel(context.Background())
 	var out, errOut syncBuffer
 	codes := make(chan int, 1)
@@ -344,7 +344,7 @@ func TestRunAdapterInitializesEnvd(t *testing.T) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Protocols = protocols
 	defer transport.CloseIdleConnections()
-	routed, err := http.NewRequest("GET", "http://"+routerAddr+"/metrics", nil)
+	routed, err := http.NewRequest("GET", "http://"+routerAddr+"/health", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +356,7 @@ func TestRunAdapterInitializesEnvd(t *testing.T) {
 		t.Fatal(err)
 	}
 	routedResp.Body.Close()
-	if routedResp.StatusCode != 200 || routedResp.ProtoMajor != 2 {
+	if routedResp.StatusCode != 204 || routedResp.ProtoMajor != 2 {
 		t.Fatalf("router wiring: status=%d protocol=%s", routedResp.StatusCode, routedResp.Proto)
 	}
 }

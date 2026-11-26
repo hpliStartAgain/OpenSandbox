@@ -34,6 +34,7 @@ type ResolvedTemplate struct {
 	Aliases             []string
 	NativeTemplateID    string
 	Revision            string
+	DefaultUser         string
 	ExpectedEnvdVersion string
 	Ready               bool
 	ProfileCompatible   bool
@@ -57,6 +58,9 @@ func NewTemplateCatalog(mappings []config.TemplateMapping, profileTimeout Timeou
 
 	for i, m := range mappings {
 		at := fmt.Sprintf("templates[%d]", i)
+		if !config.ValidDefaultUser(m.DefaultUser) {
+			return nil, fmt.Errorf("rules: %s.default_user: invalid username", at)
+		}
 		for _, f := range []struct{ name, v string }{
 			{"template_id", m.TemplateID},
 			{"native_template_id", m.NativeTemplateID},
@@ -90,6 +94,7 @@ func NewTemplateCatalog(mappings []config.TemplateMapping, profileTimeout Timeou
 			Aliases:             aliases,
 			NativeTemplateID:    m.NativeTemplateID,
 			Revision:            m.Revision,
+			DefaultUser:         m.DefaultUser,
 			ExpectedEnvdVersion: m.ExpectedEnvdVersion,
 			Ready:               m.IsReady(),
 			ProfileCompatible:   m.IsProfileCompatible(),

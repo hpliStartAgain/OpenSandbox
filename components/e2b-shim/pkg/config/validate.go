@@ -20,6 +20,7 @@ import (
 	"math"
 	"net"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -223,6 +224,9 @@ func (c *Config) validateTemplates() error {
 	revisions := map[string]bool{}
 	for i, t := range c.Templates {
 		at := fmt.Sprintf("templates[%d]", i)
+		if !ValidDefaultUser(t.DefaultUser) {
+			errs = append(errs, fmt.Errorf("%s.default_user: must be a portable lowercase username (1-32 characters)", at))
+		}
 		for _, f := range []struct{ name, v string }{
 			{"template_id", t.TemplateID},
 			{"native_template_id", t.NativeTemplateID},
@@ -275,4 +279,11 @@ func (c *Config) validateTemplates() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+var defaultUserPattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
+// ValidDefaultUser validates an explicit portable lowercase account name.
+func ValidDefaultUser(s string) bool {
+	return defaultUserPattern.MatchString(s)
 }

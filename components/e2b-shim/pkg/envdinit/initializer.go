@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/alibaba/opensandbox/e2b-shim/pkg/adapter"
+	"github.com/alibaba/opensandbox/e2b-shim/pkg/config"
 	"github.com/alibaba/opensandbox/e2b-shim/pkg/native"
 )
 
@@ -95,14 +96,18 @@ func (i *Initializer) Initialize(ctx context.Context, req adapter.EnvdInitReques
 	if ctx.Err() != nil {
 		return nil, errors.Join(ErrDefiniteFailure, ctx.Err())
 	}
+	if !config.ValidDefaultUser(req.DefaultUser) {
+		return nil, fmt.Errorf("%w: invalid default user", ErrDefiniteFailure)
+	}
 	base, err := url.Parse(req.Endpoint.URL)
 	if err != nil || base.Host == "" || (base.Scheme != "http" && base.Scheme != "https") || base.User != nil || base.Fragment != "" || base.Opaque != "" {
 		return nil, fmt.Errorf("%w: invalid endpoint", ErrDefiniteFailure)
 	}
 	payload, err := json.Marshal(struct {
+		DefaultUser string            `json:"defaultUser"`
 		AccessToken string            `json:"accessToken"`
 		EnvVars     map[string]string `json:"envVars,omitempty"`
-	}{req.AccessToken, req.EnvVars})
+	}{req.DefaultUser, req.AccessToken, req.EnvVars})
 	if err != nil {
 		return nil, fmt.Errorf("%w: invalid payload", ErrDefiniteFailure)
 	}
@@ -145,24 +150,32 @@ func (i *Initializer) Initialize(ctx context.Context, req adapter.EnvdInitReques
 	if err != nil {
 		return nil, err
 	}
-	status, version, err := i.call(initReq)
+	status, version, defaults, err := i.call(initReq)
 	if err != nil {
 		return nil, err
 	}
 	if status != http.StatusNoContent {
 		return nil, fmt.Errorf("%w: init rejected", ErrDefiniteFailure)
 	}
+	// Verify defaults before version and authentication probes.
+	var effective struct {
+		User     string
+		Fallback *bool
+	}
+	if json.Unmarshal([]byte(defaults), &effective) != nil || effective.User != req.DefaultUser || effective.Fallback == nil || *effective.Fallback {
+		return nil, fmt.Errorf("%w: invalid effective defaults", ErrDefiniteFailure)
+	}
 	if version != req.ExpectedEnvdVersion {
 		return nil, fmt.Errorf("%w: version mismatch", ErrDefiniteFailure)
 	}
-	status, _, err = i.call(probe)
+	status, _, _, err = i.call(probe)
 	if err != nil {
 		return nil, err
 	}
 	if status != http.StatusOK {
 		return nil, fmt.Errorf("%w: authenticated probe rejected", ErrDefiniteFailure)
 	}
-	status, _, err = i.call(unauthProbe)
+	status, _, _, err = i.call(unauthProbe)
 	if err != nil {
 		return nil, err
 	}
@@ -172,18 +185,18 @@ func (i *Initializer) Initialize(ctx context.Context, req adapter.EnvdInitReques
 	return &adapter.EnvdInitResult{EnvdVersion: version}, nil
 }
 
-func (i *Initializer) call(req *http.Request) (int, string, error) {
+func (i *Initializer) call(req *http.Request) (int, string, string, error) {
 	resp, err := i.client.Do(req)
 	if err != nil {
 		// In particular, *url.Error contains the private URL. Never wrap it.
-		return 0, "", ErrAmbiguous
+		return 0, "", "", ErrAmbiguous
 	}
 	defer resp.Body.Close()
 	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes)); err != nil {
-		return 0, "", ErrAmbiguous
+		return 0, "", "", ErrAmbiguous
 	}
 	if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode >= 500 {
-		return 0, "", ErrAmbiguous
+		return 0, "", "", ErrAmbiguous
 	}
-	return resp.StatusCode, resp.Header.Get("X-Envd-Version"), nil
+	return resp.StatusCode, resp.Header.Get("X-Envd-Version"), resp.Header.Get("X-Envd-Defaults"), nil
 }

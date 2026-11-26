@@ -43,6 +43,7 @@ var (
 // EnvdInitRequest carries parameters for private envd /init bootstrap.
 // All formatting, marshaling, and logging paths redact Endpoint, AccessToken, and EnvVars.
 type EnvdInitRequest struct {
+	DefaultUser                                 string
 	SandboxID, AccessToken, ExpectedEnvdVersion string
 	Endpoint                                    *native.Endpoint
 	EnvVars                                     map[string]string

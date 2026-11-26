@@ -27,7 +27,7 @@ import (
 func testCatalogForMetadata(t *testing.T) *rules.TemplateCatalog {
 	t.Helper()
 	cat, err := rules.NewTemplateCatalog([]config.TemplateMapping{
-		{TemplateID: "base", Aliases: []string{"default"}, NativeTemplateID: "tpl-base", Revision: "tpl-base.rev-1", ExpectedEnvdVersion: "0.8.0"},
+		{TemplateID: "base", Aliases: []string{"default"}, NativeTemplateID: "tpl-base", Revision: "tpl-base.rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0"},
 	}, defaultProfileTimeout())
 	if err != nil {
 		t.Fatal(err)

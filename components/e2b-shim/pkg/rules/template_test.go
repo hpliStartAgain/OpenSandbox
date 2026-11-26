@@ -32,9 +32,9 @@ func defaultProfileTimeout() rules.TimeoutPolicy {
 
 func TestTemplateCatalogResolveAndAliasReassignment(t *testing.T) {
 	catV1, err := rules.NewTemplateCatalog([]config.TemplateMapping{
-		{TemplateID: "base", Aliases: []string{"default", "base-envd"}, NativeTemplateID: "tpl-base-v1", Revision: "tpl-base.rev-1", ExpectedEnvdVersion: "0.8.0", TimeoutMaxSeconds: int64Ptr(1200)},
-		{TemplateID: "unready-tpl", NativeTemplateID: "tpl-unready", Revision: "tpl-unready.rev-1", ExpectedEnvdVersion: "0.8.0", Ready: boolPtr(false)},
-		{TemplateID: "incompat-tpl", NativeTemplateID: "tpl-incompat", Revision: "tpl-incompat.rev-1", ExpectedEnvdVersion: "0.8.0", ProfileCompatible: boolPtr(false)},
+		{TemplateID: "base", Aliases: []string{"default", "base-envd"}, NativeTemplateID: "tpl-base-v1", Revision: "tpl-base.rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0", TimeoutMaxSeconds: int64Ptr(1200)},
+		{TemplateID: "unready-tpl", NativeTemplateID: "tpl-unready", Revision: "tpl-unready.rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0", Ready: boolPtr(false)},
+		{TemplateID: "incompat-tpl", NativeTemplateID: "tpl-incompat", Revision: "tpl-incompat.rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0", ProfileCompatible: boolPtr(false)},
 	}, defaultProfileTimeout())
 	if err != nil {
 		t.Fatalf("NewTemplateCatalog v1: %v", err)
@@ -74,8 +74,8 @@ func TestTemplateCatalogResolveAndAliasReassignment(t *testing.T) {
 
 	// Catalog v2 moves alias "default" to rev-2 while retaining rev-1 for existing instances.
 	catV2, err := rules.NewTemplateCatalog([]config.TemplateMapping{
-		{TemplateID: "base-v1", NativeTemplateID: "tpl-base-v1", Revision: "tpl-base.rev-1", ExpectedEnvdVersion: "0.8.0", Ready: boolPtr(false)},
-		{TemplateID: "base-v2", Aliases: []string{"default"}, NativeTemplateID: "tpl-base-v2", Revision: "tpl-base.rev-2", ExpectedEnvdVersion: "0.8.0"},
+		{TemplateID: "base-v1", NativeTemplateID: "tpl-base-v1", Revision: "tpl-base.rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0", Ready: boolPtr(false)},
+		{TemplateID: "base-v2", Aliases: []string{"default"}, NativeTemplateID: "tpl-base-v2", Revision: "tpl-base.rev-2", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0"},
 	}, defaultProfileTimeout())
 	if err != nil {
 		t.Fatalf("NewTemplateCatalog v2: %v", err)
@@ -97,7 +97,7 @@ func TestTemplateCatalogResolveAndAliasReassignment(t *testing.T) {
 }
 
 func TestNewTemplateCatalogRejectsInvalidConfigs(t *testing.T) {
-	valid := config.TemplateMapping{TemplateID: "base", NativeTemplateID: "tpl-base", Revision: "rev-1", ExpectedEnvdVersion: "0.8.0"}
+	valid := config.TemplateMapping{TemplateID: "base", NativeTemplateID: "tpl-base", Revision: "rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0"}
 	p := defaultProfileTimeout()
 	cases := []struct {
 		name     string
@@ -107,14 +107,14 @@ func TestNewTemplateCatalogRejectsInvalidConfigs(t *testing.T) {
 	}{
 		{"invalid profile min timeout", nil, rules.TimeoutPolicy{DefaultSeconds: 300, MinSeconds: 0, MaxSeconds: 3600}, rules.ErrTimeoutInvalidPolicy},
 		{"profile max below min", nil, rules.TimeoutPolicy{DefaultSeconds: 300, MinSeconds: 100, MaxSeconds: 60}, rules.ErrTimeoutInvalidPolicy},
-		{"empty template id", []config.TemplateMapping{{NativeTemplateID: "t", Revision: "r1", ExpectedEnvdVersion: "0.8.0"}}, p, nil},
-		{"invalid revision label at-sign", []config.TemplateMapping{{TemplateID: "base", NativeTemplateID: "t", Revision: "tpl@rev1", ExpectedEnvdVersion: "0.8.0"}}, p, rules.ErrInvalidMetadataValue},
-		{"revision exceeds 63 chars", []config.TemplateMapping{{TemplateID: "base", NativeTemplateID: "t", Revision: strings.Repeat("r", 64), ExpectedEnvdVersion: "0.8.0"}}, p, rules.ErrInvalidMetadataValue},
-		{"duplicate selector", []config.TemplateMapping{valid, {TemplateID: "other", Aliases: []string{"base"}, NativeTemplateID: "t2", Revision: "rev-2", ExpectedEnvdVersion: "0.8.0"}}, p, nil},
-		{"duplicate revision", []config.TemplateMapping{valid, {TemplateID: "other", NativeTemplateID: "t2", Revision: "rev-1", ExpectedEnvdVersion: "0.8.0"}}, p, nil},
-		{"empty alias", []config.TemplateMapping{{TemplateID: "base", Aliases: []string{""}, NativeTemplateID: "t", Revision: "rev-1", ExpectedEnvdVersion: "0.8.0"}}, p, nil},
-		{"per-template max below min", []config.TemplateMapping{{TemplateID: "base", NativeTemplateID: "t", Revision: "rev-1", ExpectedEnvdVersion: "0.8.0", TimeoutMaxSeconds: int64Ptr(30)}}, p, rules.ErrTimeoutInvalidPolicy},
-		{"per-template max above max", []config.TemplateMapping{{TemplateID: "base", NativeTemplateID: "t", Revision: "rev-1", ExpectedEnvdVersion: "0.8.0", TimeoutMaxSeconds: int64Ptr(7200)}}, p, rules.ErrTimeoutInvalidPolicy},
+		{"empty template id", []config.TemplateMapping{{NativeTemplateID: "t", Revision: "r1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0"}}, p, nil},
+		{"invalid revision label at-sign", []config.TemplateMapping{{TemplateID: "base", NativeTemplateID: "t", Revision: "tpl@rev1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0"}}, p, rules.ErrInvalidMetadataValue},
+		{"revision exceeds 63 chars", []config.TemplateMapping{{TemplateID: "base", NativeTemplateID: "t", Revision: strings.Repeat("r", 64), DefaultUser: "user", ExpectedEnvdVersion: "0.8.0"}}, p, rules.ErrInvalidMetadataValue},
+		{"duplicate selector", []config.TemplateMapping{valid, {TemplateID: "other", Aliases: []string{"base"}, NativeTemplateID: "t2", Revision: "rev-2", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0"}}, p, nil},
+		{"duplicate revision", []config.TemplateMapping{valid, {TemplateID: "other", NativeTemplateID: "t2", Revision: "rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0"}}, p, nil},
+		{"empty alias", []config.TemplateMapping{{TemplateID: "base", Aliases: []string{""}, NativeTemplateID: "t", Revision: "rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0"}}, p, nil},
+		{"per-template max below min", []config.TemplateMapping{{TemplateID: "base", NativeTemplateID: "t", Revision: "rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0", TimeoutMaxSeconds: int64Ptr(30)}}, p, rules.ErrTimeoutInvalidPolicy},
+		{"per-template max above max", []config.TemplateMapping{{TemplateID: "base", NativeTemplateID: "t", Revision: "rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0", TimeoutMaxSeconds: int64Ptr(7200)}}, p, rules.ErrTimeoutInvalidPolicy},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

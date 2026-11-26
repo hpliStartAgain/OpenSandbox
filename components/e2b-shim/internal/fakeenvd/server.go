@@ -36,6 +36,10 @@ type Config struct {
 // Faults are persistent until replaced with SetFaults. RestartBeforeProbe
 // simulates a single daemon restart on the next metrics request.
 type Faults struct {
+	OmitDefaults       bool
+	WrongDefaultUser   string
+	ForceFallback      bool
+	InvalidDefaults    bool
 	DropInitResponse   bool
 	InitVersion        string
 	RestartBeforeProbe bool
@@ -49,6 +53,7 @@ type serverState struct {
 	mu          sync.Mutex
 	version     string
 	dataHandler http.Handler
+	defaultUser string
 	token       string
 	env         map[string]string
 	faults      Faults
@@ -75,6 +80,7 @@ func (s *Server) SetFaults(f Faults) {
 func (s *Server) Restart() {
 	s.mu.Lock()
 	s.token, s.env = "", nil
+	s.defaultUser = ""
 	s.mu.Unlock()
 }
 
@@ -104,6 +110,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.stats.Metrics++
 		if s.faults.RestartBeforeProbe {
 			s.token, s.env = "", nil
+			s.defaultUser = ""
 			s.faults.RestartBeforeProbe = false
 		}
 	}
@@ -130,6 +137,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) init(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	var req struct {
+		DefaultUser string            `json:"defaultUser"`
 		AccessToken string            `json:"accessToken"`
 		EnvVars     map[string]string `json:"envVars"`
 	}
@@ -165,6 +173,23 @@ func (s *Server) init(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		panic(http.ErrAbortHandler)
+	}
+	if req.DefaultUser != "" {
+		s.defaultUser = req.DefaultUser
+	}
+	user := s.defaultUser
+	if user == "" {
+		user = "root"
+	}
+	if s.faults.WrongDefaultUser != "" {
+		user = s.faults.WrongDefaultUser
+	}
+	defaults, _ := json.Marshal(map[string]any{"user": user, "fallback": s.defaultUser == "" || s.faults.ForceFallback})
+	if s.faults.InvalidDefaults {
+		defaults = []byte("{")
+	}
+	if !s.faults.OmitDefaults {
+		w.Header().Set("X-Envd-Defaults", string(defaults))
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

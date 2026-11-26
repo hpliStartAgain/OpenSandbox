@@ -54,6 +54,7 @@ The file must contain a JSON object. The loader rejects unknown fields, trailing
       "aliases": ["base-envd"],
       "native_template_id": "envd-only-base",
       "revision": "envd-only-base.rev-1",
+      "default_user": "user",
       "expected_envd_version": "0.8.0"
     }
   ],
@@ -79,7 +80,9 @@ The file must contain a JSON object. The loader rejects unknown fields, trailing
 
 Timeouts must be integer seconds and satisfy `timeout_min_seconds` ≤ `timeout_default_seconds` ≤ `timeout_max_seconds`. Each value must fit in a Go `time.Duration` after conversion to nanoseconds (at most `9223372036` seconds). Request-level timeout evaluation is implemented as pure functions in `pkg/rules` and is not yet wired to HTTP endpoints.
 
-Each element of `templates` must be an object with a non-empty `template_id`, `native_template_id`, `revision`, and `expected_envd_version`. `revision` is persisted as a native sandbox metadata label value and must match Fast Sandbox label-value syntax `^[A-Za-z0-9]([-_.A-Za-z0-9]*[A-Za-z0-9])?$` (1–63 ASCII characters; `@` is disallowed). Omitting `aliases` or setting it to `null` means an empty list, and each alias must be non-empty. Whitespace and control characters are disallowed in the four required fields and in aliases. Template IDs and aliases share one selector namespace and must be unique across all mappings, and each `revision` must be unique. Three optional per-template fields are also supported (explicit JSON `null` is rejected on all three): `ready` (boolean, default `true`; `false` blocks new creates while keeping `revision` lookup available for existing owned instances), `profile_compatible` (boolean, default `true`; `false` blocks new creates for incompatible mappings), and `timeout_max_seconds` (integer tightening the per-template ceiling within `timeout_min_seconds`..`timeout_max_seconds`). The configuration loader does not query native template readiness over the network.
+Each element of `templates` must be an object with a non-empty `template_id`, `native_template_id`, `revision`, `expected_envd_version`, and `default_user`. `revision` is persisted as a native sandbox metadata label value and must match Fast Sandbox label-value syntax `^[A-Za-z0-9]([-_.A-Za-z0-9]*[A-Za-z0-9])?$` (1–63 ASCII characters; `@` is disallowed). Omitting `aliases` or setting it to `null` means an empty list, and each alias must be non-empty. Whitespace and control characters are disallowed in the required fields and in aliases. Template IDs and aliases share one selector namespace and must be unique across all mappings, and each `revision` must be unique. Three optional per-template fields are also supported (explicit JSON `null` is rejected on all three): `ready` (boolean, default `true`; `false` blocks new creates while keeping `revision` lookup available for existing owned instances), `profile_compatible` (boolean, default `true`; `false` blocks new creates for incompatible mappings), and `timeout_max_seconds` (integer tightening the per-template ceiling within `timeout_min_seconds`..`timeout_max_seconds`). The configuration loader does not query native template readiness over the network.
+
+The required `default_user` must match `^[a-z_][a-z0-9_-]{0,31}$`; explicit `root` is allowed. The image must contain the account. Omission is a configuration error. With envd 0.8.0, bootstrap verifies the effective user through `X-Envd-Defaults`. envd does not check account existence at `/init`; a missing account returns 401 on first use.
 
 ## Gate 1a Create Options Inventory
 
@@ -141,10 +144,11 @@ Positive native state/endpoint results are cached for at most two seconds, cappe
 
 The router uses `httputil.ReverseProxy.Rewrite` with immediate flushing, without full-body buffering, protocol translation, redirects, or request replay. The native endpoint supplies the upstream host/base URL and routing headers; client native routing headers and hop-by-hop headers are removed before injection. SDK selectors and `X-Access-Token` remain available to envd. Native base-path/query scope is preserved while the incoming envd path/raw query is appended. Upstream response status, end-to-end headers, body and trailers pass through unchanged.
 
-Client access to `/init`, `/upgrade`, `/freeze`, `/unfreeze`, `/collapse`, `/fsfreeze`, and `/fsthaw` is rejected before native queries, including normalized aliases and subpaths. These management operations come from the [pinned envd route table](https://github.com/e2b-dev/runtime/blob/f32ee8a2a50052f32e3632ceb451111a98dd5104/packages/envd/internal/api/api.gen.go#L931-L948) and [upgrade registration](https://github.com/e2b-dev/runtime/blob/f32ee8a2a50052f32e3632ceb451111a98dd5104/packages/envd/main.go#L402). Other envd methods are forwarded without an RPC whitelist; that does not establish compatibility for untested methods. Router-generated errors use value-free JSON `{ "code": <status>, "message": "<status text>" }`; each request logs only status and duration.
+Client access to `/envs`, `/metrics`, `/init`, `/upgrade`, `/freeze`, `/unfreeze`, `/collapse`, `/fsfreeze`, and `/fsthaw` is rejected before native queries, including normalized aliases and subpaths. These management operations come from the [pinned envd route table](https://github.com/e2b-dev/runtime/blob/f32ee8a2a50052f32e3632ceb451111a98dd5104/packages/envd/internal/api/api.gen.go#L931-L948) and [upgrade registration](https://github.com/e2b-dev/runtime/blob/f32ee8a2a50052f32e3632ceb451111a98dd5104/packages/envd/main.go#L402). Other envd methods are forwarded without an RPC whitelist; that does not establish compatibility for untested methods. Router-generated errors use value-free JSON `{ "code": <status>, "message": "<status text>" }`; each request logs only status and duration.
 
 ## Limitations
 
+- `defaultWorkdir` is not set; the envd default applies.
 - The pinned SDK candidate `e2b==2.62.1`, real envd `0.8.0`, and Fast Sandbox backends remain untested.
 - `/healthz` is liveness only.
 - `timeout_max_seconds` is not checked against the native server.

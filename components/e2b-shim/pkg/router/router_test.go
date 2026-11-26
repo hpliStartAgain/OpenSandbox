@@ -54,7 +54,7 @@ func setup(t *testing.T, data http.Handler, ttl time.Duration) *fixture {
 		"E2B_SHIM_NATIVE_API_URL": "http://127.0.0.1:1/v1", "E2B_SHIM_ADAPTER_ID": "adapter-test",
 		"E2B_SHIM_HMAC_KEY_VERSION": "v1", "E2B_SHIM_DOMAIN": "sandbox.test", "E2B_SHIM_TIMEOUT_MAX_SECONDS": "3600",
 		"E2B_SHIM_ADAPTER_API_KEY": "fake-adapter-key", "E2B_SHIM_NATIVE_API_KEY": "fake-native-key", "E2B_SHIM_HMAC_KEY": "fake-hmac-key",
-		"E2B_SHIM_TEMPLATES": `[{"template_id":"base","native_template_id":"native-base","revision":"rev-1","expected_envd_version":"0.8.0"}]`,
+		"E2B_SHIM_TEMPLATES": `[{"template_id":"base","native_template_id":"native-base","revision":"rev-1","default_user":"user","expected_envd_version":"0.8.0"}]`,
 	}
 	cfg, err := config.Load(config.Source{LookupEnv: func(k string) (string, bool) { v, ok := env[k]; return v, ok }})
 	if err != nil {
@@ -84,7 +84,7 @@ func setup(t *testing.T, data http.Handler, ttl time.Duration) *fixture {
 	deriver, _ := rules.NewTokenDeriver(cfg.HMACKey, cfg.HMACKeyVersion, cfg.AdapterID)
 	token, _ := deriver.Derive(sbx.ID)
 	if _, err := envdinit.New(nil).Initialize(context.Background(), adapter.EnvdInitRequest{
-		SandboxID: sbx.ID, AccessToken: token, ExpectedEnvdVersion: "0.8.0", Endpoint: &native.Endpoint{URL: es.URL},
+		SandboxID: sbx.ID, AccessToken: token, DefaultUser: "user", ExpectedEnvdVersion: "0.8.0", Endpoint: &native.Endpoint{URL: es.URL},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -140,13 +140,13 @@ func TestAdmissionBeforeNative(t *testing.T) {
 			r.Host = "49983-" + f.id + ".sandbox.test.attacker.test"
 		}, 404},
 	}
-	for _, name := range []string{"init", "upgrade", "freeze", "unfreeze", "collapse", "fsfreeze", "fsthaw"} {
-		for _, p := range []string{"/" + name, "/" + name + "/", "//" + name, "/files/../" + name} {
+	for _, name := range []string{"envs", "metrics", "init", "upgrade", "freeze", "unfreeze", "collapse", "fsfreeze", "fsthaw"} {
+		for _, p := range []string{"/" + name, "/" + name + "/", "//" + name, "/files/../" + name, "/./" + name, "/" + name + "?x=1", "/\\" + name} {
 			tests = append(tests, struct {
 				name   string
 				edit   func(*http.Request)
 				status int
-			}{p, func(r *http.Request) { r.URL.Path = p }, 403})
+			}{p, func(r *http.Request) { r.URL.Path, r.URL.RawQuery, _ = strings.Cut(p, "?") }, 403})
 		}
 	}
 	tests = append(tests, struct {
@@ -633,6 +633,47 @@ func TestAmbiguousAndExpiredObservations(t *testing.T) {
 			requireStatus(t, f.status(f.request("GET", "/files", nil)), 503)
 			if f.fn.Stats().Endpoint != before {
 				t.Fatal("queried endpoint for ambiguous observation")
+			}
+		})
+	}
+}
+
+func TestAllowedDataPaths(t *testing.T) {
+	f := setup(t, http.HandlerFunc(okHandler), 0)
+	for _, p := range []string{"/health", "/files", "/files/compose", "/filesystem.Filesystem/Stat"} {
+		want := 204
+		requireStatus(t, f.status(f.request("GET", p, nil)), want)
+	}
+}
+func TestPostTransportFailureNoRetry(t *testing.T) {
+	for _, body := range []string{"payload", ""} {
+		t.Run(body, func(t *testing.T) {
+			f := setup(t, http.HandlerFunc(okHandler), 0)
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var attempts atomic.Int32
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				for {
+					c, e := ln.Accept()
+					if e != nil {
+						return
+					}
+					attempts.Add(1)
+					c.Close()
+				}
+			}()
+			f.fn.SetEndpoint(f.id, adapter.EnvdPort, native.Endpoint{URL: "http://" + ln.Addr().String()})
+			req := f.request("POST", "/process.Process/Start", strings.NewReader(body))
+			req.Header.Set("Idempotency-Key", "test-key")
+			requireStatus(t, f.status(req), 502)
+			ln.Close()
+			<-done
+			if attempts.Load() != 1 {
+				t.Fatalf("attempts=%d", attempts.Load())
 			}
 		})
 	}

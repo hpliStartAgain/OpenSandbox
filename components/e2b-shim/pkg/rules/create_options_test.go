@@ -27,10 +27,10 @@ import (
 func testCreateCatalog(t *testing.T) *rules.TemplateCatalog {
 	t.Helper()
 	cat, err := rules.NewTemplateCatalog([]config.TemplateMapping{
-		{TemplateID: "base", Aliases: []string{"base-envd"}, NativeTemplateID: "envd-only-base", Revision: "envd-only-base.rev-1", ExpectedEnvdVersion: "0.8.0"},
-		{TemplateID: "short-cap", NativeTemplateID: "envd-short", Revision: "envd-short.rev-1", ExpectedEnvdVersion: "0.8.0", TimeoutMaxSeconds: int64Ptr(120)},
-		{TemplateID: "unready", NativeTemplateID: "envd-unready", Revision: "envd-unready.rev-1", ExpectedEnvdVersion: "0.8.0", Ready: boolPtr(false)},
-		{TemplateID: "incompat", NativeTemplateID: "envd-incompat", Revision: "envd-incompat.rev-1", ExpectedEnvdVersion: "0.8.0", ProfileCompatible: boolPtr(false)},
+		{TemplateID: "base", Aliases: []string{"base-envd"}, NativeTemplateID: "envd-only-base", Revision: "envd-only-base.rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0"},
+		{TemplateID: "short-cap", NativeTemplateID: "envd-short", Revision: "envd-short.rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0", TimeoutMaxSeconds: int64Ptr(120)},
+		{TemplateID: "unready", NativeTemplateID: "envd-unready", Revision: "envd-unready.rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0", Ready: boolPtr(false)},
+		{TemplateID: "incompat", NativeTemplateID: "envd-incompat", Revision: "envd-incompat.rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0", ProfileCompatible: boolPtr(false)},
 	}, defaultProfileTimeout())
 	if err != nil {
 		t.Fatal(err)

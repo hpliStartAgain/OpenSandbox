@@ -406,8 +406,9 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, start tim
 		return
 	}
 	initRes, err := h.initializer.Initialize(r.Context(), EnvdInitRequest{
-		SandboxID: sandboxID, AccessToken: token, ExpectedEnvdVersion: validated.Template.ExpectedEnvdVersion,
-		Endpoint: &native.Endpoint{URL: ep.URL, Headers: maps.Clone(ep.Headers)}, EnvVars: maps.Clone(validated.EnvVars),
+		SandboxID: sandboxID, AccessToken: token, DefaultUser: validated.Template.DefaultUser,
+		ExpectedEnvdVersion: validated.Template.ExpectedEnvdVersion,
+		Endpoint:            &native.Endpoint{URL: ep.URL, Headers: maps.Clone(ep.Headers)}, EnvVars: maps.Clone(validated.EnvVars),
 	})
 	if err != nil || initRes == nil || initRes.EnvdVersion == "" || initRes.EnvdVersion != validated.Template.ExpectedEnvdVersion {
 		failPostAlloc("failed to initialize sandbox envd daemon", "envd_init_failed")

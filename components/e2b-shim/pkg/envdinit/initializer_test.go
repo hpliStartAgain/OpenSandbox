@@ -35,7 +35,7 @@ import (
 
 func initRequest(target string) adapter.EnvdInitRequest {
 	return adapter.EnvdInitRequest{
-		SandboxID: "instance-a", AccessToken: "test-envd-secret-a", ExpectedEnvdVersion: "0.8.0",
+		SandboxID: "instance-a", AccessToken: "test-envd-secret-a", DefaultUser: "user", ExpectedEnvdVersion: "0.8.0",
 		Endpoint: &native.Endpoint{URL: target}, EnvVars: map[string]string{"PRIVATE_ENV": "test-private-value"},
 	}
 }
@@ -98,7 +98,7 @@ func TestNativeRouteAndPayload(t *testing.T) {
 			}
 			var payload map[string]json.RawMessage
 			body, _ := io.ReadAll(r.Body)
-			if json.Unmarshal(body, &payload) != nil || len(payload) != 2 || string(payload["accessToken"]) != `"test-envd-secret-a"` || string(payload["envVars"]) != `{"PRIVATE_ENV":"test-private-value"}` {
+			if json.Unmarshal(body, &payload) != nil || len(payload) != 3 || string(payload["defaultUser"]) != `"user"` || string(payload["accessToken"]) != `"test-envd-secret-a"` || string(payload["envVars"]) != `{"PRIVATE_ENV":"test-private-value"}` {
 				t.Error("wrong init payload")
 			}
 			r.Body = io.NopCloser(strings.NewReader(string(body)))
@@ -263,5 +263,41 @@ func TestContextAndInputFailures(t *testing.T) {
 	}
 	if New(nil).client.Timeout <= 0 {
 		t.Fatal("default timeout missing")
+	}
+}
+
+func TestDefaultsFailures(t *testing.T) {
+	for _, header := range []string{"", "{", `{"user":"other","fallback":false}`, `{"user":"user","fallback":true}`, `{"user":"user"}`} {
+		t.Run(header, func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Envd-Version", "0.8.0")
+				w.Header().Set("X-Envd-Defaults", header)
+				if r.URL.Path == "/init" {
+					w.WriteHeader(204)
+				} else if r.Header.Get("X-Access-Token") != "" {
+					w.WriteHeader(200)
+				} else {
+					w.WriteHeader(401)
+				}
+			}))
+			defer s.Close()
+			_, err := New(nil).Initialize(context.Background(), initRequest(s.URL))
+			if !errors.Is(err, ErrDefiniteFailure) {
+				t.Fatalf("want definite failure, got %v", err)
+			}
+		})
+	}
+}
+func TestEmptyDefaultUserNoNetwork(t *testing.T) {
+	for _, user := range []string{"", "User", "bad user"} {
+		var calls atomic.Int32
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1) }))
+		req := initRequest(s.URL)
+		req.DefaultUser = user
+		_, err := New(nil).Initialize(context.Background(), req)
+		s.Close()
+		if !errors.Is(err, ErrDefiniteFailure) || calls.Load() != 0 {
+			t.Fatalf("user=%q err=%v calls=%d", user, err, calls.Load())
+		}
 	}
 }

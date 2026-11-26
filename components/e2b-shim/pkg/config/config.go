@@ -66,6 +66,7 @@ type TemplateMapping struct {
 	Aliases             []string `json:"aliases,omitempty"`
 	NativeTemplateID    string   `json:"native_template_id"`
 	Revision            string   `json:"revision"`
+	DefaultUser         string   `json:"default_user"`
 	ExpectedEnvdVersion string   `json:"expected_envd_version"`
 	Ready               *bool    `json:"ready,omitempty"`
 	ProfileCompatible   *bool    `json:"profile_compatible,omitempty"`

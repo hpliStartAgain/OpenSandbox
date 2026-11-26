@@ -48,7 +48,7 @@ const validFile = `{
       "aliases": ["base-envd"],
       "native_template_id": "tpl-base",
       "revision": "tpl-base.rev-1",
-      "expected_envd_version": "0.8.0"
+      "default_user":"user","expected_envd_version": "0.8.0"
     }
   ]
 }`
@@ -171,7 +171,7 @@ func TestLoadEnvOverridesFile(t *testing.T) {
 		"E2B_SHIM_TIMEOUT_DEFAULT_SECONDS": "120",
 		"E2B_SHIM_TIMEOUT_MIN_SECONDS":     "30",
 		"E2B_SHIM_TIMEOUT_MAX_SECONDS":     "600",
-		"E2B_SHIM_TEMPLATES":               `[{"template_id":"t2","native_template_id":"tpl2","revision":"tpl2.r1","expected_envd_version":"0.8.0"}]`,
+		"E2B_SHIM_TEMPLATES":               `[{"template_id":"t2","native_template_id":"tpl2","revision":"tpl2.r1","default_user":"user","expected_envd_version":"0.8.0"}]`,
 	})
 	cfg := mustLoad(t, config.Source{Path: writeConfig(t, validFile)}, env)
 	if cfg.Listen != "127.0.0.1:19090" || cfg.CompatPrefix != "/compat/e2b-test" || cfg.AdapterID != "adapter-2" ||
@@ -256,7 +256,7 @@ func TestLoadTemplateOptionalFields(t *testing.T) {
       "template_id": "unready",
       "native_template_id": "tpl-1",
       "revision": "rev-1",
-      "expected_envd_version": "0.8.0",
+      "default_user":"user","expected_envd_version": "0.8.0",
       "ready": false,
       "profile_compatible": true,
       "timeout_max_seconds": 60
@@ -265,7 +265,7 @@ func TestLoadTemplateOptionalFields(t *testing.T) {
       "template_id": "incompat",
       "native_template_id": "tpl-2",
       "revision": "` + strings.Repeat("r", 63) + `",
-      "expected_envd_version": "0.8.0",
+      "default_user":"user","expected_envd_version": "0.8.0",
       "ready": true,
       "profile_compatible": false,
       "timeout_max_seconds": 1800
@@ -375,11 +375,11 @@ func TestLoadFailures(t *testing.T) {
 		{name: "timeout default above max", file: validFile, env: envWith(map[string]string{"E2B_SHIM_TIMEOUT_DEFAULT_SECONDS": "7200"}), wantErr: "timeout_default_seconds: must not exceed timeout_max_seconds"},
 		{name: "timeout default below min", file: validFile, env: envWith(map[string]string{"E2B_SHIM_TIMEOUT_DEFAULT_SECONDS": "30"}), wantErr: "timeout_default_seconds: must not be below timeout_min_seconds"},
 		{name: "timeout min below one", file: validFile, env: envWith(map[string]string{"E2B_SHIM_TIMEOUT_MIN_SECONDS": "0"}), wantErr: "timeout_min_seconds: must be at least 1"},
-		{name: "duplicate selector", file: `{"templates":[{"template_id":"a","native_template_id":"t1","revision":"r1","expected_envd_version":"0.8.0"},{"template_id":"a","native_template_id":"t2","revision":"r2","expected_envd_version":"0.8.0"}]}`, wantErr: "duplicate template selector"},
-		{name: "duplicate alias", file: `{"templates":[{"template_id":"a","aliases":["x"],"native_template_id":"t1","revision":"r1","expected_envd_version":"0.8.0"},{"template_id":"b","aliases":["x"],"native_template_id":"t2","revision":"r2","expected_envd_version":"0.8.0"}]}`, wantErr: "duplicate template selector"},
-		{name: "duplicate revision", file: `{"templates":[{"template_id":"a","native_template_id":"t1","revision":"r1","expected_envd_version":"0.8.0"},{"template_id":"b","native_template_id":"t2","revision":"r1","expected_envd_version":"0.8.0"}]}`, wantErr: "duplicate revision"},
-		{name: "empty template field", file: `{"templates":[{"template_id":"a","native_template_id":"t","expected_envd_version":"0.8.0"}]}`, wantErr: "templates[0].revision: must not be empty"},
-		{name: "empty alias", file: `{"templates":[{"template_id":"b","aliases":[""],"native_template_id":"t","revision":"r","expected_envd_version":"0.8.0"}]}`, wantErr: "templates[0].aliases[0]: must not be empty"},
+		{name: "duplicate selector", file: `{"templates":[{"template_id":"a","native_template_id":"t1","revision":"r1","default_user":"user","expected_envd_version":"0.8.0"},{"template_id":"a","native_template_id":"t2","revision":"r2","default_user":"user","expected_envd_version":"0.8.0"}]}`, wantErr: "duplicate template selector"},
+		{name: "duplicate alias", file: `{"templates":[{"template_id":"a","aliases":["x"],"native_template_id":"t1","revision":"r1","default_user":"user","expected_envd_version":"0.8.0"},{"template_id":"b","aliases":["x"],"native_template_id":"t2","revision":"r2","default_user":"user","expected_envd_version":"0.8.0"}]}`, wantErr: "duplicate template selector"},
+		{name: "duplicate revision", file: `{"templates":[{"template_id":"a","native_template_id":"t1","revision":"r1","default_user":"user","expected_envd_version":"0.8.0"},{"template_id":"b","native_template_id":"t2","revision":"r1","default_user":"user","expected_envd_version":"0.8.0"}]}`, wantErr: "duplicate revision"},
+		{name: "empty template field", file: `{"templates":[{"template_id":"a","native_template_id":"t","default_user":"user","expected_envd_version":"0.8.0"}]}`, wantErr: "templates[0].revision: must not be empty"},
+		{name: "empty alias", file: `{"templates":[{"template_id":"b","aliases":[""],"native_template_id":"t","revision":"r","default_user":"user","expected_envd_version":"0.8.0"}]}`, wantErr: "templates[0].aliases[0]: must not be empty"},
 		{name: "empty templates env", env: envWith(map[string]string{"E2B_SHIM_TEMPLATES": ""}), wantErr: "E2B_SHIM_TEMPLATES"},
 		{name: "null templates env", env: envWith(map[string]string{"E2B_SHIM_TEMPLATES": "null"}), wantErr: "E2B_SHIM_TEMPLATES: must not be null"},
 		{name: "null config file", file: " \nnull\t", wantErr: "config file: must not be null"},
@@ -419,13 +419,13 @@ func TestLoadFailures(t *testing.T) {
 		{name: "template revision invalid label at-sign", file: strings.Replace(validFile, `"tpl-base.rev-1"`, `"tpl-base@rev-1"`, 1), wantErr: "templates[0].revision: must be a valid label value", doNotEcho: "tpl-base@rev-1"},
 		{name: "template revision trailing dot", file: strings.Replace(validFile, `"tpl-base.rev-1"`, `"tpl-base."`, 1), wantErr: "templates[0].revision: must be a valid label value", doNotEcho: "tpl-base."},
 		{name: "template revision exceeds 63 chars", file: strings.Replace(validFile, `"tpl-base.rev-1"`, `"`+strings.Repeat("r", 64)+`"`, 1), wantErr: "templates[0].revision: must be a valid label value", doNotEcho: strings.Repeat("r", 64)},
-		{name: "template ready null", file: strings.Replace(validFile, `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "ready": null`, 1), wantErr: "templates[0].ready: must not be null"},
-		{name: "template profile_compatible null", file: strings.Replace(validFile, `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "profile_compatible": null`, 1), wantErr: "templates[0].profile_compatible: must not be null"},
-		{name: "template timeout_max_seconds null", file: strings.Replace(validFile, `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "timeout_max_seconds": null`, 1), wantErr: "templates[0].timeout_max_seconds: must not be null"},
-		{name: "template timeout_max_seconds non-positive", file: strings.Replace(validFile, `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "timeout_max_seconds": 0`, 1), wantErr: "templates[0].timeout_max_seconds: must be at least 1"},
-		{name: "template timeout_max_seconds below min", file: strings.Replace(validFile, `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "timeout_max_seconds": 59`, 1), wantErr: "templates[0].timeout_max_seconds: must not be below timeout_min_seconds", doNotEcho: "59"},
-		{name: "template timeout_max_seconds above max", file: strings.Replace(validFile, `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "timeout_max_seconds": 3601`, 1), wantErr: "templates[0].timeout_max_seconds: must not exceed timeout_max_seconds", doNotEcho: "3601"},
-		{name: "template timeout_max_seconds overflows duration", file: strings.Replace(strings.Replace(validFile, `"timeout_max_seconds": 3600`, `"timeout_max_seconds": 9223372036`, 1), `"expected_envd_version": "0.8.0"`, `"expected_envd_version": "0.8.0", "timeout_max_seconds": 9223372037`, 1), wantErr: "templates[0].timeout_max_seconds: exceeds the maximum representable time.Duration", doNotEcho: "9223372037"},
+		{name: "template ready null", file: strings.Replace(validFile, `"default_user":"user","expected_envd_version": "0.8.0"`, `"default_user":"user","expected_envd_version": "0.8.0", "ready": null`, 1), wantErr: "templates[0].ready: must not be null"},
+		{name: "template profile_compatible null", file: strings.Replace(validFile, `"default_user":"user","expected_envd_version": "0.8.0"`, `"default_user":"user","expected_envd_version": "0.8.0", "profile_compatible": null`, 1), wantErr: "templates[0].profile_compatible: must not be null"},
+		{name: "template timeout_max_seconds null", file: strings.Replace(validFile, `"default_user":"user","expected_envd_version": "0.8.0"`, `"default_user":"user","expected_envd_version": "0.8.0", "timeout_max_seconds": null`, 1), wantErr: "templates[0].timeout_max_seconds: must not be null"},
+		{name: "template timeout_max_seconds non-positive", file: strings.Replace(validFile, `"default_user":"user","expected_envd_version": "0.8.0"`, `"default_user":"user","expected_envd_version": "0.8.0", "timeout_max_seconds": 0`, 1), wantErr: "templates[0].timeout_max_seconds: must be at least 1"},
+		{name: "template timeout_max_seconds below min", file: strings.Replace(validFile, `"default_user":"user","expected_envd_version": "0.8.0"`, `"default_user":"user","expected_envd_version": "0.8.0", "timeout_max_seconds": 59`, 1), wantErr: "templates[0].timeout_max_seconds: must not be below timeout_min_seconds", doNotEcho: "59"},
+		{name: "template timeout_max_seconds above max", file: strings.Replace(validFile, `"default_user":"user","expected_envd_version": "0.8.0"`, `"default_user":"user","expected_envd_version": "0.8.0", "timeout_max_seconds": 3601`, 1), wantErr: "templates[0].timeout_max_seconds: must not exceed timeout_max_seconds", doNotEcho: "3601"},
+		{name: "template timeout_max_seconds overflows duration", file: strings.Replace(strings.Replace(validFile, `"timeout_max_seconds": 3600`, `"timeout_max_seconds": 9223372036`, 1), `"default_user":"user","expected_envd_version": "0.8.0"`, `"default_user":"user","expected_envd_version": "0.8.0", "timeout_max_seconds": 9223372037`, 1), wantErr: "templates[0].timeout_max_seconds: exceeds the maximum representable time.Duration", doNotEcho: "9223372037"},
 		{name: "missing secrets", file: validFile, env: map[string]string{}, wantErr: "adapter_api_key: secret is not configured"},
 		{name: "both secret sources", env: envWith(map[string]string{"E2B_SHIM_HMAC_KEY_FILE": unreadable}), wantErr: "both E2B_SHIM_HMAC_KEY and E2B_SHIM_HMAC_KEY_FILE are set"},
 		{name: "empty secret env", env: envWith(map[string]string{"E2B_SHIM_ADAPTER_API_KEY": ""}), wantErr: "adapter_api_key: secret value is empty"},
@@ -547,4 +547,31 @@ func TestConfigFormattingRedactsSecrets(t *testing.T) {
 		t.Fatal("Load without secrets succeeded; want error")
 	}
 	assertNoSecretLeak(t, err.Error())
+}
+
+func TestDefaultUserBoundaries(t *testing.T) {
+	for _, user := range []string{"", "User", "1user", strings.Repeat("a", 33), "a b", "a\nb", "root", "app_user-1"} {
+		t.Run(user, func(t *testing.T) {
+			var c config.Config
+			if err := json.Unmarshal([]byte(validFile), &c); err != nil {
+				t.Fatal(err)
+			}
+			c.Templates[0].DefaultUser = user
+			err := c.Validate()
+			valid := user == "root" || user == "app_user-1"
+			if valid && err != nil && strings.Contains(err.Error(), "default_user") {
+				t.Fatal(err)
+			}
+			if !valid && (err == nil || !strings.Contains(err.Error(), "default_user")) {
+				t.Fatalf("missing default_user error: %v", err)
+			}
+		})
+	}
+	var c config.Config
+	if err := json.Unmarshal([]byte(strings.Replace(validFile, `"default_user":"user",`, "", 1)), &c); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "default_user") {
+		t.Fatal("missing user accepted")
+	}
 }

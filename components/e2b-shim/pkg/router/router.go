@@ -160,6 +160,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ErrorLog:     log.New(io.Discard, "", 0),
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) { writeError(w, http.StatusBadGateway) },
 		Rewrite: func(p *httputil.ProxyRequest) {
+			// Defense in depth: the transport never reuses connections, so net/http has
+			// no retry path today. If keep-alives are ever enabled, Request.isReplayable
+			// would treat empty-body requests carrying these headers as replayable, so
+			// strip them; envd does not consume them. GetBody is cleared below.
+			p.Out.Header.Del("Idempotency-Key")
+			p.Out.Header.Del("X-Idempotency-Key")
 			// ReverseProxy has already removed hop-by-hop headers. Restore the raw
 			// query (including encodings) and append the envd path to the native base.
 			p.SetURL(&ep.target)
@@ -233,9 +239,11 @@ func managementPath(p string) bool {
 	// Match normalized aliases without rewriting any forwarded request path.
 	p = path.Clean(strings.ReplaceAll(p, "\\", "/"))
 	first := strings.Split(strings.TrimPrefix(p, "/"), "/")[0]
-	// Pinned envd api.gen.go plus main.go's separately registered /upgrade.
+	// envs and metrics are envd data routes never called by the pinned SDK
+	// (e2b 2.62.1, 9301cd84), blocked as defense in depth.
+	// Other entries follow api.gen.go and main.go's /upgrade registration.
 	switch first {
-	case "init", "upgrade", "freeze", "unfreeze", "collapse", "fsfreeze", "fsthaw":
+	case "envs", "metrics", "init", "upgrade", "freeze", "unfreeze", "collapse", "fsfreeze", "fsthaw":
 		return true
 	}
 	return false

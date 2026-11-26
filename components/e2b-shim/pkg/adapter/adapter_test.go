@@ -174,10 +174,10 @@ func newHarness(t *testing.T, ho harnessOpts) *harness {
 
 	readyFalse, compatFalse, cappedMax := false, false, int64(600)
 	templatesJSON, err := json.Marshal([]config.TemplateMapping{
-		{TemplateID: "tpl-base", Aliases: []string{"base"}, NativeTemplateID: "native-tpl-base", Revision: "tpl-base.rev-1", ExpectedEnvdVersion: "0.1.4"},
-		{TemplateID: "tpl-capped", NativeTemplateID: "native-tpl-capped", Revision: "tpl-capped.rev-1", ExpectedEnvdVersion: "0.1.4", TimeoutMaxSeconds: &cappedMax},
-		{TemplateID: "tpl-unready", NativeTemplateID: "native-tpl-base", Revision: "tpl-unready.rev-1", ExpectedEnvdVersion: "0.1.4", Ready: &readyFalse},
-		{TemplateID: "tpl-incompat", NativeTemplateID: "native-tpl-base", Revision: "tpl-incompat.rev-1", ExpectedEnvdVersion: "0.1.4", ProfileCompatible: &compatFalse},
+		{TemplateID: "tpl-base", Aliases: []string{"base"}, NativeTemplateID: "native-tpl-base", Revision: "tpl-base.rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.1.4"},
+		{TemplateID: "tpl-capped", NativeTemplateID: "native-tpl-capped", Revision: "tpl-capped.rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.1.4", TimeoutMaxSeconds: &cappedMax},
+		{TemplateID: "tpl-unready", NativeTemplateID: "native-tpl-base", Revision: "tpl-unready.rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.1.4", Ready: &readyFalse},
+		{TemplateID: "tpl-incompat", NativeTemplateID: "native-tpl-base", Revision: "tpl-incompat.rev-1", DefaultUser: "user", ExpectedEnvdVersion: "0.1.4", ProfileCompatible: &compatFalse},
 	})
 	if err != nil {
 		t.Fatalf("marshal templates: %v", err)
@@ -641,7 +641,7 @@ func TestCreateHappyPathReadinessPollingAndAdmissionOrdering(t *testing.T) {
 		t.Fatalf("admission IsOpen(sbx-1) = %v, %v; want true, nil", isOpen, err)
 	}
 	calls := h.init.Calls()
-	if len(calls) != 1 || calls[0].AccessToken != wantToken || calls[0].EnvVars["APP_SECRET"] != testEnvSecretVal ||
+	if len(calls) != 1 || calls[0].DefaultUser != "user" || calls[0].AccessToken != wantToken || calls[0].EnvVars["APP_SECRET"] != testEnvSecretVal ||
 		calls[0].Endpoint == nil || calls[0].Endpoint.Headers["OpenSandbox-Ingress-To"] != testIngressToken {
 		t.Fatalf("unexpected EnvdInitRequest received by initializer")
 	}
@@ -892,7 +892,7 @@ func TestRedactionAndStructuredLogSafety(t *testing.T) {
 	_, _ = h.do(t, http.MethodDelete, "/compat/e2b/sandboxes/"+created.SandboxID, testAdapterAPIKey, "")
 
 	initReq := adapter.EnvdInitRequest{
-		SandboxID: "sbx-1", ExpectedEnvdVersion: "0.1.4", AccessToken: created.EnvdAccessToken,
+		SandboxID: "sbx-1", DefaultUser: "user", ExpectedEnvdVersion: "0.1.4", AccessToken: created.EnvdAccessToken,
 		Endpoint: &native.Endpoint{URL: "http://10.0.0.5:49983", Headers: map[string]string{"OpenSandbox-Ingress-To": testIngressToken}},
 		EnvVars:  map[string]string{"MY_SECRET": testEnvSecretVal},
 	}
